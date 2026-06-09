@@ -4,7 +4,8 @@
 //! They are shared by the GeoSite matcher, verdict cache, and config parser.
 //! Wire-format packet utilities live in `dns`.
 
-use std::collections::{hash_map::Entry, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 
 // Constants.
 
@@ -20,9 +21,12 @@ pub const SUFFIX_MAX_LEVELS: usize = 8;
 /// returns `true` when the queried name equals or is a subdomain of any inserted suffix
 /// (e.g. `"www.example.com"` matches `"example.com"`). The walk is O(depth) with a small
 /// bitmask pre-filter that skips depths with no entries.
+///
+/// Names longer than SUFFIX_MAX_LEVELS labels are truncated to their rightmost
+/// SUFFIX_MAX_LEVELS labels on insert, so the stored key always matches its recorded depth.
 #[derive(Debug, Default)]
 pub struct SuffixTable {
-    entries: HashMap<String, ()>,
+    entries: FxHashMap<String, ()>,
     /// Bitmask: bit `i` is set when at least one suffix with `i+1` dot-separated labels
     /// has been inserted. Used to skip probes at absent depths.
     level_interest: u8,
@@ -33,10 +37,34 @@ impl SuffixTable {
     /// Insert `name` (already normalized, lowercase, no trailing dot).
     /// Returns `true` if the name was not already present.
     pub fn insert(&mut self, name: String) -> bool {
-        match self.entries.entry(name) {
+        let label_count = name.split('.').count();
+        let level = label_count.min(SUFFIX_MAX_LEVELS);
+
+        // Truncate to the rightmost SUFFIX_MAX_LEVELS labels so the stored key's depth
+        // matches the level recorded in level_interest. This keeps lookup correct for
+        // query names with more labels than SUFFIX_MAX_LEVELS.
+        let effective_name = if label_count > SUFFIX_MAX_LEVELS {
+            let skip = label_count - SUFFIX_MAX_LEVELS;
+            let mut dot_count = 0usize;
+            let start = name
+                .bytes()
+                .position(|b| {
+                    if b == b'.' {
+                        dot_count += 1;
+                        dot_count == skip
+                    } else {
+                        false
+                    }
+                })
+                .map_or(0, |i| i + 1);
+            name[start..].to_string()
+        } else {
+            name
+        };
+
+        match self.entries.entry(effective_name) {
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
-                let level = e.key().split('.').count().min(SUFFIX_MAX_LEVELS);
                 if level > 0 {
                     self.level_interest |= 1u8 << (level - 1);
                     self.level_max = self.level_max.max(level);
@@ -57,23 +85,29 @@ impl SuffixTable {
         if self.entries.is_empty() {
             return false;
         }
-        let bytes = name.as_bytes();
-        let mut label_starts = [0usize; SUFFIX_MAX_LEVELS + 1];
-        let mut n_starts = 1usize;
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'.' && n_starts <= SUFFIX_MAX_LEVELS {
-                label_starts[n_starts] = i + 1;
-                n_starts += 1;
+
+        // Scan right-to-left to collect byte offsets for up to SUFFIX_MAX_LEVELS label
+        // boundaries. suffix_starts[k] = byte offset of the (k+1)-label suffix from the right.
+        let mut suffix_starts = [0usize; SUFFIX_MAX_LEVELS];
+        let mut count = 0usize;
+        for (i, &b) in name.as_bytes().iter().enumerate().rev() {
+            if b == b'.' {
+                suffix_starts[count] = i + 1;
+                count += 1;
+                if count >= SUFFIX_MAX_LEVELS {
+                    break;
+                }
             }
         }
-        let total = n_starts;
-        let max = total.min(self.level_max);
-        for level in (1..=max).rev() {
+        // count dots found (up to SUFFIX_MAX_LEVELS).
+        // Level L uses: name[suffix_starts[L-1]..] for L <= count, name[0..] for L == count+1.
+        let total_levels = (count + 1).min(self.level_max);
+        for level in (1..=total_levels).rev() {
             if self.level_interest & (1u8 << (level - 1)) == 0 {
                 continue;
             }
-            let start = total - level;
-            if self.entries.contains_key(&name[label_starts[start]..]) {
+            let start = if level <= count { suffix_starts[level - 1] } else { 0 };
+            if self.entries.contains_key(&name[start..]) {
                 return true;
             }
         }
@@ -105,3 +139,89 @@ pub fn normalize_domain(name: &str) -> Option<String> {
 }
 
 // Tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_table(suffixes: &[&str]) -> SuffixTable {
+        let mut t = SuffixTable::default();
+        for &s in suffixes {
+            t.insert(s.to_string());
+        }
+        t
+    }
+
+    #[test]
+    fn basic_suffix_match() {
+        let t = make_table(&["example.com"]);
+        assert!(t.contains_suffix("example.com"));
+        assert!(t.contains_suffix("www.example.com"));
+        assert!(t.contains_suffix("a.b.example.com"));
+        assert!(!t.contains_suffix("notexample.com"));
+        assert!(!t.contains_suffix("com"));
+    }
+
+    #[test]
+    fn single_label_suffix() {
+        let t = make_table(&["com"]);
+        assert!(t.contains_suffix("com"));
+        assert!(t.contains_suffix("example.com"));
+        assert!(t.contains_suffix("foo.bar.com"));
+        assert!(!t.contains_suffix("net"));
+    }
+
+    #[test]
+    fn deep_query_matches_shallow_suffix() {
+        // 10-label query against a 5-label suffix (the original bug).
+        let t = make_table(&["e.f.g.h.i"]);
+        let deep = "a.b.c.d.e.f.g.h.i"; // 9 labels, ends with "e.f.g.h.i"
+        assert!(t.contains_suffix(deep), "9-label query should match 5-label suffix");
+        let deeper = "x.a.b.c.d.e.f.g.h.i"; // 10 labels
+        assert!(t.contains_suffix(deeper), "10-label query should match 5-label suffix");
+    }
+
+    #[test]
+    fn max_depth_suffix_matches_deeper_query() {
+        // Insert an 8-label suffix (SUFFIX_MAX_LEVELS); query a 10-label name.
+        let suffix = "a.b.c.d.e.f.g.h";
+        let t = make_table(&[suffix]);
+        assert!(t.contains_suffix("a.b.c.d.e.f.g.h"), "exact match");
+        assert!(t.contains_suffix("x.a.b.c.d.e.f.g.h"), "9-label query");
+        assert!(t.contains_suffix("y.x.a.b.c.d.e.f.g.h"), "10-label query");
+        assert!(!t.contains_suffix("b.c.d.e.f.g.h"), "shorter name should not match");
+    }
+
+    #[test]
+    fn insert_truncates_overlength_names() {
+        // A 9-label name is truncated to 8 labels on insert.
+        // It should match a 10-label query that ends with those 8 labels.
+        let nine_label = "a.b.c.d.e.f.g.h.i"; // 9 labels → stored as "b.c.d.e.f.g.h.i"
+        let t = make_table(&[nine_label]);
+        assert!(t.contains_suffix("x.b.c.d.e.f.g.h.i"), "10-label query matches truncated 8-label key");
+        assert!(t.contains_suffix("b.c.d.e.f.g.h.i"), "exact truncated suffix matches");
+    }
+
+    #[test]
+    fn no_false_positives_across_tlds() {
+        let t = make_table(&["google.com"]);
+        assert!(!t.contains_suffix("google.net"));
+        assert!(!t.contains_suffix("notgoogle.com"));
+        assert!(!t.contains_suffix("com"));
+    }
+
+    #[test]
+    fn empty_table() {
+        let t = SuffixTable::default();
+        assert!(!t.contains_suffix("example.com"));
+    }
+
+    #[test]
+    fn normalize_domain_basic() {
+        assert_eq!(normalize_domain("Example.COM."), Some("example.com".into()));
+        assert_eq!(normalize_domain(""), None);
+        assert_eq!(normalize_domain("."), None);
+        assert_eq!(normalize_domain("a..b"), None);
+        assert_eq!(normalize_domain("a"), Some("a".into()));
+    }
+}

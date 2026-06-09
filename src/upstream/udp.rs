@@ -88,8 +88,19 @@ impl UdpUpstream {
         for i in 0..upstream.sockets.len() {
             let u = upstream.clone();
             tokio::spawn(async move {
-                if let Err(err) = u.recv_loop(i).await {
-                    crate::log_error!("upstream event=recv_loop_exit error={err:#}");
+                let mut backoff = Duration::from_millis(50);
+                loop {
+                    if let Err(err) = u.clone().recv_loop(i).await {
+                        crate::verbose!(
+                            "upstream name={} proto=udp event=recv_loop_restart backoff_ms={} error={err:#}",
+                            u.name,
+                            backoff.as_millis()
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    } else {
+                        backoff = Duration::from_millis(50);
+                    }
                 }
             });
         }
