@@ -349,19 +349,7 @@ fn write_query_latency_histogram(out: &mut String, ql: &QueryLatencySnapshot) {
         "# HELP {name} End-to-end latency for slow-path (cache-miss) DNS queries\n"
     ));
     out.push_str(&format!("# TYPE {name} histogram\n"));
-    let mut cumulative = 0u64;
-    for (i, &bound_us) in RTT_BUCKET_BOUNDS_US.iter().enumerate() {
-        cumulative += ql.hist[i];
-        let bound_s = bound_us as f64 / 1_000_000.0;
-        out.push_str(&format!(
-            "{name}_bucket{{le=\"{bound_s:.6}\"}} {cumulative}\n"
-        ));
-    }
-    cumulative += ql.hist[RTT_BUCKETS - 1];
-    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
-    out.push_str(&format!("{name}_count {}\n", ql.count));
-    let sum_s = ql.sum_us as f64 / 1_000_000.0;
-    out.push_str(&format!("{name}_sum {sum_s:.6}\n"));
+    write_histogram_series(out, name, None, &ql.hist, ql.count, ql.sum_us);
 }
 
 fn write_upstream_rtt_histogram(out: &mut String, nodes: &[NodeStatsSnapshot]) {
@@ -369,30 +357,38 @@ fn write_upstream_rtt_histogram(out: &mut String, nodes: &[NodeStatsSnapshot]) {
     out.push_str(&format!("# HELP {name} Upstream DNS query RTT histogram\n"));
     out.push_str(&format!("# TYPE {name} histogram\n"));
     for n in nodes {
-        let mut cumulative = 0u64;
-        for (i, &bound_us) in RTT_BUCKET_BOUNDS_US.iter().enumerate() {
-            cumulative += n.rtt_hist[i];
-            let bound_s = bound_us as f64 / 1_000_000.0;
-            out.push_str(&format!(
-                "{name}_bucket{{upstream=\"{}\",le=\"{:.6}\"}} {cumulative}\n",
-                n.name, bound_s
-            ));
-        }
-        // overflow bucket (+Inf)
-        cumulative += n.rtt_hist[RTT_BUCKETS - 1];
+        write_histogram_series(out, name, Some(&n.name), &n.rtt_hist, n.rtt_count(), n.rtt_sum_us);
+    }
+}
+
+/// Render one Prometheus histogram series (buckets + _count + _sum).
+/// `upstream` adds an `upstream="<name>"` label to every line when Some.
+fn write_histogram_series(
+    out: &mut String,
+    name: &str,
+    upstream: Option<&str>,
+    hist: &[u64; RTT_BUCKETS],
+    count: u64,
+    sum_us: u64,
+) {
+    // Prepended inside bucket label set before "le=...": "" or "upstream=\"foo\","
+    let bucket_prefix = upstream.map_or_else(String::new, |u| format!("upstream=\"{u}\","));
+    // Appended after metric name for _count/_sum: "" or "{upstream=\"foo\"}"
+    let outer_labels = upstream.map_or_else(String::new, |u| format!("{{upstream=\"{u}\"}}"));
+
+    let mut cumulative = 0u64;
+    for (i, &bound_us) in RTT_BUCKET_BOUNDS_US.iter().enumerate() {
+        cumulative += hist[i];
+        let bound_s = bound_us as f64 / 1_000_000.0;
         out.push_str(&format!(
-            "{name}_bucket{{upstream=\"{}\",le=\"+Inf\"}} {cumulative}\n",
-            n.name
-        ));
-        out.push_str(&format!(
-            "{name}_count{{upstream=\"{}\"}} {}\n",
-            n.name,
-            n.rtt_count()
-        ));
-        let sum_s = n.rtt_sum_us as f64 / 1_000_000.0;
-        out.push_str(&format!(
-            "{name}_sum{{upstream=\"{}\"}} {sum_s:.6}\n",
-            n.name
+            "{name}_bucket{{{bucket_prefix}le=\"{bound_s:.6}\"}} {cumulative}\n"
         ));
     }
+    cumulative += hist[RTT_BUCKETS - 1];
+    out.push_str(&format!(
+        "{name}_bucket{{{bucket_prefix}le=\"+Inf\"}} {cumulative}\n"
+    ));
+    out.push_str(&format!("{name}_count{outer_labels} {count}\n"));
+    let sum_s = sum_us as f64 / 1_000_000.0;
+    out.push_str(&format!("{name}_sum{outer_labels} {sum_s:.6}\n"));
 }

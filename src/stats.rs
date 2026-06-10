@@ -10,6 +10,38 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+/// Declare a batch of plain `AtomicU64` counters with their `inc_*` functions, the
+/// `GlobalSnapshot` struct, and `global_snapshot()` in one place.
+///
+/// Each entry has the form:
+///   `$(#[attr])* STATIC_NAME / inc_fn_name => snapshot_field_name`
+///
+/// Adding a new counter requires editing only this macro invocation — no manual
+/// static, inc function, struct field, or snapshot initialiser to keep in sync.
+macro_rules! declare_counters {
+    ( $( $(#[$attr:meta])* $STATIC:ident / $fn_name:ident => $field:ident ),+ $(,)? ) => {
+        $(
+            $(#[$attr])*
+            static $STATIC: AtomicU64 = AtomicU64::new(0);
+            $(#[$attr])*
+            #[inline]
+            pub fn $fn_name() {
+                $STATIC.fetch_add(1, Ordering::Relaxed);
+            }
+        )+
+
+        pub struct GlobalSnapshot {
+            $(pub $field: u64,)+
+        }
+
+        pub fn global_snapshot() -> GlobalSnapshot {
+            GlobalSnapshot {
+                $($field: $STATIC.load(Ordering::Relaxed),)+
+            }
+        }
+    };
+}
+
 // RTT histogram configuration.
 // 11 finite bucket boundaries (in microseconds) + 1 overflow bucket = 12 total.
 // Boundaries are chosen to cover the 1 ms to 5 s range that typical DNS upstreams hit.
@@ -28,52 +60,66 @@ pub const RTT_BUCKET_BOUNDS_US: &[u64] = &[
 ];
 pub const RTT_BUCKETS: usize = 12; // 11 bounds + overflow
 
-// Global counters.
+declare_counters!(
+    // Incoming query counts (only incremented on unix listener paths).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    QUERIES_UDP / inc_queries_udp => queries_udp,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    QUERIES_TCP / inc_queries_tcp => queries_tcp,
 
-static QUERIES_UDP: AtomicU64 = AtomicU64::new(0);
-static QUERIES_TCP: AtomicU64 = AtomicU64::new(0);
-static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-/// Expired entry served proactively from get() while a background refresh runs.
-static CACHE_STALE_REFRESH: AtomicU64 = AtomicU64::new(0);
-/// Stale entry served as an error fallback (upstream SERVFAIL / network failure).
-static CACHE_STALE_ERROR: AtomicU64 = AtomicU64::new(0);
-/// Stale entry served because upstream did not respond within stale-client-timeout.
-static CACHE_STALE_CLIENT_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-static CACHE_REFRESH_STARTED: AtomicU64 = AtomicU64::new(0);
-static CACHE_REFRESH_SKIPPED: AtomicU64 = AtomicU64::new(0);
-static CACHE_REFRESH_FAILED: AtomicU64 = AtomicU64::new(0);
-static SINGLEFLIGHT_HITS: AtomicU64 = AtomicU64::new(0);
-static INFLIGHT_DROPS: AtomicU64 = AtomicU64::new(0);
-static HEDGED_QUERIES: AtomicU64 = AtomicU64::new(0);
-static HEDGE_WINS: AtomicU64 = AtomicU64::new(0);
+    // DNS response cache outcomes.
+    CACHE_HITS / inc_cache_hits => cache_hits,
+    CACHE_MISSES / inc_cache_misses => cache_misses,
+    /// Expired entry served proactively while a background refresh runs.
+    CACHE_STALE_REFRESH / inc_cache_stale_refresh => cache_stale_refresh,
+    /// Stale entry served as an error fallback (upstream SERVFAIL / network failure).
+    CACHE_STALE_ERROR / inc_cache_stale_error => cache_stale_error,
+    /// Stale entry served because upstream did not respond within stale-client-timeout.
+    CACHE_STALE_CLIENT_TIMEOUT / inc_cache_stale_client_timeout => cache_stale_client_timeout,
+    CACHE_REFRESH_STARTED / inc_cache_refresh_started => cache_refresh_started,
+    CACHE_REFRESH_SKIPPED / inc_cache_refresh_skipped => cache_refresh_skipped,
+    CACHE_REFRESH_FAILED / inc_cache_refresh_failed => cache_refresh_failed,
 
-// Routing / matching hot-path effectiveness counters.
+    // Request deduplication / load control.
+    SINGLEFLIGHT_HITS / inc_singleflight_hits => singleflight_hits,
+    INFLIGHT_DROPS / inc_inflight_drops => inflight_drops,
+    HEDGED_QUERIES / inc_hedged_queries => hedged_queries,
+    HEDGE_WINS / inc_hedge_wins => hedge_wins,
 
-/// Route resolved from the L1 route cache (no matcher walk).
-static ROUTE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-/// Route computed by walking the routing index (L1 miss).
-static ROUTE_COMPUTED: AtomicU64 = AtomicU64::new(0);
-/// Cumulative time spent computing routes on L1 misses, in microseconds.
-static ROUTE_COMPUTE_SUM_US: AtomicU64 = AtomicU64::new(0);
-/// GeoSite verdict answered from the L2 result cache.
-static GEOSITE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-/// GeoSite verdict required a full matcher walk (full/suffix/keyword/regex).
-static GEOSITE_WALKS: AtomicU64 = AtomicU64::new(0);
+    // Routing hot-path effectiveness.
+    /// Route resolved from the L1 route cache (no matcher walk).
+    ROUTE_CACHE_HITS / inc_route_cache_hit => route_cache_hits,
+    /// Route computed by walking the routing index (L1 miss).
+    /// Updated by record_route_compute(); generated inc_route_computed() is unused.
+    #[allow(dead_code)]
+    ROUTE_COMPUTED / inc_route_computed => route_computed,
+    /// Cumulative time for L1 misses, µs. Updated by record_route_compute().
+    #[allow(dead_code)]
+    ROUTE_COMPUTE_SUM_US / inc_route_compute_sum_us => route_compute_sum_us,
+    /// GeoSite verdict answered from the L2 result cache.
+    GEOSITE_CACHE_HITS / inc_geosite_cache_hit => geosite_cache_hits,
+    /// GeoSite verdict required a full matcher walk.
+    GEOSITE_WALKS / inc_geosite_walk => geosite_walks,
 
-// Upstream transport health counters.
+    // Upstream transport health.
+    /// UDP responses that arrived truncated (TC=1) and were retried over TCP.
+    TC_FALLBACKS / inc_tc_fallback => tc_fallbacks,
+    /// UDP upstream recv loops restarted after a socket error.
+    UDP_RECV_RESTARTS / inc_udp_recv_restart => udp_recv_restarts,
 
-/// UDP responses that arrived truncated (TC=1) and were retried over TCP.
-static TC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-/// UDP upstream recv loops restarted after a socket error.
-static UDP_RECV_RESTARTS: AtomicU64 = AtomicU64::new(0);
+    // Routing decisions.
+    ROUTED_NONE_RACE / inc_routed_none_race => routed_none_race,
+    ROUTED_NULL / inc_routed_null => routed_null,
+    ROUTED_GROUP / inc_routed_group => routed_group,
+    ROUTED_AAAA_FILTERED / inc_routed_aaaa_filtered => routed_aaaa_filtered,
+);
 
-// Routing decision counters.
-
-static ROUTED_NONE_RACE: AtomicU64 = AtomicU64::new(0);
-static ROUTED_NULL: AtomicU64 = AtomicU64::new(0);
-static ROUTED_GROUP: AtomicU64 = AtomicU64::new(0);
-static ROUTED_AAAA_FILTERED: AtomicU64 = AtomicU64::new(0);
+/// Record one route computation (L1 route-cache miss) and its duration.
+#[inline]
+pub fn record_route_compute(elapsed_us: u64) {
+    ROUTE_COMPUTED.fetch_add(1, Ordering::Relaxed);
+    ROUTE_COMPUTE_SUM_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
 
 // Slow-path (cache-miss) query latency histogram.
 // Uses the same bucket boundaries as the upstream RTT histogram.
@@ -82,108 +128,6 @@ static QUERY_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUERY_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
 static QUERY_LATENCY_HIST: [AtomicU64; RTT_BUCKETS] =
     [const { AtomicU64::new(0) }; RTT_BUCKETS];
-
-#[inline]
-#[cfg_attr(not(unix), allow(dead_code))] // only called from listener.rs which is #[cfg(unix)]
-pub fn inc_queries_udp() {
-    QUERIES_UDP.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-#[cfg_attr(not(unix), allow(dead_code))] // only called from listener.rs which is #[cfg(unix)]
-pub fn inc_queries_tcp() {
-    QUERIES_TCP.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_hits() {
-    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_misses() {
-    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_stale_refresh() {
-    CACHE_STALE_REFRESH.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_stale_error() {
-    CACHE_STALE_ERROR.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_stale_client_timeout() {
-    CACHE_STALE_CLIENT_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_refresh_started() {
-    CACHE_REFRESH_STARTED.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_refresh_skipped() {
-    CACHE_REFRESH_SKIPPED.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_cache_refresh_failed() {
-    CACHE_REFRESH_FAILED.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_singleflight_hits() {
-    SINGLEFLIGHT_HITS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_inflight_drops() {
-    INFLIGHT_DROPS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_hedged_queries() {
-    HEDGED_QUERIES.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_hedge_wins() {
-    HEDGE_WINS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_route_cache_hit() {
-    ROUTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-/// Record one route computation (L1 route-cache miss) and its duration.
-#[inline]
-pub fn record_route_compute(elapsed_us: u64) {
-    ROUTE_COMPUTED.fetch_add(1, Ordering::Relaxed);
-    ROUTE_COMPUTE_SUM_US.fetch_add(elapsed_us, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_geosite_cache_hit() {
-    GEOSITE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_geosite_walk() {
-    GEOSITE_WALKS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_tc_fallback() {
-    TC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_udp_recv_restart() {
-    UDP_RECV_RESTARTS.fetch_add(1, Ordering::Relaxed);
-}
-
-#[inline]
-pub fn inc_routed_none_race() {
-    ROUTED_NONE_RACE.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_routed_null() {
-    ROUTED_NULL.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_routed_group() {
-    ROUTED_GROUP.fetch_add(1, Ordering::Relaxed);
-}
-#[inline]
-pub fn inc_routed_aaaa_filtered() {
-    ROUTED_AAAA_FILTERED.fetch_add(1, Ordering::Relaxed);
-}
 
 pub fn record_query_latency(rtt_us: u64) {
     QUERY_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -195,71 +139,12 @@ pub fn record_query_latency(rtt_us: u64) {
     QUERY_LATENCY_HIST[bucket].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Read all global counters as a snapshot for rendering.
-pub fn global_snapshot() -> GlobalSnapshot {
-    GlobalSnapshot {
-        queries_udp: QUERIES_UDP.load(Ordering::Relaxed),
-        queries_tcp: QUERIES_TCP.load(Ordering::Relaxed),
-        cache_hits: CACHE_HITS.load(Ordering::Relaxed),
-        cache_misses: CACHE_MISSES.load(Ordering::Relaxed),
-        cache_stale_refresh: CACHE_STALE_REFRESH.load(Ordering::Relaxed),
-        cache_stale_error: CACHE_STALE_ERROR.load(Ordering::Relaxed),
-        cache_stale_client_timeout: CACHE_STALE_CLIENT_TIMEOUT.load(Ordering::Relaxed),
-        cache_refresh_started: CACHE_REFRESH_STARTED.load(Ordering::Relaxed),
-        cache_refresh_skipped: CACHE_REFRESH_SKIPPED.load(Ordering::Relaxed),
-        cache_refresh_failed: CACHE_REFRESH_FAILED.load(Ordering::Relaxed),
-        singleflight_hits: SINGLEFLIGHT_HITS.load(Ordering::Relaxed),
-        inflight_drops: INFLIGHT_DROPS.load(Ordering::Relaxed),
-        hedged_queries: HEDGED_QUERIES.load(Ordering::Relaxed),
-        hedge_wins: HEDGE_WINS.load(Ordering::Relaxed),
-        route_cache_hits: ROUTE_CACHE_HITS.load(Ordering::Relaxed),
-        route_computed: ROUTE_COMPUTED.load(Ordering::Relaxed),
-        route_compute_sum_us: ROUTE_COMPUTE_SUM_US.load(Ordering::Relaxed),
-        geosite_cache_hits: GEOSITE_CACHE_HITS.load(Ordering::Relaxed),
-        geosite_walks: GEOSITE_WALKS.load(Ordering::Relaxed),
-        tc_fallbacks: TC_FALLBACKS.load(Ordering::Relaxed),
-        udp_recv_restarts: UDP_RECV_RESTARTS.load(Ordering::Relaxed),
-        routed_none_race: ROUTED_NONE_RACE.load(Ordering::Relaxed),
-        routed_null: ROUTED_NULL.load(Ordering::Relaxed),
-        routed_group: ROUTED_GROUP.load(Ordering::Relaxed),
-        routed_aaaa_filtered: ROUTED_AAAA_FILTERED.load(Ordering::Relaxed),
-    }
-}
-
 pub fn query_latency_snapshot() -> QueryLatencySnapshot {
     QueryLatencySnapshot {
         count: QUERY_LATENCY_COUNT.load(Ordering::Relaxed),
         sum_us: QUERY_LATENCY_SUM_US.load(Ordering::Relaxed),
         hist: std::array::from_fn(|i| QUERY_LATENCY_HIST[i].load(Ordering::Relaxed)),
     }
-}
-
-pub struct GlobalSnapshot {
-    pub queries_udp: u64,
-    pub queries_tcp: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub cache_stale_refresh: u64,
-    pub cache_stale_error: u64,
-    pub cache_stale_client_timeout: u64,
-    pub cache_refresh_started: u64,
-    pub cache_refresh_skipped: u64,
-    pub cache_refresh_failed: u64,
-    pub singleflight_hits: u64,
-    pub inflight_drops: u64,
-    pub hedged_queries: u64,
-    pub hedge_wins: u64,
-    pub route_cache_hits: u64,
-    pub route_computed: u64,
-    pub route_compute_sum_us: u64,
-    pub geosite_cache_hits: u64,
-    pub geosite_walks: u64,
-    pub tc_fallbacks: u64,
-    pub udp_recv_restarts: u64,
-    pub routed_none_race: u64,
-    pub routed_null: u64,
-    pub routed_group: u64,
-    pub routed_aaaa_filtered: u64,
 }
 
 pub struct QueryLatencySnapshot {

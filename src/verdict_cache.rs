@@ -27,9 +27,10 @@
 //! verdicts expire at their original deadline rather than getting a fresh TTL.
 
 use crate::config::VerdictCacheConfig;
+use crate::persist::atomic_write;
 use anyhow::{Context, Result};
 use moka::sync::Cache;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -154,13 +155,6 @@ impl VerdictCache {
         cache.run_pending_tasks();
         let now = now_unix();
 
-        let mut tmp_os = path.as_os_str().to_os_string();
-        tmp_os.push(".tmp");
-        let tmp = PathBuf::from(tmp_os);
-        let file =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut w = BufWriter::new(file);
-
         let mut entries: Vec<(Arc<String>, VerdictEntry)> = Vec::new();
         for (k, v) in cache.iter() {
             if self.is_expired(v.inserted_unix, now) {
@@ -169,22 +163,21 @@ impl VerdictCache {
             entries.push((k, v));
         }
 
-        w.write_all(PERSIST_MAGIC)?;
-        w.write_all(&fingerprint.to_le_bytes())?;
-        w.write_all(&(entries.len() as u32).to_le_bytes())?;
-        for (qname, entry) in &entries {
-            w.write_all(&entry.inserted_unix.to_le_bytes())?;
-            w.write_all(&[entry.is_primary as u8])?;
-            let b = qname.as_bytes();
-            w.write_all(&(b.len() as u16).to_le_bytes())?;
-            w.write_all(b)?;
-        }
-
-        w.flush()?;
-        drop(w);
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-        Ok(entries.len())
+        let count = entries.len();
+        atomic_write(path, |w| {
+            w.write_all(PERSIST_MAGIC)?;
+            w.write_all(&fingerprint.to_le_bytes())?;
+            w.write_all(&(count as u32).to_le_bytes())?;
+            for (qname, entry) in &entries {
+                w.write_all(&entry.inserted_unix.to_le_bytes())?;
+                w.write_all(&[entry.is_primary as u8])?;
+                let b = qname.as_bytes();
+                w.write_all(&(b.len() as u16).to_le_bytes())?;
+                w.write_all(b)?;
+            }
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     /// Load verdicts from `path`, skipping entries past their original deadline.

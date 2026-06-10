@@ -24,11 +24,12 @@
 use crate::config::{CacheConfig, GroupCachePolicy};
 use crate::dns;
 use crate::fnv::Fnv1a;
+use crate::persist::atomic_write;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use moka::sync::Cache;
 use std::cmp::Ordering as CmpOrdering;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -519,11 +520,6 @@ impl DnsCache {
             .unwrap_or_default()
             .as_secs();
 
-        let tmp = path.with_extension("tmp");
-        let file =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut w = BufWriter::new(file);
-
         // Collect live, non-sentinel entries.
         // Sentinel entries (NXDOMAIN cross-qtype keys) are excluded: they are re-derived
         // automatically on load when the canonical NXDOMAIN entry is inserted.
@@ -545,59 +541,58 @@ impl DnsCache {
             entries.push((*key, entry));
         }
 
-        // Magic encodes format implicitly; change it when the on-disk layout changes.
-        // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-        w.write_all(b"PDNSC004")?;
-        w.write_all(&fingerprint.to_le_bytes())?;
-        w.write_all(&(entries.len() as u32).to_le_bytes())?;
+        let count = entries.len();
+        atomic_write(path, |w| {
+            // Magic encodes format implicitly; change it when the on-disk layout changes.
+            // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
+            w.write_all(b"PDNSC004")?;
+            w.write_all(&fingerprint.to_le_bytes())?;
+            w.write_all(&(count as u32).to_le_bytes())?;
 
-        for (key, entry) in &entries {
-            let elapsed = entry.inserted.elapsed().as_secs();
-            let remaining = (entry.ttl as u64).saturating_sub(elapsed);
-            let stale_remaining = entry
-                .stale_until
-                .saturating_duration_since(now_instant)
-                .as_secs();
-            let expire_unix = now_unix + remaining;
-            let stale_until_unix = now_unix + stale_remaining;
+            for (key, entry) in &entries {
+                let elapsed = entry.inserted.elapsed().as_secs();
+                let remaining = (entry.ttl as u64).saturating_sub(elapsed);
+                let stale_remaining = entry
+                    .stale_until
+                    .saturating_duration_since(now_instant)
+                    .as_secs();
+                let expire_unix = now_unix + remaining;
+                let stale_until_unix = now_unix + stale_remaining;
 
-            w.write_all(&key.to_le_bytes())?;
-            w.write_all(&expire_unix.to_le_bytes())?;
-            w.write_all(&stale_until_unix.to_le_bytes())?;
-            w.write_all(&entry.ttl.to_le_bytes())?;
+                w.write_all(&key.to_le_bytes())?;
+                w.write_all(&expire_unix.to_le_bytes())?;
+                w.write_all(&stale_until_unix.to_le_bytes())?;
+                w.write_all(&entry.ttl.to_le_bytes())?;
 
-            let question: &[u8] = &entry.question;
-            w.write_all(&(question.len() as u32).to_le_bytes())?;
-            w.write_all(question)?;
+                let question: &[u8] = &entry.question;
+                w.write_all(&(question.len() as u32).to_le_bytes())?;
+                w.write_all(question)?;
 
-            w.write_all(&(entry.packet.len() as u32).to_le_bytes())?;
-            w.write_all(&entry.packet)?;
+                w.write_all(&(entry.packet.len() as u32).to_le_bytes())?;
+                w.write_all(&entry.packet)?;
 
-            w.write_all(&(entry.query.len() as u32).to_le_bytes())?;
-            w.write_all(&entry.query)?;
+                w.write_all(&(entry.query.len() as u32).to_le_bytes())?;
+                w.write_all(&entry.query)?;
 
-            let qname = entry.qname.as_bytes();
-            w.write_all(&(qname.len() as u32).to_le_bytes())?;
-            w.write_all(qname)?;
+                let qname = entry.qname.as_bytes();
+                w.write_all(&(qname.len() as u32).to_le_bytes())?;
+                w.write_all(qname)?;
 
-            let offsets: &[usize] = &entry.ttl_offsets;
-            w.write_all(&(offsets.len() as u32).to_le_bytes())?;
-            for &off in offsets {
-                w.write_all(&(off as u32).to_le_bytes())?;
+                let offsets: &[usize] = &entry.ttl_offsets;
+                w.write_all(&(offsets.len() as u32).to_le_bytes())?;
+                for &off in offsets {
+                    w.write_all(&(off as u32).to_le_bytes())?;
+                }
+
+                w.write_all(&entry.max_ttl.to_le_bytes())?;
+                w.write_all(&entry.stale_ttl.to_le_bytes())?;
+                // refresh_percent: u32::MAX encodes None.
+                w.write_all(&entry.refresh_percent.unwrap_or(u32::MAX).to_le_bytes())?;
+                w.write_all(&entry.group_id.to_le_bytes())?;
             }
-
-            w.write_all(&entry.max_ttl.to_le_bytes())?;
-            w.write_all(&entry.stale_ttl.to_le_bytes())?;
-            // refresh_percent: u32::MAX encodes None.
-            w.write_all(&entry.refresh_percent.unwrap_or(u32::MAX).to_le_bytes())?;
-            w.write_all(&entry.group_id.to_le_bytes())?;
-        }
-
-        w.flush()?;
-        drop(w);
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-        Ok(entries.len())
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     /// Load cache entries from `path`. Skips expired entries. Returns count loaded.

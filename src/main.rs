@@ -14,6 +14,7 @@ mod ipset;
 mod listener;
 mod log;
 mod metrics;
+mod persist;
 mod pipeline;
 mod router;
 mod routing_index;
@@ -65,12 +66,12 @@ async fn async_main(cfg: Config) -> Result<()> {
         if let Some(path) = state.cfg.cache_persist_path.clone() {
             let s = state.clone();
             let fp = config::cache_fingerprint(&s.cfg);
+            let vpath = verdict_cache::persist_path_for(&path);
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                     s.cfg.cache_persist_interval,
                 ));
                 ticker.tick().await; // skip immediate first tick
-                let vpath = verdict_cache::persist_path_for(&path);
                 loop {
                     ticker.tick().await;
                     match s.cache.save_to_file(&path, fp) {
@@ -85,6 +86,20 @@ async fn async_main(cfg: Config) -> Result<()> {
                     }
                 }
             });
+        }
+    }
+
+    // Load verdict cache from disk on startup if DNS cache persistence is configured.
+    if let Some(path) = &state.cfg.cache_persist_path {
+        if state.verdict_cache.enabled() {
+            let fp = config::cache_fingerprint(&state.cfg);
+            let vpath = verdict_cache::persist_path_for(path);
+            if vpath.exists() {
+                match state.verdict_cache.load_from_file(&vpath, fp) {
+                    Ok(n) => startup!("verdict_cache persist=loaded entries={n}"),
+                    Err(e) => startup!("verdict_cache persist=load_failed error={e:#}"),
+                }
+            }
         }
     }
 
