@@ -7,6 +7,7 @@ mod config;
 mod config_json;
 mod dns;
 mod domain;
+mod fnv;
 mod geosite;
 mod ipset;
 #[cfg(unix)]

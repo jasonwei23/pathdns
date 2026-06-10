@@ -539,17 +539,20 @@ async fn exchange_with_dedupe(
                             .position(|sg| std::ptr::eq(sg, *g))
                             .map(|i| i as u16)
                             .unwrap_or(u16::MAX);
-                        (g.cache_policy.as_ref(), gid)
+                        (g.cache_policy, gid)
                     }
-                    _ => (None, u16::MAX),
+                    // Race/none targets carry no group policy; use the global defaults.
+                    _ => (state.cache.resolve_policy(None), u16::MAX),
                 };
                 state.cache.add(
-                    ck,
-                    ctx.info.qname.clone(),
-                    ctx.info.question_end,
-                    &query_for_cache,
-                    resp.as_ref(),
-                    cache_policy,
+                    crate::cache::CacheInsert {
+                        key: ck,
+                        qname: ctx.info.qname.clone(),
+                        question_end: ctx.info.question_end,
+                        query: &query_for_cache,
+                        packet: resp.as_ref(),
+                    },
+                    &cache_policy,
                     group_id,
                 );
             }

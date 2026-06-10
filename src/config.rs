@@ -716,22 +716,15 @@ fn parse_upstreams(items: &[String]) -> Result<Vec<UpstreamEndpoint>> {
 /// Covers: groups (name, tags, filter_qtype, cache policy), fallback routing, global
 /// cache TTL settings, and GeoSite file paths.
 pub fn cache_fingerprint(cfg: &Config) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-
-    let mut h = FNV_OFFSET;
+    let mut h = crate::fnv::Fnv1a::new();
     macro_rules! feed {
         ($bytes:expr) => {
-            for &b in $bytes {
-                h ^= b as u64;
-                h = h.wrapping_mul(FNV_PRIME);
-            }
+            h.write($bytes)
         };
     }
     macro_rules! sep {
         () => {
-            h ^= 0x00FF_FF00;
-            h = h.wrapping_mul(FNV_PRIME);
+            h.write_sep()
         };
     }
 
@@ -812,7 +805,7 @@ pub fn cache_fingerprint(cfg: &Config) -> u64 {
         sep!();
     }
 
-    h
+    h.finish()
 }
 
 fn parse_ipset_pair(value: &str) -> Result<IpSetPair> {

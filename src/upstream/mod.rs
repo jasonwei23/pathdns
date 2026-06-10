@@ -27,6 +27,7 @@
 //! A UDP response with TC=1 triggers an automatic one-shot TCP retry.
 
 mod doh;
+mod inflight;
 #[cfg(any(feature = "doq", feature = "h3"))]
 mod quic;
 mod tcp_mux;

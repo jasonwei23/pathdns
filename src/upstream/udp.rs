@@ -1,19 +1,14 @@
-use super::{apply_ecs_mode, mix16, random_id_seed, tcp_exchange_packet, UpstreamRequest};
+use super::inflight::{Completion, InflightRegistry};
+use super::{apply_ecs_mode, tcp_exchange_packet, UpstreamRequest};
 use crate::config::EcsMode;
 use crate::dns;
 use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
-use rustc_hash::FxBuildHasher;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
-
-// Inflight entry: (response sender, original client_id, question bytes for mismatch detection)
-type InflightEntry = (oneshot::Sender<Bytes>, u16, Bytes);
 
 pub(super) struct UdpUpstream {
     pub(super) name: String,
@@ -21,24 +16,8 @@ pub(super) struct UdpUpstream {
     sockets: Vec<Arc<UdpSocket>>,
     send_idx: AtomicUsize,
     timeout: Duration,
-    /// Counter seeded from system time at startup; mixed through `mix16` before use
-    /// so that upstream query IDs are non-sequential and unpredictable.
-    id: AtomicU32,
-    inflight: DashMap<u16, InflightEntry, FxBuildHasher>,
-    /// Maximum concurrent in-flight queries (0 = unlimited).
-    max_inflight: usize,
+    inflight: InflightRegistry,
     ecs_mode: EcsMode,
-}
-
-struct InflightGuard<'a> {
-    upstream: &'a UdpUpstream,
-    id: u16,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.upstream.remove_inflight(self.id);
-    }
 }
 
 impl UdpUpstream {
@@ -80,9 +59,7 @@ impl UdpUpstream {
             sockets,
             send_idx: AtomicUsize::new(0),
             timeout,
-            id: AtomicU32::new(random_id_seed()),
-            inflight: DashMap::with_hasher(FxBuildHasher),
-            max_inflight,
+            inflight: InflightRegistry::new(max_inflight),
             ecs_mode,
         });
         for i in 0..upstream.sockets.len() {
@@ -108,11 +85,9 @@ impl UdpUpstream {
         let raw_packet = apply_ecs_mode(&req.packet, &self.ecs_mode);
         let mut packet = BytesMut::from(raw_packet.as_ref());
         let question = req.question.clone(); // keep a copy for TC-fallback validation
-        let (upstream_id, rx) = self.register_inflight(req.client_id, req.question)?;
-        let _guard = InflightGuard {
-            upstream: self,
-            id: upstream_id,
-        };
+        let (upstream_id, rx, _guard) =
+            self.inflight
+                .register(&self.name, req.client_id, req.question)?;
         dns::set_id(&mut packet, upstream_id)?;
 
         let socket_idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
@@ -175,40 +150,6 @@ impl UdpUpstream {
         }
     }
 
-    fn register_inflight(
-        &self,
-        client_id: u16,
-        question: Bytes,
-    ) -> Result<(u16, oneshot::Receiver<Bytes>)> {
-        if self.max_inflight > 0 && self.inflight.len() >= self.max_inflight {
-            return Err(anyhow!(
-                "upstream {} inflight cap ({}) reached",
-                self.name,
-                self.max_inflight
-            ));
-        }
-        let (tx, rx) = oneshot::channel();
-        let mut tx = Some(tx);
-        for _ in 0..u16::MAX {
-            let id = mix16(self.id.fetch_add(1, Ordering::Relaxed));
-            match self.inflight.entry(id) {
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    let Some(tx) = tx.take() else {
-                        return Err(anyhow!("upstream {} sender already registered", self.name));
-                    };
-                    e.insert((tx, client_id, question));
-                    return Ok((id, rx));
-                }
-                dashmap::mapref::entry::Entry::Occupied(_) => continue,
-            }
-        }
-        Err(anyhow!("upstream {} inflight table is full", self.name))
-    }
-
-    fn remove_inflight(&self, id: u16) {
-        self.inflight.remove(&id);
-    }
-
     async fn recv_loop(self: Arc<Self>, socket_idx: usize) -> Result<()> {
         let socket = &self.sockets[socket_idx];
         let mut buf = BytesMut::with_capacity(4096);
@@ -219,32 +160,8 @@ impl UdpUpstream {
                 buf.reserve(4096 - buf.capacity());
             }
             let n = socket.recv_buf(&mut buf).await?;
-            if !dns::is_reply(&buf[..n]) {
-                continue;
-            }
-            let id = match dns::get_id(&buf[..n]) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-            // Peek first; only remove after question validation so a stale/spoofed
-            // response with a recycled ID cannot destroy the live waiter's sender.
-            if let Some(entry) = self.inflight.get(&id) {
-                let resp_qend = dns::question_end(&buf[..n]);
-                let resp_question = resp_qend
-                    .and_then(|end| buf.get(12..end))
-                    .unwrap_or(&[][..]);
-                if !dns::questions_match(resp_question, &entry.2) {
-                    crate::verbose!(
-                        "upstream name={} proto=udp remote={} event=question_mismatch id={id} — keeping inflight, dropping stale/spoofed response",
-                        self.name,
-                        self.remote
-                    );
-                    continue; // entry stays; real response can still arrive
-                }
-                drop(entry); // release shared ref before taking ownership
-                if let Some((_, (tx, client_id, _))) = self.inflight.remove(&id) {
-                    let _ = dns::set_id(&mut buf[..n], client_id);
-                    let _ = tx.send(buf.split_to(n).freeze());
+            match self.inflight.complete(&mut buf, n) {
+                Completion::Delivered => {
                     recv_count += 1;
                     // Yield every 100 dispatched responses to prevent monopolizing the Tokio
                     // worker during burst periods where many responses arrive back-to-back.
@@ -253,6 +170,14 @@ impl UdpUpstream {
                         tokio::task::yield_now().await;
                     }
                 }
+                Completion::Mismatch(id) => {
+                    crate::verbose!(
+                        "upstream name={} proto=udp remote={} event=question_mismatch id={id} — keeping inflight, dropping stale/spoofed response",
+                        self.name,
+                        self.remote
+                    );
+                }
+                Completion::NoWaiter => {}
             }
         }
     }

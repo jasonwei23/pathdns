@@ -98,6 +98,34 @@ pub fn questions_match(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+/// Case-insensitive comparison of the QNAME portions (up to and including the 0x00
+/// terminator) of two DNS question slices, ignoring QTYPE/QCLASS.
+/// Used for NXDOMAIN cross-qtype sentinel validation in the cache.
+pub fn qnames_match(a: &[u8], b: &[u8]) -> bool {
+    let mut pos = 0;
+    loop {
+        let len_a = *a.get(pos).unwrap_or(&0);
+        let len_b = *b.get(pos).unwrap_or(&0);
+        if len_a != len_b {
+            return false;
+        }
+        pos += 1;
+        if len_a == 0 {
+            return true;
+        }
+        let end = pos + len_a as usize;
+        if end > a.len() || end > b.len() {
+            return false;
+        }
+        for i in pos..end {
+            if !a[i].eq_ignore_ascii_case(&b[i]) {
+                return false;
+            }
+        }
+        pos = end;
+    }
+}
+
 // Shared internal helpers.
 
 /// Walk a compressed or uncompressed DNS name starting at `pos`.

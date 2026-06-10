@@ -66,7 +66,8 @@ pub struct RefreshGate {
 pub struct CustomGroup {
     pub name: String,
     pub upstream: Option<UpstreamPool>,
-    pub cache_policy: Option<crate::config::GroupCachePolicy>,
+    /// Group cache policy merged over global defaults at startup.
+    pub cache_policy: crate::cache::ResolvedCachePolicy,
     pub filter_qtype: std::collections::HashSet<u16>,
     pub geosite_include: Vec<String>,
     pub geosite_exclude: Vec<String>,
@@ -95,6 +96,10 @@ impl AppState {
         );
         let upstream_cfg = cfg.upstream_config();
 
+        // Cache is created before the groups so each group's cache policy can be
+        // resolved against the global defaults once, at startup.
+        let cache = DnsCache::new(&cfg.cache_config());
+
         // Build custom group pools.
         let mut groups = Vec::new();
         for spec in &cfg.groups {
@@ -118,7 +123,7 @@ impl AppState {
             groups.push(CustomGroup {
                 name: spec.name.clone(),
                 upstream,
-                cache_policy: spec.cache_policy.clone(),
+                cache_policy: cache.resolve_policy(spec.cache_policy.as_ref()),
                 filter_qtype: spec.filter_qtype.iter().copied().collect(),
                 geosite_include: spec.geosite_include.clone(),
                 geosite_exclude: spec.geosite_exclude.clone(),
@@ -128,7 +133,6 @@ impl AppState {
         // Resolve fallback group indices.
         let fallback = resolve_fallback(&cfg, &groups)?;
 
-        let cache = DnsCache::new(&cfg.cache_config());
         if cache.enabled() {
             crate::startup!(
                 "cache capacity={} stale-expire-ttl={}s stale-ttl={}s stale-ttl-reset={} stale-client-timeout={}ms refresh={} refresh-min-ttl={}",
