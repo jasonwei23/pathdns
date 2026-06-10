@@ -254,7 +254,7 @@ impl Config {
                 .map(|n| n.get())
                 .unwrap_or(2)
         });
-        let max_inflight = json.max_inflight.unwrap_or(worker_threads * 1024);
+        let max_inflight = json.max_inflight.unwrap_or(2048);
         if max_inflight < 1 {
             return Err(anyhow!("max-inflight must be at least 1"));
         }
@@ -293,15 +293,15 @@ impl Config {
                 })
         });
 
-        let cache_min_ttl = json.cache.as_ref().and_then(|c| c.min_ttl).unwrap_or(0);
-        let cache_max_ttl = json.cache.as_ref().and_then(|c| c.max_ttl).unwrap_or(0);
+        let cache_min_ttl = json.cache.as_ref().and_then(|c| c.min_ttl).unwrap_or(60);
+        let cache_max_ttl = json.cache.as_ref().and_then(|c| c.max_ttl).unwrap_or(86400);
         if cache_max_ttl > 0 && cache_min_ttl > cache_max_ttl {
             return Err(anyhow!(
                 "cache.min-ttl {cache_min_ttl} cannot exceed cache.max-ttl {cache_max_ttl}"
             ));
         }
 
-        let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
+        let udp_buf_size = json.udp_buf_size.unwrap_or(256 * 1024);
         let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads).max(1);
 
         // Parse querylog section.
@@ -376,7 +376,7 @@ impl Config {
             bind: bind_addrs,
             listen_udp,
             listen_tcp,
-            timeout: Duration::from_millis(json.timeout_ms.unwrap_or(5000)),
+            timeout: Duration::from_millis(json.timeout_ms.unwrap_or(3000)),
             max_inflight,
             inflight_queue_ms,
             worker_threads,
@@ -387,8 +387,8 @@ impl Config {
                 .cache
                 .as_ref()
                 .and_then(|c| c.stale_expire_ttl)
-                .unwrap_or(0),
-            cache_stale_ttl: json.cache.as_ref().and_then(|c| c.stale_ttl).unwrap_or(30),
+                .unwrap_or(86400),
+            cache_stale_ttl: json.cache.as_ref().and_then(|c| c.stale_ttl).unwrap_or(3600),
             cache_stale_ttl_reset: json
                 .cache
                 .as_ref()

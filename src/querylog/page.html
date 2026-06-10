@@ -207,11 +207,11 @@ tr:hover td{background:var(--surface2)}
       <div style="overflow-x:auto">
         <table id="ql-table">
           <thead><tr>
-            <th>Time</th><th>Client</th><th>Proto</th><th>QName</th>
+            <th>Time</th><th>Client</th><th>QName</th>
             <th>Type</th><th>RCode</th><th>Elapsed</th><th>Source</th>
             <th>Group</th>
           </tr></thead>
-          <tbody id="ql-tbody"><tr><td colspan="9" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
+          <tbody id="ql-tbody"><tr><td colspan="8" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
         </table>
       </div>
       <div class="more-btn-wrap">
@@ -427,10 +427,20 @@ async function loadQueryLog() {
   }
 }
 
+const RCODE_NAMES = {0:'NOERROR',1:'FORMERR',2:'SERVFAIL',3:'NXDOMAIN',4:'NOTIMP',5:'REFUSED',6:'YXDOMAIN',7:'YXRRSET',8:'NXRRSET',9:'NOTAUTH',10:'NOTZONE'};
+const RCODE_OK  = new Set([0]);
+const RCODE_WARN = new Set([3,5]);
+
+function rcodeTag(code) {
+  const name = RCODE_NAMES[code] || ('RCODE' + code);
+  const cls = RCODE_OK.has(code) ? 'badge-ok' : RCODE_WARN.has(code) ? 'badge-null' : 'badge-err';
+  return '<span class="badge ' + cls + '">' + name + '</span>';
+}
+
 function renderQueryLog() {
   const tbody = document.getElementById('ql-tbody');
   if (!qlEvents.length) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text2);text-align:center">No entries</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text2);text-align:center">No entries</td></tr>';
     return;
   }
   const frag = document.createDocumentFragment();
@@ -439,18 +449,12 @@ function renderQueryLog() {
     const t = new Date(ev.time);
     const timeStr = t.toLocaleTimeString();
     const src = sourceTag(ev.source);
-    const rcode = ev.rcode === 0
-      ? '<span class="badge badge-ok">NOERR</span>'
-      : ev.rcode === 3
-      ? '<span class="badge badge-err">NXDOM</span>'
-      : '<span class="badge badge-err">' + ev.rcode + '</span>';
     tr.innerHTML =
       '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
       '<td>' + esc(ev.client) + '</td>' +
-      '<td>' + esc(ev.protocol) + '</td>' +
       '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
       '<td>' + esc(ev.qtype_name) + '</td>' +
-      '<td>' + rcode + '</td>' +
+      '<td>' + rcodeTag(ev.rcode) + '</td>' +
       '<td>' + fmtRtt(ev.elapsed_us) + '</td>' +
       '<td>' + src + '</td>' +
       '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';

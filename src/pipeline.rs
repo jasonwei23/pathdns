@@ -134,11 +134,33 @@ pub(crate) fn try_fast_path(
 ) -> FastPathOutcome {
     let t0 = state.querylog.collecting().then(Instant::now);
 
+    // Non-QUERY opcodes (STATUS, NOTIFY, UPDATE, …): return NOTIMP per RFC 1035.
+    if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        return FastPathOutcome::Response {
+            resp: Bytes::from(dns::notimp_opcode_reply(packet)),
+            refresh: None,
+        };
+    }
+
     let fast_info = match dns::parse_query_fast(packet) {
         Ok(info) => info,
         Err(_) => return FastPathOutcome::Drop,
     };
     record_query_received(&state.querylog, proto);
+
+    // Non-IN/non-ANY QCLASS: return NOTIMP per RFC 1035.
+    {
+        let i = fast_info.question_end.saturating_sub(2);
+        let qclass = u16::from_be_bytes([packet[i], packet[i + 1]]);
+        if qclass != 1 && qclass != 255 {
+            return FastPathOutcome::Response {
+                resp: Bytes::from(
+                    dns::notimp_reply(packet, fast_info.question_end).unwrap_or_default(),
+                ),
+                refresh: None,
+            };
+        }
+    }
 
     // Fast cache read: no qname allocation needed.
     if let Some(hit) = state
@@ -192,11 +214,33 @@ pub(crate) fn try_fast_path_into(
 ) -> FastPathOutcome {
     let t0 = state.querylog.collecting().then(Instant::now);
 
+    // Non-QUERY opcodes: return NOTIMP per RFC 1035.
+    if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        return FastPathOutcome::Response {
+            resp: Bytes::from(dns::notimp_opcode_reply(packet)),
+            refresh: None,
+        };
+    }
+
     let fast_info = match dns::parse_query_fast(packet) {
         Ok(info) => info,
         Err(_) => return FastPathOutcome::Drop,
     };
     record_query_received(&state.querylog, ClientProto::Udp);
+
+    // Non-IN/non-ANY QCLASS: return NOTIMP.
+    {
+        let i = fast_info.question_end.saturating_sub(2);
+        let qclass = u16::from_be_bytes([packet[i], packet[i + 1]]);
+        if qclass != 1 && qclass != 255 {
+            return FastPathOutcome::Response {
+                resp: Bytes::from(
+                    dns::notimp_reply(packet, fast_info.question_end).unwrap_or_default(),
+                ),
+                refresh: None,
+            };
+        }
+    }
 
     // Cache hit: write directly into the caller-provided send buffer.
     if let Some(meta) = state
