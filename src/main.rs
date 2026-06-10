@@ -80,7 +80,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         .is_some_and(|addr| !addr.ip().is_loopback())
         && state.cfg.querylog.token.is_none()
     {
-        eprintln!("warn: querylog api is exposed without authentication");
+        eprintln!("warn: web dashboard is exposed without authentication");
     }
     pipeline::spawn_refresh_worker(state.clone(), refresh_rx);
     server::spawn_reload_watchers(state.clone());
@@ -106,7 +106,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         if let Some(addr) = api_bind {
             let api_listener = tokio::net::TcpListener::bind(addr)
                 .await
-                .map_err(|e| anyhow::anyhow!("web ui: failed to bind {addr}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
             startup!("listening web=http://{addr}");
             let api_stats = stats_ring.clone();
             tokio::spawn(crate::querylog::api::serve(
@@ -117,7 +117,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         // No collection (memory=0) but still serve API for stats.
         let api_listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| anyhow::anyhow!("web ui: failed to bind {addr}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
         startup!("listening web=http://{addr}");
         let api_ring = std::sync::Arc::new(crate::querylog::ring::EventRing::new(0));
         tokio::spawn(crate::querylog::api::serve(
