@@ -54,6 +54,7 @@ pub(super) struct DoQUpstream {
     timeout: Duration,
     ecs_mode: EcsMode,
     next_id: AtomicU32,
+    inflight: Arc<tokio::sync::Semaphore>,
     /// Active QUIC connection; `None` when not connected or after error.
     connection: tokio::sync::Mutex<Option<quinn::Connection>>,
 }
@@ -66,9 +67,15 @@ impl DoQUpstream {
         server_name: String,
         timeout: Duration,
         ecs_mode: EcsMode,
+        max_inflight: usize,
     ) -> Result<Self> {
         let endpoint = make_quic_endpoint(remote, &name, b"doq")?;
         crate::verbose!("upstream name={name} proto=doq remote={remote} sni={server_name}");
+        let permits = if max_inflight > 0 {
+            max_inflight
+        } else {
+            tokio::sync::Semaphore::MAX_PERMITS
+        };
         Ok(Self {
             name,
             endpoint,
@@ -77,6 +84,7 @@ impl DoQUpstream {
             timeout,
             ecs_mode,
             next_id: AtomicU32::new(random_id_seed()),
+            inflight: Arc::new(tokio::sync::Semaphore::new(permits)),
             connection: tokio::sync::Mutex::new(None),
         })
     }
@@ -106,6 +114,13 @@ impl DoQUpstream {
     }
 
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
+        let _permit = self
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
+
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
         let mut pkt = raw.to_vec();
         let upstream_id = mix16(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -161,8 +176,18 @@ impl DoQUpstream {
 
 // HTTP/3 DoH upstream.
 //
-// Requires `--features h3` (which implies `doq`).  Uses per-query QUIC
-// connections for simplicity; the h3 driver is run in a background task.
+// Requires `--features h3` (which implies `doq`).  Uses a persistent QUIC+h3
+// connection per upstream node; each DNS query opens a new h3 request stream.
+// The h3 driver is run in a background task.
+
+#[cfg(feature = "h3")]
+type H3SendReq = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
+
+#[cfg(feature = "h3")]
+struct H3Conn {
+    quic: quinn::Connection,
+    send_req: H3SendReq,
+}
 
 #[cfg(feature = "h3")]
 pub(super) struct H3Upstream {
@@ -174,6 +199,8 @@ pub(super) struct H3Upstream {
     timeout: Duration,
     ecs_mode: EcsMode,
     next_id: AtomicU32,
+    inflight: Arc<tokio::sync::Semaphore>,
+    connection: tokio::sync::Mutex<Option<H3Conn>>,
 }
 
 #[cfg(feature = "h3")]
@@ -185,11 +212,17 @@ impl H3Upstream {
         path: String,
         timeout: Duration,
         ecs_mode: EcsMode,
+        max_inflight: usize,
     ) -> Result<Self> {
         let endpoint = make_quic_endpoint(remote, &name, b"h3")?;
         crate::verbose!(
             "upstream name={name} proto=h3 remote={remote} sni={server_name} path={path}"
         );
+        let permits = if max_inflight > 0 {
+            max_inflight
+        } else {
+            tokio::sync::Semaphore::MAX_PERMITS
+        };
         Ok(Self {
             name,
             endpoint,
@@ -199,10 +232,66 @@ impl H3Upstream {
             timeout,
             ecs_mode,
             next_id: AtomicU32::new(random_id_seed()),
+            inflight: Arc::new(tokio::sync::Semaphore::new(permits)),
+            connection: tokio::sync::Mutex::new(None),
         })
     }
 
+    async fn get_or_connect(&self) -> Result<H3SendReq> {
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            if conn.quic.close_reason().is_none() {
+                return Ok(conn.send_req.clone());
+            }
+        }
+        // Establish a new QUIC+h3 connection.
+        let setup_fut = async {
+            let connecting = self
+                .endpoint
+                .connect(self.remote, &self.server_name)
+                .map_err(|e| anyhow!("upstream {}: H3 connect error: {e}", self.name))?;
+            let quic_conn = connecting
+                .await
+                .with_context(|| format!("upstream {}: H3 QUIC handshake failed", self.name))?;
+
+            let h3_conn = h3_quinn::Connection::new(quic_conn.clone());
+            let (mut driver, send_req) = h3::client::new(h3_conn)
+                .await
+                .map_err(|e| anyhow!("upstream {}: H3 connection init failed: {e}", self.name))?;
+
+            tokio::spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+
+            Ok::<(quinn::Connection, H3SendReq), anyhow::Error>((quic_conn, send_req))
+        };
+
+        let (quic_conn, send_req) = tokio::time::timeout(self.timeout, setup_fut)
+            .await
+            .map_err(|_| anyhow!("upstream {}: H3 connect timeout", self.name))??;
+
+        crate::verbose!(
+            "upstream name={} proto=h3 remote={} event=connected",
+            self.name,
+            self.remote
+        );
+
+        let cloned = send_req.clone();
+        *guard = Some(H3Conn {
+            quic: quic_conn,
+            send_req,
+        });
+        Ok(cloned)
+    }
+
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
+        let _permit = self
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
+
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
         let mut pkt = raw.to_vec();
         let upstream_id = mix16(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -216,33 +305,19 @@ impl H3Upstream {
     }
 
     async fn do_exchange(&self, pkt: Vec<u8>) -> Result<Vec<u8>> {
-        let fut = async {
-            let connecting = self
-                .endpoint
-                .connect(self.remote, &self.server_name)
-                .map_err(|e| anyhow!("upstream {}: H3 connect error: {e}", self.name))?;
-            let quic_conn = connecting
-                .await
-                .with_context(|| format!("upstream {}: H3 QUIC handshake failed", self.name))?;
+        let mut send_req = self.get_or_connect().await?;
 
-            let h3_conn = h3_quinn::Connection::new(quic_conn);
-            let (mut driver, mut send_req) = h3::client::new(h3_conn)
-                .await
-                .map_err(|e| anyhow!("upstream {}: H3 connection init failed: {e}", self.name))?;
+        let name: &str = &self.name;
+        let uri: http::Uri = format!(
+            "https://{}:{}{}",
+            self.server_name,
+            self.remote.port(),
+            self.path
+        )
+        .parse()
+        .map_err(|e| anyhow!("upstream {name}: H3 URI parse failed: {e}"))?;
 
-            tokio::spawn(async move {
-                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            });
-
-            let uri: http::Uri = format!(
-                "https://{}:{}{}",
-                self.server_name,
-                self.remote.port(),
-                self.path
-            )
-            .parse()
-            .map_err(|e| anyhow!("upstream {}: H3 URI parse failed: {e}", self.name))?;
-
+        let fut = async move {
             let request = http::Request::builder()
                 .method(http::Method::POST)
                 .uri(uri)
@@ -250,31 +325,30 @@ impl H3Upstream {
                 .header("accept", "application/dns-message")
                 .header("content-length", pkt.len().to_string())
                 .body(())
-                .map_err(|e| anyhow!("upstream {}: H3 request build failed: {e}", self.name))?;
+                .map_err(|e| anyhow!("upstream {name}: H3 request build failed: {e}"))?;
 
             let mut stream = send_req
                 .send_request(request)
                 .await
-                .map_err(|e| anyhow!("upstream {}: H3 send_request failed: {e}", self.name))?;
+                .map_err(|e| anyhow!("upstream {name}: H3 send_request failed: {e}"))?;
 
             stream
                 .send_data(bytes::Bytes::from(pkt))
                 .await
-                .map_err(|e| anyhow!("upstream {}: H3 send_data failed: {e}", self.name))?;
+                .map_err(|e| anyhow!("upstream {name}: H3 send_data failed: {e}"))?;
             stream
                 .finish()
                 .await
-                .map_err(|e| anyhow!("upstream {}: H3 stream finish failed: {e}", self.name))?;
+                .map_err(|e| anyhow!("upstream {name}: H3 stream finish failed: {e}"))?;
 
             let response = stream
                 .recv_response()
                 .await
-                .map_err(|e| anyhow!("upstream {}: H3 recv_response failed: {e}", self.name))?;
+                .map_err(|e| anyhow!("upstream {name}: H3 recv_response failed: {e}"))?;
 
             if response.status() != http::StatusCode::OK {
                 return Err(anyhow!(
-                    "upstream {}: H3 HTTP/3 {}",
-                    self.name,
+                    "upstream {name}: H3 HTTP/3 {}",
                     response.status()
                 ));
             }
@@ -293,14 +367,29 @@ impl H3Upstream {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        return Err(anyhow!("upstream {}: H3 recv_data failed: {e}", self.name))
+                        return Err(anyhow!("upstream {name}: H3 recv_data failed: {e}"))
                     }
                 }
             }
             Ok(body)
         };
-        tokio::time::timeout(self.timeout, fut)
+
+        let result = tokio::time::timeout(self.timeout, fut)
             .await
-            .map_err(|_| anyhow!("upstream {}: H3 timeout", self.name))?
+            .map_err(|_| anyhow!("upstream {}: H3 timeout", self.name))?;
+
+        // On connection-level failure, evict the stored connection so the next query
+        // reconnects.  Stream/HTTP errors do not evict the connection.
+        if result.is_err() {
+            let guard = self.connection.lock().await;
+            if let Some(conn) = guard.as_ref() {
+                if conn.quic.close_reason().is_some() {
+                    drop(guard);
+                    *self.connection.lock().await = None;
+                }
+            }
+        }
+
+        result
     }
 }

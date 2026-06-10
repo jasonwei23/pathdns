@@ -345,6 +345,7 @@ impl UpstreamPool {
                         server_name,
                         cfg.timeout,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_inflight,
                     )?
                 }
                 UpstreamProto::H3 => {
@@ -367,6 +368,7 @@ impl UpstreamPool {
                         path,
                         cfg.timeout,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_inflight,
                     )?
                 }
             };
@@ -410,10 +412,10 @@ impl UpstreamPool {
             crate::startup!("{msg}");
         }
         crate::verbose!(
-            "upstream {} nodes={} timeout={}s",
+            "upstream {} nodes={} timeout={}ms",
             name,
             nodes.len(),
-            cfg.timeout.as_secs()
+            cfg.timeout.as_millis()
         );
         Ok(Self {
             nodes,
@@ -767,6 +769,7 @@ fn make_doq_transport(
     server_name: String,
     timeout: Duration,
     ecs_mode: EcsMode,
+    max_inflight: usize,
 ) -> Result<UpstreamTransport> {
     #[cfg(feature = "doq")]
     return Ok(UpstreamTransport::Doq(Arc::new(DoQUpstream::new(
@@ -775,8 +778,9 @@ fn make_doq_transport(
         server_name,
         timeout,
         ecs_mode,
+        max_inflight,
     )?)));
-    drop((name, remote, server_name, timeout, ecs_mode));
+    drop((name, remote, server_name, timeout, ecs_mode, max_inflight));
     Err(anyhow!(
         "quic:// upstream requires the 'doq' feature; recompile with: cargo build --features doq"
     ))
@@ -792,6 +796,7 @@ fn make_h3_transport(
     path: String,
     timeout: Duration,
     ecs_mode: EcsMode,
+    max_inflight: usize,
 ) -> Result<UpstreamTransport> {
     #[cfg(feature = "h3")]
     return Ok(UpstreamTransport::H3(Arc::new(H3Upstream::new(
@@ -801,8 +806,9 @@ fn make_h3_transport(
         path,
         timeout,
         ecs_mode,
+        max_inflight,
     )?)));
-    drop((name, remote, server_name, path, timeout, ecs_mode));
+    drop((name, remote, server_name, path, timeout, ecs_mode, max_inflight));
     Err(anyhow!(
         "h3:// upstream requires the 'h3' feature; recompile with: cargo build --features h3"
     ))
