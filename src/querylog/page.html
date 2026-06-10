@@ -54,7 +54,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 #qps-chart{width:100%;height:140px;display:block}
 
 /* Tables */
-.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
 .toolbar input{flex:1;padding:7px 11px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;border-radius:7px;outline:none;transition:border-color .12s}
 .toolbar input:focus{border-color:var(--accent)}
 .toolbar input::placeholder{color:var(--text2)}
@@ -64,7 +64,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 .btn-primary:hover{filter:brightness(1.1)}
 .btn-danger{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
 .btn-danger:hover{background:rgba(239,68,68,.2)}
-.check-label{font-size:13px;color:var(--text2);display:flex;align-items:center;gap:6px;cursor:pointer}
+.toggle-label{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text2);white-space:nowrap;user-select:none}
+.toggle-label input{display:none}
+.toggle-track{width:30px;height:17px;background:var(--border);border-radius:9px;position:relative;transition:background .15s;flex-shrink:0}
+.toggle-label input:checked~.toggle-track{background:var(--accent)}
+.toggle-track::after{content:'';position:absolute;top:2px;left:2px;width:13px;height:13px;background:#fff;border-radius:50%;transition:transform .15s;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.toggle-label input:checked~.toggle-track::after{transform:translateX(13px)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--text);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -267,7 +272,7 @@ tr:hover td{background:var(--surface2)}
       <div class="toolbar">
         <input id="ql-filter" type="text" placeholder="Filter by domain…" oninput="filterChanged()">
         <button class="btn btn-danger" onclick="clearLog()">Clear</button>
-        <label class="check-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"> Auto-refresh</label>
+        <label class="toggle-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
       </div>
       <div style="overflow-x:auto">
         <table id="ql-table">
