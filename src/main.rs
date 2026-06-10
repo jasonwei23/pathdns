@@ -104,16 +104,24 @@ async fn async_main(cfg: Config) -> Result<()> {
         )));
 
         if let Some(addr) = api_bind {
+            let api_listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("web ui: failed to bind {addr}: {e}"))?;
+            startup!("listening web=http://{addr}");
             let api_stats = stats_ring.clone();
             tokio::spawn(crate::querylog::api::serve(
-                addr, api_token, api_ring, api_qps, api_stats, api_handle, api_state,
+                api_listener, api_token, api_ring, api_qps, api_stats, api_handle, api_state,
             ));
         }
     } else if let Some(addr) = state.cfg.querylog.bind {
         // No collection (memory=0) but still serve API for stats.
+        let api_listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("web ui: failed to bind {addr}: {e}"))?;
+        startup!("listening web=http://{addr}");
         let api_ring = std::sync::Arc::new(crate::querylog::ring::EventRing::new(0));
         tokio::spawn(crate::querylog::api::serve(
-            addr,
+            api_listener,
             state.cfg.querylog.token.clone(),
             api_ring,
             qps_ring.clone(),

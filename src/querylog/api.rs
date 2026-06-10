@@ -14,7 +14,6 @@ use super::{QpsRing, QueryLogHandle};
 use crate::querylog::ring::{EventRing, StatsRing};
 use crate::querylog::worker::micros_to_rfc3339;
 use crate::server::AppState;
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +23,7 @@ use tokio::net::TcpListener;
 static DASHBOARD_HTML: &str = include_str!("page.html");
 
 pub async fn serve(
-    addr: SocketAddr,
+    listener: TcpListener,
     token: Option<String>,
     ring: Arc<EventRing>,
     qps_ring: Arc<QpsRing>,
@@ -32,14 +31,6 @@ pub async fn serve(
     handle: QueryLogHandle,
     state: Arc<AppState>,
 ) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("warn: querylog api=bind_failed addr={addr} error={e}");
-            return;
-        }
-    };
-    crate::startup!("querylog api=http://{addr}");
     let token = Arc::new(token);
     loop {
         let Ok((mut conn, _peer)) = listener.accept().await else {

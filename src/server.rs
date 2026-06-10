@@ -88,21 +88,6 @@ impl AppState {
         Self,
         tokio::sync::mpsc::Receiver<crate::cache::CacheRefresh>,
     )> {
-        let bind_str = cfg
-            .bind
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        crate::startup!(
-            "config bind={} proto={} workers={} inflight={} inflight_queue={}ms timeout={}ms",
-            bind_str,
-            listeners_summary(&cfg),
-            cfg.worker_threads,
-            cfg.max_inflight,
-            cfg.inflight_queue_ms,
-            cfg.timeout.as_millis(),
-        );
         let upstream_cfg = cfg.upstream_config();
 
         // Cache is created before the groups so each group's cache policy can be
@@ -125,11 +110,6 @@ impl AppState {
                     .await?,
                 )
             };
-            crate::startup!(
-                "group {} add_ip={}",
-                spec.name,
-                spec.add_ip.as_deref().unwrap_or("-")
-            );
             groups.push(CustomGroup {
                 name: spec.name.clone(),
                 upstream,
@@ -143,26 +123,11 @@ impl AppState {
         // Resolve fallback group indices.
         let fallback = resolve_fallback(&cfg, &groups)?;
 
-        if cache.enabled() {
-            crate::startup!(
-                "cache capacity={} stale-expire-ttl={}s stale-ttl={}s stale-ttl-reset={} stale-client-timeout={}ms refresh={} refresh-min-ttl={}",
-                cfg.cache_size,
-                cfg.cache_stale_expire_ttl,
-                cfg.cache_stale_ttl,
-                cfg.cache_stale_ttl_reset,
-                cfg.cache_stale_client_timeout,
-                cfg.cache_refresh
-                    .map(|v| format!("{v}%"))
-                    .unwrap_or_else(|| "-".to_string()),
-                cfg.cache_refresh_min_ttl
-                    .map(|v| format!("{v}s"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-        }
         if let Some(path) = &cfg.cache_persist_path {
             let fp = crate::config::cache_fingerprint(&cfg);
             match cache.load_from_file(path, fp) {
-                Ok(n) => crate::startup!("cache persist=loaded entries={n}"),
+                Ok(n) if n > 0 => crate::startup!("cache persist=loaded entries={n}"),
+                Ok(_) => {}
                 Err(e) => crate::startup!("cache persist=load_failed error={e:#}"),
             }
         }
@@ -176,28 +141,19 @@ impl AppState {
             .map(Arc::new);
         #[cfg(not(target_os = "linux"))]
         let ipset: Option<Arc<IpSetManager>> = None;
-        if let Some(ipset) = &ipset {
-            crate::startup!("netlink {}", ipset.summary());
-        }
-
         let verdict_cache = VerdictCache::new(cfg.verdict_cache.as_ref());
         if verdict_cache.enabled() {
-            // Verdicts persist alongside the DNS cache in a sibling `.verdict` file.
             if let Some(path) = &cfg.cache_persist_path {
                 let vpath = crate::verdict_cache::persist_path_for(path);
                 if vpath.exists() {
                     let fp = crate::config::cache_fingerprint(&cfg);
                     match verdict_cache.load_from_file(&vpath, fp) {
-                        Ok(n) => crate::startup!("verdict_cache persist=loaded entries={n}"),
+                        Ok(n) if n > 0 => crate::startup!("verdict_cache persist=loaded entries={n}"),
+                        Ok(_) => {}
                         Err(e) => crate::startup!("verdict_cache persist=load_failed error={e:#}"),
                     }
                 }
             }
-            crate::startup!(
-                "verdict_cache capacity={} entries={}",
-                cfg.verdict_cache.as_ref().map(|c| c.capacity).unwrap_or(0),
-                verdict_cache.len()
-            );
         }
 
         let needed_tags = needed_geosite_tags(&cfg);
@@ -417,14 +373,8 @@ where
 
     let (tx, rx) = mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, NotifyConfig::default())?;
-    for (dir, files) in &dir_watches {
+    for dir in dir_watches.keys() {
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
-        crate::startup!(
-            "reload watch={} path={} files={:?}",
-            name,
-            dir.display(),
-            files
-        );
     }
 
     for res in rx {
@@ -524,6 +474,9 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     if !state.cfg.listen_udp && !state.cfg.listen_tcp {
         return Err(anyhow!("at least one bind protocol is required"));
     }
+    let proto = listeners_summary(&state.cfg);
+    let addrs = state.cfg.bind.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
+    crate::startup!("listening dns=[{addrs}] proto={proto}");
     let mut set = tokio::task::JoinSet::new();
     for &addr in &state.cfg.bind {
         if state.cfg.listen_udp {
