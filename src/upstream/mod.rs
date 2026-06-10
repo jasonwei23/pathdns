@@ -13,10 +13,15 @@
 //! DoT (DNS-over-TLS, RFC 7858) reuses the same mux path with a `tokio-rustls` stream.
 //!
 //! # Node selection
-//! `UpstreamPool::exchange` uses EWMA RTT × (1 + active_inflight) as a selection score
-//! rather than pure round-robin.  Ties are broken by round-robin offset so load is spread
-//! when all nodes are equally fast.  Nodes in the penalty window are skipped in the first
-//! pass; if all are penalized they are used anyway (fallback round-robin).
+//! `UpstreamPool::exchange` scores each node as EWMA RTT × (1 + active_inflight) and
+//! picks pseudo-randomly among all nodes within a band of the best score
+//! (Unbound-style RTT banding): near-equal nodes share load, keeping their RTT
+//! estimates fresh and providing warm failover targets.  Failures double a node's
+//! RTT estimate (Unbound-style backoff) so traffic shifts away after the first
+//! error; `FAILURE_THRESHOLD` consecutive failures add a hard penalty window.
+//! The first success after failures adopts the fresh RTT sample directly for fast
+//! recovery.  Nodes in the penalty window are skipped in the first pass; if all are
+//! penalized they are used anyway (fallback round-robin).
 //!
 //! # Truncated UDP responses
 //! A UDP response with TC=1 triggers an automatic one-shot TCP retry.
@@ -38,6 +43,7 @@ use quic::DoQUpstream;
 #[cfg(feature = "h3")]
 use quic::H3Upstream;
 use rustls::pki_types::ServerName;
+use smallvec::SmallVec;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -54,6 +60,25 @@ const PENALTY_DURATION_MS: u64 = 30_000;
 /// Every N upstream selections, force-route to the least-recently-used eligible node so
 /// healthy-but-slow nodes are periodically re-probed rather than starved forever.
 const PROBE_INTERVAL: u64 = 100;
+/// Banded selection (Unbound-style): nodes whose score is within this multiple of the
+/// best score share traffic via pseudo-random pick instead of herding onto the single
+/// minimum.
+const SELECT_BAND_FACTOR: u64 = 2;
+/// Additive band floor in microseconds so sub-millisecond scores are treated as equal.
+const SELECT_BAND_FLOOR_US: u64 = 2_000;
+/// RTT estimate applied on failure when the node has no RTT data yet.
+const FAILURE_RTT_FLOOR_US: u64 = 50_000;
+/// Upper bound for the failure-inflated RTT estimate (10 s).
+const FAILURE_RTT_CAP_US: u64 = 10_000_000;
+
+/// Upper score bound for banded selection.  Nodes scoring at or below this limit
+/// are considered interchangeable with the best node: `best × SELECT_BAND_FACTOR`,
+/// with an additive floor so microsecond-scale scores (LAN resolvers, untested
+/// nodes) are all treated as equal rather than split by measurement noise.
+fn band_limit(best: u64) -> u64 {
+    best.saturating_mul(SELECT_BAND_FACTOR)
+        .max(best.saturating_add(SELECT_BAND_FLOOR_US))
+}
 
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
@@ -113,7 +138,12 @@ impl HealthStats {
 
     fn record_success(&self, rtt_us: u64) {
         let old = self.ewma_rtt_us.load(Ordering::Relaxed);
-        let new_ewma = if old == 0 {
+        let had_failures = self.consecutive_failures.load(Ordering::Relaxed) != 0;
+        let new_ewma = if old == 0 || had_failures {
+            // First sample, or first success after failures: adopt the fresh
+            // measurement directly.  The stored value is either absent or inflated
+            // by failure backoff; blending would keep the node deprioritized long
+            // after it has recovered.
             rtt_us
         } else {
             // EWMA alpha=0.25: new = 0.75*old + 0.25*rtt
@@ -125,6 +155,16 @@ impl HealthStats {
     }
 
     fn record_failure(&self) -> u32 {
+        // Unbound-style RTT backoff: each failure doubles the RTT estimate so the
+        // selection score sheds load after the FIRST failure instead of keeping the
+        // node attractive until the hard penalty trips.  Floor covers nodes with no
+        // RTT data; cap keeps the estimate recoverable.
+        let old = self.ewma_rtt_us.load(Ordering::Relaxed);
+        let inflated = old
+            .saturating_mul(2)
+            .clamp(FAILURE_RTT_FLOOR_US, FAILURE_RTT_CAP_US);
+        self.ewma_rtt_us.store(inflated, Ordering::Relaxed);
+
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= FAILURE_THRESHOLD {
             self.penalty_until_ms
@@ -406,24 +446,36 @@ impl UpstreamPool {
             }
         }
 
-        // Normal path: single pass to find the first minimum-EWMA×inflight node,
-        // starting at `start` for round-robin tiebreak.
-        let mut best_idx: Option<usize> = None;
+        // Normal path: banded selection (Unbound-style RTT banding, AdGuard-style
+        // load spreading).  Collect each eligible node's score, find the best, then
+        // pick pseudo-randomly among all nodes whose score falls within the band.
+        // Near-equal nodes share traffic, which keeps their RTT estimates fresh and
+        // gives instant warm failover targets; a clearly slower node still gets
+        // nothing outside its periodic probe.
+        let mut candidates: SmallVec<[(usize, u64); 8]> = SmallVec::new();
         let mut best_score = u64::MAX;
-        for offset in 0..self.nodes.len() {
-            let idx = (start + offset) % self.nodes.len();
-            let node = &self.nodes[idx];
+        for (idx, node) in self.nodes.iter().enumerate() {
             if !node.enabled_for(client_proto) || node.health.is_penalized_at(now) {
                 continue;
             }
             let score = node.selection_score();
-            if score < best_score {
-                best_score = score;
-                best_idx = Some(idx);
-            }
+            best_score = best_score.min(score);
+            candidates.push((idx, score));
         }
-        if best_idx.is_some() {
-            return best_idx;
+        if !candidates.is_empty() {
+            let limit = band_limit(best_score);
+            let in_band = candidates.iter().filter(|&&(_, s)| s <= limit).count();
+            // Fibonacci-hash the query counter for a cheap, well-scattered pick.
+            let pick = (query_ix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as usize % in_band;
+            let mut seen = 0usize;
+            for &(idx, score) in &candidates {
+                if score <= limit {
+                    if seen == pick {
+                        return Some(idx);
+                    }
+                    seen += 1;
+                }
+            }
         }
 
         // All eligible nodes are penalized; use them in round-robin order.
@@ -888,4 +940,88 @@ pub fn set_raw_socket_buf_size(fd: libc::c_int, size: usize) {
         return;
     }
     set_buf_size_fd(fd, size);
+}
+
+// -- Tests ----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_inflates_rtt_estimate() {
+        let h = HealthStats::new();
+        h.record_success(20_000);
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 20_000);
+
+        // First failure: 20_000 * 2 = 40_000 < floor, so the floor applies.
+        h.record_failure();
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_FLOOR_US);
+
+        // Subsequent failures double the estimate.
+        h.record_failure();
+        assert_eq!(
+            h.ewma_rtt_us.load(Ordering::Relaxed),
+            FAILURE_RTT_FLOOR_US * 2
+        );
+    }
+
+    #[test]
+    fn failure_inflation_is_capped() {
+        let h = HealthStats::new();
+        h.record_success(8_000_000);
+        h.record_failure();
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_CAP_US);
+        h.record_failure();
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_CAP_US);
+    }
+
+    #[test]
+    fn failure_with_no_data_uses_floor() {
+        let h = HealthStats::new();
+        h.record_failure();
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_FLOOR_US);
+    }
+
+    #[test]
+    fn success_after_failure_adopts_fresh_sample() {
+        let h = HealthStats::new();
+        h.record_success(20_000);
+        h.record_failure();
+        h.record_failure();
+        // Recovery: fresh sample replaces the inflated estimate outright.
+        h.record_success(22_000);
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 22_000);
+        assert_eq!(h.consecutive_failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn steady_state_success_blends_ewma() {
+        let h = HealthStats::new();
+        h.record_success(20_000);
+        h.record_success(40_000);
+        // 0.75 * 20_000 + 0.25 * 40_000 = 25_000
+        assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 25_000);
+    }
+
+    #[test]
+    fn penalty_after_threshold_and_reset_on_success() {
+        let h = HealthStats::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            h.record_failure();
+        }
+        assert!(h.is_penalized_at(now_ms()));
+        h.record_success(1_000);
+        assert!(!h.is_penalized_at(now_ms()));
+    }
+
+    #[test]
+    fn band_limit_floor_and_factor() {
+        // No data / zero best: floor only.
+        assert_eq!(band_limit(0), SELECT_BAND_FLOOR_US);
+        // Sub-millisecond best: additive floor dominates (500*2 < 500+2000).
+        assert_eq!(band_limit(500), 500 + SELECT_BAND_FLOOR_US);
+        // Above the floor crossover: multiplicative factor dominates.
+        assert_eq!(band_limit(10_000), 20_000);
+    }
 }
