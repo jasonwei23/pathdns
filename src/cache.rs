@@ -754,19 +754,19 @@ impl DnsCache {
     }
 }
 
-fn read_u16(r: &mut impl Read) -> Result<u16> {
+pub(crate) fn read_u16(r: &mut impl Read) -> Result<u16> {
     let mut buf = [0u8; 2];
     r.read_exact(&mut buf)?;
     Ok(u16::from_le_bytes(buf))
 }
 
-fn read_u32(r: &mut impl Read) -> Result<u32> {
+pub(crate) fn read_u32(r: &mut impl Read) -> Result<u32> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_u64(r: &mut impl Read) -> Result<u64> {
+pub(crate) fn read_u64(r: &mut impl Read) -> Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))

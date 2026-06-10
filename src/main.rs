@@ -69,11 +69,18 @@ async fn async_main(cfg: Config) -> Result<()> {
                     s.cfg.cache_persist_interval,
                 ));
                 ticker.tick().await; // skip immediate first tick
+                let vpath = verdict_cache::persist_path_for(&path);
                 loop {
                     ticker.tick().await;
                     match s.cache.save_to_file(&path, fp) {
                         Ok(n) => startup!("cache persist=saved entries={n}"),
                         Err(e) => startup!("cache persist=save_failed error={e:#}"),
+                    }
+                    if s.verdict_cache.enabled() {
+                        match s.verdict_cache.save_to_file(&vpath, fp) {
+                            Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
+                            Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
+                        }
                     }
                 }
             });
@@ -95,6 +102,13 @@ async fn async_main(cfg: Config) -> Result<()> {
         match state.cache.save_to_file(path, fp) {
             Ok(n) => startup!("cache persist=saved entries={n}"),
             Err(e) => startup!("cache persist=save_failed error={e:#}"),
+        }
+        if state.verdict_cache.enabled() {
+            let vpath = verdict_cache::persist_path_for(path);
+            match state.verdict_cache.save_to_file(&vpath, fp) {
+                Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
+                Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
+            }
         }
     }
 

@@ -163,6 +163,17 @@ impl AppState {
 
         let verdict_cache = VerdictCache::new(cfg.verdict_cache.as_ref());
         if verdict_cache.enabled() {
+            // Verdicts persist alongside the DNS cache in a sibling `.verdict` file.
+            if let Some(path) = &cfg.cache_persist_path {
+                let vpath = crate::verdict_cache::persist_path_for(path);
+                if vpath.exists() {
+                    let fp = crate::config::cache_fingerprint(&cfg);
+                    match verdict_cache.load_from_file(&vpath, fp) {
+                        Ok(n) => crate::startup!("verdict_cache persist=loaded entries={n}"),
+                        Err(e) => crate::startup!("verdict_cache persist=load_failed error={e:#}"),
+                    }
+                }
+            }
             crate::startup!(
                 "verdict_cache capacity={} entries={}",
                 cfg.verdict_cache.as_ref().map(|c| c.capacity).unwrap_or(0),
