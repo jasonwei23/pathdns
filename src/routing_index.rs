@@ -79,8 +79,8 @@ pub struct RouteIndex {
     /// Number of unique tags (for TagMemo sizing).
     num_tags: usize,
 
-    /// L1 route cache: qname hash -> group index (or usize::MAX for no match).
-    route_cache: MokaCache<u64, usize>,
+    /// L1 route cache: qname -> group index (or usize::MAX for no match).
+    route_cache: MokaCache<String, usize>,
 }
 
 impl RouteIndex {
@@ -129,7 +129,7 @@ impl RouteIndex {
         }
 
         let num_tags = tag_names.len();
-        let route_cache = MokaCache::builder().max_capacity(4096).build();
+        let route_cache = MokaCache::builder().max_capacity(32_768).build();
         Self {
             geosite_entries,
             catch_all_idx,
@@ -157,8 +157,7 @@ impl RouteIndex {
         // result might differ once the DB is loaded.
         let use_cache = geosite.is_some() || self.geosite_entries.is_empty();
         if use_cache {
-            let hash = fnv_hash_qname(qname);
-            if let Some(idx) = self.route_cache.get(&hash) {
+            if let Some(idx) = self.route_cache.get(qname) {
                 return if idx == usize::MAX {
                     None
                 } else {
@@ -174,7 +173,7 @@ impl RouteIndex {
                         .unwrap_or(usize::MAX)
                 })
                 .unwrap_or(usize::MAX);
-            self.route_cache.insert(hash, idx);
+            self.route_cache.insert(qname.to_string(), idx);
             return result;
         }
         self.route_uncached(groups, qname, geosite)
@@ -255,17 +254,6 @@ fn geo_entry_matches(
         // Without a DB we can't confirm exclusion, so allow.
         None => true,
     }
-}
-
-fn fnv_hash_qname(qname: &str) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut h = FNV_OFFSET;
-    for &b in qname.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
 }
 
 // Tests.
