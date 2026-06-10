@@ -245,6 +245,24 @@ impl UpstreamPool {
             }
 
             let node_name = format!("{name}-{idx}");
+            let node_addr_display = match endpoint.proto {
+                UpstreamProto::Udp | UpstreamProto::UdpIncoming => endpoint.addr.to_string(),
+                UpstreamProto::Tcp | UpstreamProto::TcpIncoming => {
+                    format!("tcp://{}", endpoint.addr)
+                }
+                UpstreamProto::Tls => format!("tls://{}", endpoint.addr),
+                UpstreamProto::Https => format!(
+                    "https://{}{}",
+                    endpoint.addr,
+                    endpoint.path.as_deref().unwrap_or("/dns-query")
+                ),
+                UpstreamProto::Quic => format!("quic://{}", endpoint.addr),
+                UpstreamProto::H3 => format!(
+                    "h3://{}{}",
+                    endpoint.addr,
+                    endpoint.path.as_deref().unwrap_or("/dns-query")
+                ),
+            };
             let transport = match endpoint.proto {
                 UpstreamProto::Udp | UpstreamProto::UdpIncoming => {
                     let udp_upstream = UdpUpstream::create(
@@ -386,6 +404,7 @@ impl UpstreamPool {
                 health: HealthStats::new(),
                 stats: NodeStats::new(),
                 last_selected: AtomicU64::new(0),
+                addr_display: node_addr_display,
             });
         }
         {
@@ -659,7 +678,7 @@ impl UpstreamPool {
         self.nodes
             .iter()
             .enumerate()
-            .map(|(i, n)| n.stats.snapshot(&format!("{pool_name}-{i}")))
+            .map(|(i, n)| n.stats.snapshot(&format!("{pool_name}-{i}"), &n.addr_display))
             .collect()
     }
 }
@@ -684,6 +703,8 @@ struct UpstreamNode {
     /// Monotonic query index of the last time this node was selected (probe or normal).
     /// Initialized to 0; used by the probe scheduler to find the least-recently-used node.
     last_selected: AtomicU64,
+    /// Human-readable address string for this individual node (e.g. "tls://1.1.1.1:853").
+    addr_display: String,
 }
 
 /// RAII guard that decrements `active_inflight` on drop.

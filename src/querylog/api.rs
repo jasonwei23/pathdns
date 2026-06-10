@@ -423,7 +423,6 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
                 "response_bytes": ev.response_bytes,
                 "source": ev.source,
                 "group": ev.group.as_deref(),
-                "upstream": ev.upstream.as_deref(),
                 "answer_ips": answer_ips,
                 "error": ev.error.as_deref(),
             })
@@ -468,6 +467,7 @@ fn render_node_snapshots(snaps: &[crate::stats::NodeStatsSnapshot]) -> Vec<serde
             };
             serde_json::json!({
                 "name": s.name.as_str(),
+                "addr": s.addr.as_str(),
                 "queries_ok": s.queries_ok,
                 "queries_err": s.queries_err,
                 "queries_timeout": s.queries_timeout,

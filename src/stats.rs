@@ -59,9 +59,10 @@ impl NodeStats {
     }
 
     /// Read all fields as a point-in-time snapshot for rendering.
-    pub fn snapshot(&self, name: &str) -> NodeStatsSnapshot {
+    pub fn snapshot(&self, name: &str, addr: &str) -> NodeStatsSnapshot {
         NodeStatsSnapshot {
             name: name.to_string(),
+            addr: addr.to_string(),
             queries_ok: self.queries_ok.load(Ordering::Relaxed),
             queries_err: self.queries_err.load(Ordering::Relaxed),
             queries_timeout: self.queries_timeout.load(Ordering::Relaxed),
@@ -81,6 +82,7 @@ impl Default for NodeStats {
 /// Point-in-time snapshot of one upstream node's stats.
 pub struct NodeStatsSnapshot {
     pub name: String,
+    pub addr: String,
     pub queries_ok: u64,
     pub queries_err: u64,
     pub queries_timeout: u64,

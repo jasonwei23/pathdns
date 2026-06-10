@@ -62,7 +62,6 @@ pub struct QueryLogEvent {
     pub response_bytes: u32,
     pub source: &'static str, // "cache"|"upstream"|"singleflight"|"stale"|"null"
     pub group: Option<Arc<str>>,
-    pub upstream: Option<Arc<str>>,
     #[serde(serialize_with = "ser_ip_list")]
     pub answer_ips: smallvec::SmallVec<[IpAddr; 4]>,
     pub error: Option<Arc<str>>,
@@ -84,7 +83,6 @@ pub struct DecodedEvent {
     pub response_bytes: u32,
     pub source: String,
     pub group: Option<String>,
-    pub upstream: Option<String>,
     pub answer_ips: Vec<String>,
     pub error: Option<String>,
 }
@@ -393,7 +391,6 @@ mod tests {
             response_bytes: 32,
             source: "cache",
             group: None,
-            upstream: None,
             answer_ips: smallvec::SmallVec::new(),
             error: None,
         }

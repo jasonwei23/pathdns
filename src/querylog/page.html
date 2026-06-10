@@ -187,7 +187,7 @@ tr:hover td{background:var(--surface2)}
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>Group</th><th>Node</th><th>OK</th><th>Errors</th><th>Timeouts</th><th>Cancelled</th><th>Active</th><th>Avg RTT</th>
+            <th>Group</th><th>Address</th><th>OK</th><th>Errors</th><th>Timeouts</th><th>Cancelled</th><th>Active</th><th>Avg RTT</th>
           </tr></thead>
           <tbody id="dash-up-tbody"><tr><td colspan="8" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
         </table>
@@ -209,9 +209,9 @@ tr:hover td{background:var(--surface2)}
           <thead><tr>
             <th>Time</th><th>Client</th><th>Proto</th><th>QName</th>
             <th>Type</th><th>RCode</th><th>Elapsed</th><th>Source</th>
-            <th>Group</th><th>Upstream</th>
+            <th>Group</th>
           </tr></thead>
-          <tbody id="ql-tbody"><tr><td colspan="10" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
+          <tbody id="ql-tbody"><tr><td colspan="9" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
         </table>
       </div>
       <div class="more-btn-wrap">
@@ -321,7 +321,7 @@ async function loadDashUpstreams() {
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td>' + esc(g.group) + '</td>' +
-        '<td title="' + esc(n.name) + '">' + esc(n.name) + '</td>' +
+        '<td title="' + esc(n.addr) + '">' + esc(n.addr) + '</td>' +
         '<td style="color:var(--green)">' + fmt(n.queries_ok) + '</td>' +
         '<td style="color:var(--red)">' + fmt(n.queries_err) + '</td>' +
         '<td style="color:var(--amber)">' + fmt(n.queries_timeout) + '</td>' +
@@ -430,7 +430,7 @@ async function loadQueryLog() {
 function renderQueryLog() {
   const tbody = document.getElementById('ql-tbody');
   if (!qlEvents.length) {
-    tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text2);text-align:center">No entries</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text2);text-align:center">No entries</td></tr>';
     return;
   }
   const frag = document.createDocumentFragment();
@@ -453,8 +453,7 @@ function renderQueryLog() {
       '<td>' + rcode + '</td>' +
       '<td>' + fmtRtt(ev.elapsed_us) + '</td>' +
       '<td>' + src + '</td>' +
-      '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>' +
-      '<td title="' + esc(ev.upstream || '') + '">' + (ev.upstream ? esc(ev.upstream.split('/').pop()) : '<span style="color:var(--text2)">—</span>') + '</td>';
+      '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';
     frag.appendChild(tr);
   }
   tbody.innerHTML = '';

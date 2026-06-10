@@ -169,7 +169,6 @@ pub(crate) fn try_fast_path(
                 response_bytes: hit.packet.len() as u32,
                 source: if hit.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(hit.group_id, state),
-                upstream: None,
                 answer_ips: smallvec::SmallVec::new(),
                 error: None,
             });
@@ -228,7 +227,6 @@ pub(crate) fn try_fast_path_into(
                 response_bytes: send_buf.len() as u32,
                 source: if meta.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(meta.group_id, state),
-                upstream: None,
                 answer_ips: smallvec::SmallVec::new(),
                 error: None,
             });
@@ -321,7 +319,7 @@ async fn handle_packet_slow_with_info(
                             info,
                             origin: QueryOrigin::Client { peer, proto },
                         };
-                        emit_slow_event(&ctx, &state, resp, "overload", None, None, None, 0);
+                        emit_slow_event(&ctx, &state, resp, "overload", None, None, 0);
                     }
                     return Ok(servfail);
                 }
@@ -370,7 +368,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
         } else {
             dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?
         };
-        emit_slow_event(&ctx, state, &resp, "null", None, None, None, 0);
+        emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
         return Ok(resp);
     }
 
@@ -381,7 +379,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
             .null_responses
             .fetch_add(1, Ordering::Relaxed);
         let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
-        emit_slow_event(&ctx, state, &resp, "null", None, None, None, 0);
+        emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
         return Ok(resp);
     };
 
@@ -491,7 +489,6 @@ async fn exchange_with_dedupe(
                     "filtered",
                     Some(Arc::from(g.name.as_str())),
                     None,
-                    None,
                     0,
                 );
             }
@@ -508,7 +505,6 @@ async fn exchange_with_dedupe(
         let servfail = Bytes::from(
             dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
         );
-        let upstream_disp = target.upstream_display();
         match tokio::time::timeout(deadline, rx.changed()).await {
             Err(_elapsed) => {
                 let elapsed = started.elapsed().as_micros() as u64;
@@ -520,7 +516,6 @@ async fn exchange_with_dedupe(
                     &servfail,
                     "singleflight",
                     Some(Arc::from(target.group_name())),
-                    upstream_disp,
                     None,
                     elapsed,
                 );
@@ -536,7 +531,6 @@ async fn exchange_with_dedupe(
                     &servfail,
                     "singleflight",
                     Some(Arc::from(target.group_name())),
-                    upstream_disp,
                     None,
                     elapsed,
                 );
@@ -562,7 +556,6 @@ async fn exchange_with_dedupe(
             &resp,
             "singleflight",
             Some(Arc::from(target.group_name())),
-            upstream_disp,
             None,
             elapsed,
         );
@@ -575,7 +568,6 @@ async fn exchange_with_dedupe(
     // Leader path: compute skip_cache before consuming packet, clone for cache use.
     let skip_cache = target.skip_cache();
     let query_for_cache = ctx.packet.clone();
-    let upstream_disp = target.upstream_display();
 
     // stale-client-timeout: if enabled, look up the stale cache entry before going upstream.
     // We will race the upstream against the timeout; if it fires first, return stale immediately.
@@ -614,7 +606,6 @@ async fn exchange_with_dedupe(
                     &stale_pkt,
                     "stale",
                     Some(Arc::from(group_name)),
-                    upstream_disp,
                     None,
                     elapsed,
                 );
@@ -653,7 +644,6 @@ async fn exchange_with_dedupe(
                         &stale,
                         "stale",
                         Some(Arc::from(group_name)),
-                        upstream_disp,
                         None,
                         elapsed,
                     );
@@ -704,7 +694,6 @@ async fn exchange_with_dedupe(
                 &resp,
                 "upstream",
                 Some(Arc::from(group_name)),
-                upstream_disp,
                 None,
                 elapsed,
             );
@@ -729,7 +718,6 @@ async fn exchange_with_dedupe(
                         &stale,
                         "stale",
                         Some(Arc::from(group_name)),
-                        upstream_disp,
                         None,
                         elapsed,
                     );
@@ -763,7 +751,6 @@ async fn exchange_with_dedupe(
                 &servfail,
                 "upstream",
                 Some(Arc::from(group_name)),
-                upstream_disp,
                 Some(Arc::from(err.to_string().as_str())),
                 elapsed,
             );
@@ -805,7 +792,6 @@ fn emit_slow_event(
     resp: &Bytes,
     source: &'static str,
     group: Option<Arc<str>>,
-    upstream: Option<Arc<str>>,
     error: Option<Arc<str>>,
     elapsed_us: u64,
 ) {
@@ -829,7 +815,6 @@ fn emit_slow_event(
         response_bytes: resp.len() as u32,
         source,
         group,
-        upstream,
         answer_ips: if ql.collect_answer_ips() && matches!(ctx.info.qtype, 1 | 28) {
             dns::answer_ips(resp, ctx.info.question_end)
         } else {
