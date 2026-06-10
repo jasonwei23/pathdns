@@ -65,7 +65,6 @@ pub struct RefreshGate {
 
 pub struct CustomGroup {
     pub name: String,
-    pub has_domain_rules: bool,
     pub upstream: Option<UpstreamPool>,
     pub cache_policy: Option<crate::config::GroupCachePolicy>,
     pub filter_qtype: std::collections::HashSet<u16>,
@@ -116,10 +115,8 @@ impl AppState {
                 spec.name,
                 spec.add_ip.as_deref().unwrap_or("-")
             );
-            let has_domain_rules = !spec.geosite_include.is_empty();
             groups.push(CustomGroup {
                 name: spec.name.clone(),
-                has_domain_rules,
                 upstream,
                 cache_policy: spec.cache_policy.clone(),
                 filter_qtype: spec.filter_qtype.iter().copied().collect(),

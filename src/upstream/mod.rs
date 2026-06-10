@@ -170,16 +170,6 @@ impl UpstreamProto {
         }
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::Udp | Self::UdpIncoming => "udp",
-            Self::Tcp | Self::TcpIncoming => "tcp",
-            Self::Tls => "tls",
-            Self::Https => "https",
-            Self::Quic => "quic",
-            Self::H3 => "h3",
-        }
-    }
 }
 
 impl UpstreamPool {
@@ -389,10 +379,6 @@ impl UpstreamPool {
             next: AtomicUsize::new(0),
             hedge_delay: cfg.hedge_delay,
         })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
     }
 
     /// Pick the primary node index using probe + EWMA scoring.

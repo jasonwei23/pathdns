@@ -15,12 +15,6 @@ const NETLINK_NETFILTER: i32 = 12;
 #[derive(Debug)]
 pub(super) struct NetlinkSocket {
     fd: RawFd,
-    /// Port ID assigned by the kernel when the socket was bound.
-    /// Kept for debugging; not currently used to filter incoming messages
-    /// because NLMSG_ERROR responses echo the original request's pid (0),
-    /// not our port ID.
-    #[allow(dead_code)]
-    pid: u32,
     seq: u32,
     recv_buf: Vec<u8>,
 }
@@ -59,28 +53,10 @@ impl NetlinkSocket {
         let mut sa: libc::sockaddr_nl = unsafe { mem::zeroed() };
         sa.nl_family = libc::AF_NETLINK as u16;
         let sa_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        let pid = unsafe {
-            if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, sa_len) == 0 {
-                let mut bound: libc::sockaddr_nl = mem::zeroed();
-                let mut bound_len = sa_len;
-                if libc::getsockname(
-                    fd,
-                    &mut bound as *mut _ as *mut libc::sockaddr,
-                    &mut bound_len,
-                ) == 0
-                {
-                    bound.nl_pid
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        };
+        unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, sa_len) };
 
         Ok(Self {
             fd,
-            pid,
             seq: 1,
             recv_buf: vec![0u8; 8192],
         })

@@ -203,7 +203,7 @@ impl RouteIndex {
                 return Some(&groups[catch_all]);
             }
             let group = &groups[entry.group_idx];
-            if geo_entry_matches(entry, group, qname, geosite, &mut tag_memo, &self.tag_names) {
+            if geo_entry_matches(entry, qname, geosite, &mut tag_memo, &self.tag_names) {
                 return Some(group);
             }
         }
@@ -219,14 +219,14 @@ impl RouteIndex {
 
 fn geo_entry_matches(
     entry: &GeoSiteEntry,
-    group: &CustomGroup,
     qname: &str,
     geosite: Option<&GeoSiteDb>,
     memo: &mut TagMemo,
     tag_names: &[String],
 ) -> bool {
-    // Positive check.
-    let match_positive = if group.has_domain_rules {
+    // Positive check: if this entry has include tags, at least one must match.
+    // If there are no include tags (exclude-only group), every domain passes.
+    let match_positive = if !entry.include_ids.is_empty() {
         geosite.is_some_and(|gs| {
             entry
                 .include_ids
@@ -234,7 +234,6 @@ fn geo_entry_matches(
                 .any(|&id| memo.check(gs, id, &tag_names[id as usize], qname))
         })
     } else {
-        // No positive matchers: always passes.
         true
     };
 
