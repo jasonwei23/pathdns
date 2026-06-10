@@ -82,6 +82,8 @@ declare_counters!(
 
     // Request deduplication / load control.
     SINGLEFLIGHT_HITS / inc_singleflight_hits => singleflight_hits,
+    /// Queries that entered the inflight queue (fast try_acquire failed; inflight-queue-ms > 0).
+    INFLIGHT_QUEUED / inc_inflight_queued => inflight_queued,
     INFLIGHT_DROPS / inc_inflight_drops => inflight_drops,
     HEDGED_QUERIES / inc_hedged_queries => hedged_queries,
     HEDGE_WINS / inc_hedge_wins => hedge_wins,

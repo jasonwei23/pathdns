@@ -76,6 +76,7 @@ pub(crate) struct JsonConfig {
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
     pub(crate) max_inflight: Option<usize>,
+    pub(crate) inflight_queue_ms: Option<u64>,
     pub(crate) hedge_delay_ms: Option<u64>,
 
     // GeoSite

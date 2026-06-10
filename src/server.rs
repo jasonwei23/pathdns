@@ -87,11 +87,12 @@ impl AppState {
         tokio::sync::mpsc::Receiver<crate::cache::CacheRefresh>,
     )> {
         crate::startup!(
-            "config bind={} proto={} workers={} inflight={} timeout={}s",
+            "config bind={} proto={} workers={} inflight={} inflight_queue={}ms timeout={}s",
             cfg.bind,
             listeners_summary(&cfg),
             cfg.worker_threads,
             cfg.max_inflight,
+            cfg.inflight_queue_ms,
             cfg.timeout.as_secs(),
         );
         let upstream_cfg = cfg.upstream_config();

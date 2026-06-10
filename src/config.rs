@@ -153,6 +153,8 @@ pub struct Config {
     pub listen_tcp: bool,
     pub timeout: Duration,
     pub max_inflight: usize,
+    /// 0 = hard-drop immediately; >0 = queue for up to this many ms before dropping.
+    pub inflight_queue_ms: u64,
     pub worker_threads: usize,
     pub fallback: FallbackConfig,
     pub verbose: bool,
@@ -228,6 +230,7 @@ impl Config {
         if max_inflight < 1 {
             return Err(anyhow!("max-inflight must be at least 1"));
         }
+        let inflight_queue_ms = json.inflight_queue_ms.unwrap_or(0);
 
         let upstream_max_inflight = json.upstream_max_inflight.unwrap_or(256);
         let hedge_delay_ms = json.hedge_delay_ms.unwrap_or(0);
@@ -279,6 +282,7 @@ impl Config {
             listen_tcp,
             timeout: Duration::from_secs(json.timeout.unwrap_or(5)),
             max_inflight,
+            inflight_queue_ms,
             worker_threads,
             fallback,
             verbose: json.verbose.unwrap_or(false) || cli_verbose,

@@ -130,9 +130,12 @@ fn render(state: &AppState) -> String {
 
     write_counter(
         &mut out,
-        "dns_inflight_drops_total",
-        "Queries dropped because max-inflight limit was reached",
-        &[(&[], g.inflight_drops)],
+        "dns_inflight_total",
+        "Queries that hit the max-inflight limit (queued = waited; dropped = timed out or hard-dropped)",
+        &[
+            (&[("result", "queued")], g.inflight_queued),
+            (&[("result", "dropped")], g.inflight_drops),
+        ],
     );
 
     if g.hedged_queries > 0 || g.hedge_wins > 0 {

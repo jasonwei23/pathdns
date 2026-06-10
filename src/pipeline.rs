@@ -234,18 +234,34 @@ async fn handle_packet_slow_with_info(
     let permit = match state.limit.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            crate::stats::inc_inflight_drops();
-            crate::verbose!(
-                "dns event=drop reason=max_inflight id={} qtype={} qname={} from={}",
-                info.id,
-                info.qtype,
-                info.qname,
-                peer
-            );
-            let servfail = dns::servfail_reply(&packet, info.question_end)
-                .map(Bytes::from)
-                .ok();
-            return Ok(servfail);
+            // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
+            let acquired = if state.cfg.inflight_queue_ms > 0 {
+                crate::stats::inc_inflight_queued();
+                let wait = Duration::from_millis(state.cfg.inflight_queue_ms);
+                tokio::time::timeout(wait, state.limit.clone().acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            } else {
+                None
+            };
+            match acquired {
+                Some(permit) => permit,
+                None => {
+                    crate::stats::inc_inflight_drops();
+                    crate::verbose!(
+                        "dns event=drop reason=max_inflight id={} qtype={} qname={} from={}",
+                        info.id,
+                        info.qtype,
+                        info.qname,
+                        peer
+                    );
+                    let servfail = dns::servfail_reply(&packet, info.question_end)
+                        .map(Bytes::from)
+                        .ok();
+                    return Ok(servfail);
+                }
+            }
         }
     };
 
