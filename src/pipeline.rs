@@ -357,19 +357,20 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
         if let Some(target) = group.target() {
             return exchange_with_dedupe(ctx, state, target).await;
         }
-        // Null group.
-        state
-            .querylog
-            .counters
-            .null_responses
-            .fetch_add(1, Ordering::Relaxed);
-        let resp = if group.filter_qtype.contains(&ctx.info.qtype) {
-            dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?
-        } else {
-            dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?
-        };
-        emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
-        return Ok(resp);
+        // Null group: block when filter_qtype is empty (block all) or matches this qtype.
+        // When filter_qtype is non-empty but does not contain this qtype, fall through to
+        // global routing so only the listed types are suppressed.
+        if group.filter_qtype.is_empty() || group.filter_qtype.contains(&ctx.info.qtype) {
+            state
+                .querylog
+                .counters
+                .null_responses
+                .fetch_add(1, Ordering::Relaxed);
+            let resp =
+                dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
+            emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
+            return Ok(resp);
+        }
     }
 
     let Some(target) = router::classify_target(state, ctx.info.qtype) else {
