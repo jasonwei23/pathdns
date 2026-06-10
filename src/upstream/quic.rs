@@ -14,30 +14,34 @@ use std::time::Duration;
 // A single persistent QUIC connection is maintained per upstream; each DNS
 // query opens a new bidirectional stream.  2-byte length prefix per RFC 9250.
 
-#[cfg(feature = "doq")]
-fn make_quic_client_config() -> Result<quinn::ClientConfig> {
-    let roots: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
-        .map_err(|e| anyhow!("QUIC TLS config build failed: {e}"))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic_cfg)))
-}
-
 /// Create a QUIC client endpoint bound to an ephemeral local port.
+///
+/// `alpn` must be the ALPN token for the protocol in use:
+///   - `b"doq"` for DNS-over-QUIC (RFC 9250)
+///   - `b"h3"`  for HTTP/3 DoH (RFC 9114)
+///
+/// RFC 9250 §4.1: implementations MUST use the "doq" ALPN token.
+/// Without the correct ALPN, servers that enforce protocol negotiation
+/// will reject the TLS handshake.
+///
 /// Chooses IPv6 or IPv4 bind address to match `remote`.
 #[cfg(feature = "doq")]
-fn make_quic_endpoint(remote: SocketAddr, name: &str) -> Result<quinn::Endpoint> {
-    let client_cfg = make_quic_client_config()?;
+fn make_quic_endpoint(remote: SocketAddr, name: &str, alpn: &[u8]) -> Result<quinn::Endpoint> {
+    let roots: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+    let mut rustls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    rustls_cfg.alpn_protocols = vec![alpn.to_vec()];
+    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+        .map_err(|e| anyhow!("upstream {name}: QUIC TLS config: {e}"))?;
     let bind: SocketAddr = if remote.is_ipv6() {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
     } else {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     };
     let mut endpoint = quinn::Endpoint::client(bind)
-        .with_context(|| format!("upstream {name}: QUIC endpoint bind failed ({bind})"))?;
-    endpoint.set_default_client_config(client_cfg);
+        .with_context(|| format!("upstream {name}: QUIC bind failed ({bind})"))?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_cfg)));
     Ok(endpoint)
 }
 
@@ -63,7 +67,7 @@ impl DoQUpstream {
         timeout: Duration,
         ecs_mode: EcsMode,
     ) -> Result<Self> {
-        let endpoint = make_quic_endpoint(remote, &name)?;
+        let endpoint = make_quic_endpoint(remote, &name, b"doq")?;
         crate::verbose!("upstream name={name} proto=doq remote={remote} sni={server_name}");
         Ok(Self {
             name,
@@ -182,7 +186,7 @@ impl H3Upstream {
         timeout: Duration,
         ecs_mode: EcsMode,
     ) -> Result<Self> {
-        let endpoint = make_quic_endpoint(remote, &name)?;
+        let endpoint = make_quic_endpoint(remote, &name, b"h3")?;
         crate::verbose!(
             "upstream name={name} proto=h3 remote={remote} sni={server_name} path={path}"
         );
