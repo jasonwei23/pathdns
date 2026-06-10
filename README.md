@@ -17,6 +17,7 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - Persistent mux connections for TCP/TLS upstreams with automatic reconnect.
 - DNS cache with TTL patching, stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
 - Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
+- Graceful rate limiting: configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
 - Per-domain verdict cache for `fallback.default-group: none` routing decisions.
 - Query type filtering with optional group and GeoSite tag conditions.
 - Native Linux netlink backend for ipset/nftset test and add operations (no shell-out).
@@ -132,6 +133,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `bind` | string | `"127.0.0.1:65353"` | Listen address. Append `@udp` or `@tcp` to restrict protocol. |
 | `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
+| `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately (original behaviour). |
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
 | `timeout` | int (seconds) | `5` | Upstream query timeout. |
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
@@ -467,6 +469,7 @@ Enable with `"metrics-addr": "0.0.0.0:9153"`.
 | `dns_cache_lookups_total{result}` | counter | Cache hits / misses / stale |
 | `dns_cache_refresh_total{result}` | counter | Background refresh outcomes |
 | `dns_singleflight_hits_total` | counter | Deduplicated in-flight queries |
+| `dns_inflight_total{result}` | counter | Queries that hit `max-inflight`: `result="queued"` waited in queue; `result="dropped"` were shed with SERVFAIL |
 | `dns_queries_routed_total{target}` | counter | Routing decisions (none_race / null / group / aaaa_filtered) |
 | `dns_query_latency_seconds` | histogram | End-to-end slow-path latency |
 | `dns_upstream_queries_total{upstream,result}` | counter | Per-upstream ok/err counts |
