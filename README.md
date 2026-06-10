@@ -133,12 +133,12 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `bind` | string | `"127.0.0.1:65353"` | Listen address. Append `@udp` or `@tcp` to restrict protocol. |
 | `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
-| `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately (original behaviour). |
+| `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
-| `timeout` | int (seconds) | `5` | Upstream query timeout. |
+| `timeout-ms` | int (ms) | `5000` | Upstream query timeout. |
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
 | `upstream-udp-sockets` | int | CPU count | UDP socket pool size per upstream node. |
-| `hedge-delay-ms` | int | `0` (disabled) | Fire a second upstream after N ms with no reply. |
+| `hedge-delay-ms` | int (ms) | `0` (disabled) | Fire a second upstream after N ms with no reply. |
 | `verbose` | bool | `false` | Enable diagnostic logging (same as `-v`). |
 | `metrics-addr` | string | — | Prometheus scrape address (e.g. `"0.0.0.0:9153"`). |
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
@@ -214,16 +214,16 @@ Without `ipset-name4`/`ipset-name6`, the `"none"` fallback races both upstreams 
 
 ```json
 "cache": {
-  "size":                 10000,
-  "stale-expire-ttl":     86400,
-  "stale-ttl":            30,
-  "stale-ttl-reset":      true,
-  "stale-client-timeout": 0,
-  "nodata-ttl":           60,
-  "min-ttl":              0,
-  "max-ttl":              0,
-  "refresh":              20,
-  "refresh-min-ttl":      0,
+  "size":                    10000,
+  "stale-expire-ttl":        86400,
+  "stale-ttl":               30,
+  "stale-ttl-reset":         true,
+  "stale-client-timeout-ms": 0,
+  "nodata-ttl":              60,
+  "min-ttl":                 0,
+  "max-ttl":                 0,
+  "refresh":                 20,
+  "refresh-min-ttl":         0,
   "persist": {
     "path":     "/etc/pathdns/cache.db",
     "interval": 300
@@ -237,7 +237,7 @@ Without `ipset-name4`/`ipset-name6`, the `"none"` fallback races both upstreams 
 | `stale-expire-ttl` | int (seconds) | `0` | Serve stale entries for up to N seconds after TTL expiry (RFC 8767). `0` disables stale serving. |
 | `stale-ttl` | int (seconds) | `30` | TTL advertised in stale replies. |
 | `stale-ttl-reset` | bool | `true` | When `true`, stale replies always use `stale-ttl`. When `false`, advertise the actual remaining stale window. |
-| `stale-client-timeout` | int (ms) | `0` | When > 0 and a stale entry exists, wait up to N ms for a fresh upstream answer before falling back to the stale reply. `0` disables (serve stale immediately). |
+| `stale-client-timeout-ms` | int (ms) | `0` | When > 0 and a stale entry exists, wait up to N ms for a fresh upstream answer before falling back to the stale reply. `0` disables (serve stale immediately). |
 | `nodata-ttl` | int (seconds) | `60` | TTL for NODATA/NXDOMAIN responses with no SOA record. |
 | `min-ttl` | int (seconds) | `0` | Minimum TTL applied at write time (cache insertion). |
 | `max-ttl` | int (seconds) | `0` | Maximum TTL applied at write time (`0` = no cap). |
@@ -250,7 +250,7 @@ Concurrent cache-miss queries for the same question share one upstream request (
 
 ### Group-level cache overrides
 
-A group's `cache` key overrides per-entry behaviour for responses routed to that group. Only the 7 fields below may be set; instance-wide settings (`persist`, `stale-client-timeout`, `refresh-min-ttl`, `stale-ttl-reset`) are not accepted.
+A group's `cache` key overrides per-entry behaviour for responses routed to that group. Only the 7 fields below may be set; instance-wide settings (`persist`, `stale-client-timeout-ms`, `refresh-min-ttl`, `stale-ttl-reset`) are not accepted.
 
 | Field | Type | Description |
 |-------|------|-------------|

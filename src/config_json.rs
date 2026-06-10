@@ -46,7 +46,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Group-level cache overrides.  Only per-entry behavior may be configured here;
-/// runtime/instance settings (`persist`, `stale-client-timeout`, `refresh-min-ttl`,
+/// runtime/instance settings (`persist`, `stale-client-timeout-ms`, `refresh-min-ttl`,
 /// `stale-ttl-reset`) are global-only.  `size` only accepts `0` (skip cache).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -71,7 +71,7 @@ pub(crate) struct JsonConfig {
     pub(crate) metrics_addr: Option<String>,
 
     // Upstreams / transport
-    pub(crate) timeout: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
     pub(crate) udp_buf_size: Option<usize>,
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
@@ -123,7 +123,7 @@ pub(crate) struct JsonCacheSection {
     pub(crate) stale_expire_ttl: Option<u64>,
     pub(crate) stale_ttl: Option<u32>,
     pub(crate) stale_ttl_reset: Option<bool>,
-    pub(crate) stale_client_timeout: Option<u64>,
+    pub(crate) stale_client_timeout_ms: Option<u64>,
     pub(crate) nodata_ttl: Option<u32>,
     pub(crate) min_ttl: Option<u32>,
     pub(crate) max_ttl: Option<u32>,

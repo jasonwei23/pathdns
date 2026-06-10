@@ -280,7 +280,7 @@ impl Config {
             bind: bind_addr,
             listen_udp,
             listen_tcp,
-            timeout: Duration::from_secs(json.timeout.unwrap_or(5)),
+            timeout: Duration::from_millis(json.timeout_ms.unwrap_or(5000)),
             max_inflight,
             inflight_queue_ms,
             worker_threads,
@@ -301,7 +301,7 @@ impl Config {
             cache_stale_client_timeout: json
                 .cache
                 .as_ref()
-                .and_then(|c| c.stale_client_timeout)
+                .and_then(|c| c.stale_client_timeout_ms)
                 .unwrap_or(0),
             cache_nodata_ttl: json.cache.as_ref().and_then(|c| c.nodata_ttl).unwrap_or(60),
             cache_min_ttl,
