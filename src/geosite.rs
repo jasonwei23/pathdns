@@ -137,8 +137,10 @@ impl GeoSiteDb {
         cache_key.push('\0');
         cache_key.push_str(domain);
         if let Some(cached) = self.result_cache.get(cache_key.as_str()) {
+            crate::stats::inc_geosite_cache_hit();
             return cached;
         }
+        crate::stats::inc_geosite_walk();
         let result = self.tags.get(tag).is_some_and(|m| m.matches(domain));
         self.result_cache.insert(cache_key, result);
         result

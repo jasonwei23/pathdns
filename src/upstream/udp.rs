@@ -90,6 +90,7 @@ impl UdpUpstream {
             tokio::spawn(async move {
                 let mut delay_ms = 50u64;
                 while let Err(err) = u.clone().recv_loop(i).await {
+                    crate::stats::inc_udp_recv_restart();
                     crate::log_error!(
                         "upstream name={} event=recv_loop_exit error={err:#} restarting_in={delay_ms}ms",
                         u.name
@@ -135,6 +136,7 @@ impl UdpUpstream {
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(resp)) => {
                 if dns::is_truncated(&resp) {
+                    crate::stats::inc_tc_fallback();
                     match tcp_exchange_packet(self.remote, &packet, self.timeout, &self.name).await
                     {
                         Ok(mut tcp_resp) => {

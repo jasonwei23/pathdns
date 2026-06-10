@@ -158,13 +158,16 @@ impl RouteIndex {
         let use_cache = geosite.is_some() || self.geosite_entries.is_empty();
         if use_cache {
             if let Some(idx) = self.route_cache.get(qname) {
+                crate::stats::inc_route_cache_hit();
                 return if idx == usize::MAX {
                     None
                 } else {
                     groups.get(idx)
                 };
             }
+            let started = std::time::Instant::now();
             let result = self.route_uncached(groups, qname, geosite);
+            crate::stats::record_route_compute(started.elapsed().as_micros() as u64);
             let idx = result
                 .map(|g| {
                     groups
@@ -176,7 +179,10 @@ impl RouteIndex {
             self.route_cache.insert(qname.to_string(), idx);
             return result;
         }
-        self.route_uncached(groups, qname, geosite)
+        let started = std::time::Instant::now();
+        let result = self.route_uncached(groups, qname, geosite);
+        crate::stats::record_route_compute(started.elapsed().as_micros() as u64);
+        result
     }
 
     fn route_uncached<'a>(

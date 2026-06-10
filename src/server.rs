@@ -359,24 +359,16 @@ fn spawn_reload_watcher(state: Arc<AppState>, watcher: ReloadWatcher) {
 }
 
 fn reload_geosite(state: &AppState, needed_tags: &HashSet<String>) -> Result<()> {
-    match load_geosite(&state.cfg, needed_tags) {
-        Ok(db) => {
-            state.geosite.store(db);
-            state.routing_index.invalidate();
-            state.cache.invalidate_all();
-            crate::stats::inc_geosite_reload_ok();
-            crate::startup!(
-                "reload event=geosite status=ok files={} tags={}",
-                state.cfg.geosite_files.len(),
-                needed_tags.len()
-            );
-            Ok(())
-        }
-        Err(e) => {
-            crate::stats::inc_geosite_reload_err();
-            Err(e)
-        }
-    }
+    let db = load_geosite(&state.cfg, needed_tags)?;
+    state.geosite.store(db);
+    state.routing_index.invalidate();
+    state.cache.invalidate_all();
+    crate::startup!(
+        "reload event=geosite status=ok files={} tags={}",
+        state.cfg.geosite_files.len(),
+        needed_tags.len()
+    );
+    Ok(())
 }
 
 fn watch_files<F>(paths: Vec<PathBuf>, name: &'static str, mut reload: F) -> notify::Result<()>

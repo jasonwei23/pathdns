@@ -152,16 +152,6 @@ fn render(state: &AppState) -> String {
 
     write_counter(
         &mut out,
-        "dns_geosite_reloads_total",
-        "GeoSite database reload attempts",
-        &[
-            (&[("result", "ok")], g.geosite_reload_ok),
-            (&[("result", "err")], g.geosite_reload_err),
-        ],
-    );
-
-    write_counter(
-        &mut out,
         "dns_queries_routed_total",
         "DNS queries by routing decision",
         &[
@@ -170,6 +160,67 @@ fn render(state: &AppState) -> String {
             (&[("target", "group")], g.routed_group),
             (&[("target", "aaaa_filtered")], g.routed_aaaa_filtered),
         ],
+    );
+
+    // Routing hot-path effectiveness: route-cache hit ratio and the cost of misses.
+    // route_compute_seconds_sum / dns_route_lookups_total{result="computed"} gives the
+    // average matcher-walk cost; a low cache-hit ratio plus a high average identifies
+    // GeoSite matching as the bottleneck.
+    write_counter(
+        &mut out,
+        "dns_route_lookups_total",
+        "Routing decisions by source (L1 route cache vs full index walk)",
+        &[
+            (&[("result", "cache_hit")], g.route_cache_hits),
+            (&[("result", "computed")], g.route_computed),
+        ],
+    );
+    write_counter(
+        &mut out,
+        "dns_route_compute_microseconds_total",
+        "Cumulative time spent computing routes on route-cache misses (microseconds)",
+        &[(&[], g.route_compute_sum_us)],
+    );
+
+    write_counter(
+        &mut out,
+        "dns_geosite_lookups_total",
+        "GeoSite tag verdicts by source (L2 result cache vs full matcher walk)",
+        &[
+            (&[("result", "cache_hit")], g.geosite_cache_hits),
+            (&[("result", "walk")], g.geosite_walks),
+        ],
+    );
+
+    // Upstream transport health: TC fallbacks double per-query latency; recv-loop
+    // restarts indicate socket-level churn that surfaces as timeouts.
+    write_counter(
+        &mut out,
+        "dns_tc_fallback_total",
+        "UDP responses truncated (TC=1) and retried over TCP",
+        &[(&[], g.tc_fallbacks)],
+    );
+    write_counter(
+        &mut out,
+        "dns_udp_recv_restarts_total",
+        "UDP upstream receive loops restarted after socket errors",
+        &[(&[], g.udp_recv_restarts)],
+    );
+
+    // Concurrency watermark: how close the server runs to its global inflight cap.
+    let max_inflight = state.cfg.max_inflight;
+    let in_use = max_inflight.saturating_sub(state.limit.available_permits());
+    write_gauge(
+        &mut out,
+        "dns_inflight_current",
+        "Queries currently being processed (global semaphore permits in use)",
+        in_use as u64,
+    );
+    write_gauge(
+        &mut out,
+        "dns_inflight_limit",
+        "Configured max-inflight limit",
+        max_inflight as u64,
     );
 
     let ql = stats::query_latency_snapshot();

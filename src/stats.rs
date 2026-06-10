@@ -47,8 +47,26 @@ static SINGLEFLIGHT_HITS: AtomicU64 = AtomicU64::new(0);
 static INFLIGHT_DROPS: AtomicU64 = AtomicU64::new(0);
 static HEDGED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static HEDGE_WINS: AtomicU64 = AtomicU64::new(0);
-static GEOSITE_RELOAD_OK: AtomicU64 = AtomicU64::new(0);
-static GEOSITE_RELOAD_ERR: AtomicU64 = AtomicU64::new(0);
+
+// Routing / matching hot-path effectiveness counters.
+
+/// Route resolved from the L1 route cache (no matcher walk).
+static ROUTE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Route computed by walking the routing index (L1 miss).
+static ROUTE_COMPUTED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative time spent computing routes on L1 misses, in microseconds.
+static ROUTE_COMPUTE_SUM_US: AtomicU64 = AtomicU64::new(0);
+/// GeoSite verdict answered from the L2 result cache.
+static GEOSITE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// GeoSite verdict required a full matcher walk (full/suffix/keyword/regex).
+static GEOSITE_WALKS: AtomicU64 = AtomicU64::new(0);
+
+// Upstream transport health counters.
+
+/// UDP responses that arrived truncated (TC=1) and were retried over TCP.
+static TC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// UDP upstream recv loops restarted after a socket error.
+static UDP_RECV_RESTARTS: AtomicU64 = AtomicU64::new(0);
 
 // Routing decision counters.
 
@@ -124,12 +142,30 @@ pub fn inc_hedge_wins() {
     HEDGE_WINS.fetch_add(1, Ordering::Relaxed);
 }
 #[inline]
-pub fn inc_geosite_reload_ok() {
-    GEOSITE_RELOAD_OK.fetch_add(1, Ordering::Relaxed);
+pub fn inc_route_cache_hit() {
+    ROUTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+/// Record one route computation (L1 route-cache miss) and its duration.
+#[inline]
+pub fn record_route_compute(elapsed_us: u64) {
+    ROUTE_COMPUTED.fetch_add(1, Ordering::Relaxed);
+    ROUTE_COMPUTE_SUM_US.fetch_add(elapsed_us, Ordering::Relaxed);
 }
 #[inline]
-pub fn inc_geosite_reload_err() {
-    GEOSITE_RELOAD_ERR.fetch_add(1, Ordering::Relaxed);
+pub fn inc_geosite_cache_hit() {
+    GEOSITE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+#[inline]
+pub fn inc_geosite_walk() {
+    GEOSITE_WALKS.fetch_add(1, Ordering::Relaxed);
+}
+#[inline]
+pub fn inc_tc_fallback() {
+    TC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+#[inline]
+pub fn inc_udp_recv_restart() {
+    UDP_RECV_RESTARTS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -176,8 +212,13 @@ pub fn global_snapshot() -> GlobalSnapshot {
         inflight_drops: INFLIGHT_DROPS.load(Ordering::Relaxed),
         hedged_queries: HEDGED_QUERIES.load(Ordering::Relaxed),
         hedge_wins: HEDGE_WINS.load(Ordering::Relaxed),
-        geosite_reload_ok: GEOSITE_RELOAD_OK.load(Ordering::Relaxed),
-        geosite_reload_err: GEOSITE_RELOAD_ERR.load(Ordering::Relaxed),
+        route_cache_hits: ROUTE_CACHE_HITS.load(Ordering::Relaxed),
+        route_computed: ROUTE_COMPUTED.load(Ordering::Relaxed),
+        route_compute_sum_us: ROUTE_COMPUTE_SUM_US.load(Ordering::Relaxed),
+        geosite_cache_hits: GEOSITE_CACHE_HITS.load(Ordering::Relaxed),
+        geosite_walks: GEOSITE_WALKS.load(Ordering::Relaxed),
+        tc_fallbacks: TC_FALLBACKS.load(Ordering::Relaxed),
+        udp_recv_restarts: UDP_RECV_RESTARTS.load(Ordering::Relaxed),
         routed_none_race: ROUTED_NONE_RACE.load(Ordering::Relaxed),
         routed_null: ROUTED_NULL.load(Ordering::Relaxed),
         routed_group: ROUTED_GROUP.load(Ordering::Relaxed),
@@ -208,8 +249,13 @@ pub struct GlobalSnapshot {
     pub inflight_drops: u64,
     pub hedged_queries: u64,
     pub hedge_wins: u64,
-    pub geosite_reload_ok: u64,
-    pub geosite_reload_err: u64,
+    pub route_cache_hits: u64,
+    pub route_computed: u64,
+    pub route_compute_sum_us: u64,
+    pub geosite_cache_hits: u64,
+    pub geosite_walks: u64,
+    pub tc_fallbacks: u64,
+    pub udp_recv_restarts: u64,
     pub routed_none_race: u64,
     pub routed_null: u64,
     pub routed_group: u64,
