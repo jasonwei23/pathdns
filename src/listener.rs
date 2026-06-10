@@ -28,8 +28,7 @@ use tokio::task::JoinSet;
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
 /// Bind `worker_threads` SO_REUSEPORT UDP sockets and race them in a `JoinSet`.
-pub async fn serve_udp(state: Arc<AppState>) -> Result<()> {
-    let bind = state.cfg.bind;
+pub async fn serve_udp(bind: SocketAddr, state: Arc<AppState>) -> Result<()> {
     let buf_size = state.cfg.udp_buf_size;
     let n = state.cfg.worker_threads.max(1);
     let mut sockets = Vec::with_capacity(n);
@@ -58,8 +57,7 @@ pub async fn serve_udp(state: Arc<AppState>) -> Result<()> {
 }
 
 /// Bind `worker_threads` SO_REUSEPORT TCP listeners and race them in a `JoinSet`.
-pub async fn serve_tcp(state: Arc<AppState>) -> Result<()> {
-    let bind = state.cfg.bind;
+pub async fn serve_tcp(bind: SocketAddr, state: Arc<AppState>) -> Result<()> {
     let n = state.cfg.worker_threads.max(1);
     let mut listeners = Vec::with_capacity(n);
     for _ in 0..n {

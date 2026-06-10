@@ -183,7 +183,7 @@ pub struct QueryLogFileConfig {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub bind: SocketAddr,
+    pub bind: Vec<SocketAddr>,
     pub listen_udp: bool,
     pub listen_tcp: bool,
     pub timeout: Duration,
@@ -247,13 +247,7 @@ impl Config {
     }
 
     pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
-        let bind_raw = json.bind.as_deref().unwrap_or("127.0.0.1:65353");
-        let (listen_udp, listen_tcp) = resolve_bind_proto(bind_raw)?;
-        let bind_addr = {
-            let addr_part = bind_raw.split_once('@').map_or(bind_raw, |(a, _)| a);
-            let normalized = normalize_addr_with_default_port(addr_part, 65353);
-            parse_addr(&normalized).with_context(|| format!("invalid bind address: {addr_part}"))?
-        };
+        let (listen_udp, listen_tcp, bind_addrs) = parse_bind_config(json.bind)?;
 
         let worker_threads = json.worker_threads.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -379,7 +373,7 @@ impl Config {
         };
 
         Ok(Self {
-            bind: bind_addr,
+            bind: bind_addrs,
             listen_udp,
             listen_tcp,
             timeout: Duration::from_millis(json.timeout_ms.unwrap_or(5000)),
@@ -752,6 +746,43 @@ fn parse_groups(json_groups: Vec<JsonGroupEntry>) -> Result<Vec<GroupSpec>> {
     }
 
     Ok(groups)
+}
+
+fn parse_bind_config(
+    value: Option<serde_json::Value>,
+) -> Result<(bool, bool, Vec<SocketAddr>)> {
+    match value {
+        None => {
+            let addr = parse_addr_with_default_port("127.0.0.1", 65353)?;
+            Ok((true, true, vec![addr]))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let (listen_udp, listen_tcp) = resolve_bind_proto(&s)?;
+            let addr_part = s.split_once('@').map_or(s.as_str(), |(a, _)| a);
+            let normalized = normalize_addr_with_default_port(addr_part, 65353);
+            let addr = parse_addr(&normalized)
+                .with_context(|| format!("invalid bind address: {addr_part}"))?;
+            Ok((listen_udp, listen_tcp, vec![addr]))
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Err(anyhow!("bind array must not be empty"));
+            }
+            let mut addrs = Vec::with_capacity(arr.len());
+            for v in &arr {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| anyhow!("bind array elements must be strings"))?;
+                let addr_part = s.split_once('@').map_or(s, |(a, _)| a);
+                let normalized = normalize_addr_with_default_port(addr_part, 65353);
+                let addr = parse_addr(&normalized)
+                    .with_context(|| format!("invalid bind address: {addr_part}"))?;
+                addrs.push(addr);
+            }
+            Ok((true, true, addrs))
+        }
+        _ => Err(anyhow!("bind must be a string or an array of strings")),
+    }
 }
 
 fn resolve_bind_proto(raw: &str) -> Result<(bool, bool)> {

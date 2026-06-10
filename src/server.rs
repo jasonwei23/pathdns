@@ -88,9 +88,15 @@ impl AppState {
         Self,
         tokio::sync::mpsc::Receiver<crate::cache::CacheRefresh>,
     )> {
+        let bind_str = cfg
+            .bind
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         crate::startup!(
             "config bind={} proto={} workers={} inflight={} inflight_queue={}ms timeout={}ms",
-            cfg.bind,
+            bind_str,
             listeners_summary(&cfg),
             cfg.worker_threads,
             cfg.max_inflight,
@@ -515,16 +521,25 @@ impl RefreshGate {
 
 #[cfg(unix)]
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
-    match (state.cfg.listen_udp, state.cfg.listen_tcp) {
-        (true, true) => {
-            tokio::select! {
-                result = listener::serve_udp(state.clone()) => result,
-                result = listener::serve_tcp(state.clone()) => result,
-            }
+    if !state.cfg.listen_udp && !state.cfg.listen_tcp {
+        return Err(anyhow!("at least one bind protocol is required"));
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for &addr in &state.cfg.bind {
+        if state.cfg.listen_udp {
+            let s = state.clone();
+            set.spawn(async move { listener::serve_udp(addr, s).await });
         }
-        (true, false) => listener::serve_udp(state).await,
-        (false, true) => listener::serve_tcp(state).await,
-        (false, false) => Err(anyhow!("at least one bind protocol is required")),
+        if state.cfg.listen_tcp {
+            let s = state.clone();
+            set.spawn(async move { listener::serve_tcp(addr, s).await });
+        }
+    }
+    // Return as soon as any listener exits (error or unexpected shutdown).
+    match set.join_next().await {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => Err(anyhow!("listener task panicked: {e}")),
+        None => Ok(()),
     }
 }
 

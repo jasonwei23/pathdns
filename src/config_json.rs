@@ -64,8 +64,8 @@ pub(crate) struct JsonGroupCacheSection {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonConfig {
-    // Listener
-    pub(crate) bind: Option<String>,
+    // Listener — accepts a single address string or an array of address strings.
+    pub(crate) bind: Option<serde_json::Value>,
     pub(crate) worker_threads: Option<usize>,
 
     // Query log / dashboard
