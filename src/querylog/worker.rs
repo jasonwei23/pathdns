@@ -16,7 +16,7 @@
 //! to be called from `tokio::task::spawn_blocking` inside the HTTP API handler.
 
 use super::{DecodedEvent, QpsRing, QueryLogCounters, QueryLogEvent, QueryLogFileConfig};
-use crate::querylog::ring::EventRing;
+use crate::querylog::ring::{EventRing, StatsRing};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,24 +29,66 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 
 pub async fn run_qps_sampler(
     qps_ring: Arc<QpsRing>,
+    stats_ring: Arc<StatsRing>,
     counters: Arc<QueryLogCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    use super::ring::PerSecondSnapshot;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
-    let mut last_total = counters.queries_total.load(Ordering::Relaxed);
+
+    macro_rules! load {
+        ($field:ident) => { counters.$field.load(Ordering::Relaxed) };
+    }
+    // Capture initial absolute values; deltas are computed each tick.
+    let mut prev_queries    = load!(queries_total);
+    let mut prev_cache      = load!(cache_hits);
+    let mut prev_up_ok      = load!(upstream_ok);
+    let mut prev_up_err     = load!(upstream_err);
+    let mut prev_null       = load!(null_responses);
+    let mut prev_stale      = load!(stale_served);
+    let mut prev_filtered   = load!(filtered);
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let total = counters.queries_total.load(Ordering::Relaxed);
-                qps_ring.push(total.saturating_sub(last_total));
-                last_total = total;
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let cur_queries  = load!(queries_total);
+                let cur_cache    = load!(cache_hits);
+                let cur_up_ok    = load!(upstream_ok);
+                let cur_up_err   = load!(upstream_err);
+                let cur_null     = load!(null_responses);
+                let cur_stale    = load!(stale_served);
+                let cur_filtered = load!(filtered);
+
+                let snap = PerSecondSnapshot {
+                    unix_secs:      now_secs,
+                    queries:        cur_queries .saturating_sub(prev_queries),
+                    cache_hits:     cur_cache   .saturating_sub(prev_cache),
+                    upstream_ok:    cur_up_ok   .saturating_sub(prev_up_ok),
+                    upstream_err:   cur_up_err  .saturating_sub(prev_up_err),
+                    null_responses: cur_null    .saturating_sub(prev_null),
+                    stale_served:   cur_stale   .saturating_sub(prev_stale),
+                    filtered:       cur_filtered.saturating_sub(prev_filtered),
+                };
+                qps_ring.push(snap.queries);
+                stats_ring.push(snap);
+
+                prev_queries  = cur_queries;
+                prev_cache    = cur_cache;
+                prev_up_ok    = cur_up_ok;
+                prev_up_err   = cur_up_err;
+                prev_null     = cur_null;
+                prev_stale    = cur_stale;
+                prev_filtered = cur_filtered;
             }
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
+                if changed.is_err() || *shutdown.borrow() { return; }
             }
         }
     }

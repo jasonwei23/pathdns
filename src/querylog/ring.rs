@@ -121,6 +121,67 @@ impl QpsRing {
     }
 }
 
+// ── Per-second stats ring ─────────────────────────────────────────────────────
+
+/// Per-second counter snapshot (deltas from the previous second).
+#[derive(Default, Clone, Copy)]
+pub struct PerSecondSnapshot {
+    pub unix_secs: u64,
+    pub queries: u64,
+    pub cache_hits: u64,
+    pub upstream_ok: u64,
+    pub upstream_err: u64,
+    pub null_responses: u64,
+    pub stale_served: u64,
+    pub filtered: u64,
+}
+
+/// Stores per-second counter snapshots for the last 86400 seconds (24 hours).
+pub struct StatsRing {
+    data: RwLock<VecDeque<PerSecondSnapshot>>,
+}
+
+impl StatsRing {
+    pub fn new() -> Self {
+        Self {
+            data: RwLock::new(VecDeque::with_capacity(3601)),
+        }
+    }
+
+    pub fn push(&self, snap: PerSecondSnapshot) {
+        if let Ok(mut data) = self.data.write() {
+            if data.len() == 86400 {
+                data.pop_front();
+            }
+            data.push_back(snap);
+        }
+    }
+
+    /// Aggregate the last `seconds` snapshots. Returns (aggregated totals, window_start_unix_secs).
+    pub fn aggregate(&self, seconds: usize) -> (PerSecondSnapshot, u64) {
+        let Ok(data) = self.data.read() else {
+            return (PerSecondSnapshot::default(), 0);
+        };
+        let take = seconds.min(86400).min(data.len());
+        let mut agg = PerSecondSnapshot::default();
+        let mut from_secs = 0u64;
+        let skip = data.len().saturating_sub(take);
+        for (i, snap) in data.iter().skip(skip).enumerate() {
+            if i == 0 {
+                from_secs = snap.unix_secs;
+            }
+            agg.queries += snap.queries;
+            agg.cache_hits += snap.cache_hits;
+            agg.upstream_ok += snap.upstream_ok;
+            agg.upstream_err += snap.upstream_err;
+            agg.null_responses += snap.null_responses;
+            agg.stale_served += snap.stale_served;
+            agg.filtered += snap.filtered;
+        }
+        (agg, from_secs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

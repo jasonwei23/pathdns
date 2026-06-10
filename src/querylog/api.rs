@@ -11,7 +11,7 @@
 //!   GET  /api/upstreams           → per-node stats snapshot
 
 use super::{QpsRing, QueryLogHandle};
-use crate::querylog::ring::EventRing;
+use crate::querylog::ring::{EventRing, StatsRing};
 use crate::querylog::worker::micros_to_rfc3339;
 use crate::server::AppState;
 use std::net::SocketAddr;
@@ -28,6 +28,7 @@ pub async fn serve(
     token: Option<String>,
     ring: Arc<EventRing>,
     qps_ring: Arc<QpsRing>,
+    stats_ring: Arc<StatsRing>,
     handle: QueryLogHandle,
     state: Arc<AppState>,
 ) {
@@ -46,6 +47,7 @@ pub async fn serve(
         };
         let ring = ring.clone();
         let qps_ring = qps_ring.clone();
+        let stats_ring = stats_ring.clone();
         let handle = handle.clone();
         let state = state.clone();
         let token = token.clone();
@@ -57,7 +59,7 @@ pub async fn serve(
             };
 
             let (status, body, content_type) =
-                dispatch(req, &ring, &qps_ring, &handle, &state, token.as_deref()).await;
+                dispatch(req, &ring, &qps_ring, &stats_ring, &handle, &state, token.as_deref()).await;
 
             let header = format!(
                 "HTTP/1.1 {status}\r\n\
@@ -184,6 +186,7 @@ async fn dispatch(
     req: HttpRequest,
     ring: &EventRing,
     qps_ring: &QpsRing,
+    stats_ring: &StatsRing,
     handle: &QueryLogHandle,
     state: &AppState,
     token: Option<&str>,
@@ -309,6 +312,43 @@ async fn dispatch(
                     "application/json",
                 ),
             }
+        }
+
+        ("GET", "/api/stats/aggregate") => {
+            let seconds = parse_query_param(&req.query, "seconds")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3600)
+                .min(86400)
+                .max(1);
+            let (agg, from_secs) = stats_ring.aggregate(seconds);
+            let to_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cache_rate = if agg.queries > 0 {
+                agg.cache_hits as f64 / agg.queries as f64 * 100.0
+            } else {
+                0.0
+            };
+            let body = serde_json::to_vec(&serde_json::json!({
+                "seconds": seconds,
+                "from_unix": from_secs,
+                "to_unix": to_secs,
+                "queries": agg.queries,
+                "cache_hits": agg.cache_hits,
+                "cache_hit_rate_pct": cache_rate,
+                "upstream_ok": agg.upstream_ok,
+                "upstream_err": agg.upstream_err,
+                "null_responses": agg.null_responses,
+                "stale_served": agg.stale_served,
+                "filtered": agg.filtered,
+            })).unwrap_or_default();
+            ("200 OK", body, "application/json")
+        }
+
+        ("GET", "/api/groups") => {
+            let body = render_groups(state);
+            ("200 OK", body, "application/json")
         }
 
         ("GET", "/api/upstreams") => {
@@ -453,6 +493,52 @@ fn render_upstreams(state: &AppState) -> Vec<u8> {
     }
     out.push(b']');
     out
+}
+
+fn render_groups(state: &AppState) -> Vec<u8> {
+    let geosite = state.geosite.load_full();
+    let tag_counts: std::collections::HashMap<&str, usize> = geosite
+        .as_deref()
+        .map(|db| db.tag_counts().collect())
+        .unwrap_or_default();
+
+    let groups: Vec<_> = state
+        .groups
+        .iter()
+        .map(|g| {
+            let tags: Vec<_> = g
+                .geosite_include
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "tag": t,
+                        "include": true,
+                        "count": tag_counts.get(t.as_str()).copied().unwrap_or(0),
+                    })
+                })
+                .chain(g.geosite_exclude.iter().map(|t| {
+                    serde_json::json!({
+                        "tag": t,
+                        "include": false,
+                        "count": tag_counts.get(t.as_str()).copied().unwrap_or(0),
+                    })
+                }))
+                .collect();
+
+            let mut filter_qtypes: Vec<u16> = g.filter_qtype.iter().copied().collect();
+            filter_qtypes.sort_unstable();
+
+            serde_json::json!({
+                "name": g.name,
+                "tags": tags,
+                "filter_qtype": filter_qtypes,
+                "has_upstream": g.upstream.is_some(),
+                "is_null": g.upstream.is_none() && g.name == "null",
+            })
+        })
+        .collect();
+
+    serde_json::to_vec(&groups).unwrap_or_default()
 }
 
 fn render_node_snapshots(snaps: &[crate::stats::NodeStatsSnapshot]) -> Vec<serde_json::Value> {

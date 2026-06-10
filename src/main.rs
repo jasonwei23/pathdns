@@ -69,7 +69,7 @@ async fn async_main(cfg: Config) -> Result<()> {
                 compress: f.compress,
             }),
     };
-    let (ql_handle, ql_worker, qps_ring, ql_shutdown) = crate::querylog::build(ql_cfg);
+    let (ql_handle, ql_worker, qps_ring, stats_ring, ql_shutdown) = crate::querylog::build(ql_cfg);
 
     let (app_state, refresh_rx) = server::AppState::new(cfg, ql_handle.clone()).await?;
     let state = Arc::new(app_state);
@@ -104,8 +104,9 @@ async fn async_main(cfg: Config) -> Result<()> {
         )));
 
         if let Some(addr) = api_bind {
+            let api_stats = stats_ring.clone();
             tokio::spawn(crate::querylog::api::serve(
-                addr, api_token, api_ring, api_qps, api_handle, api_state,
+                addr, api_token, api_ring, api_qps, api_stats, api_handle, api_state,
             ));
         }
     } else if let Some(addr) = state.cfg.querylog.bind {
@@ -116,6 +117,7 @@ async fn async_main(cfg: Config) -> Result<()> {
             state.cfg.querylog.token.clone(),
             api_ring,
             qps_ring.clone(),
+            stats_ring.clone(),
             ql_handle.clone(),
             state.clone(),
         ));
@@ -124,6 +126,7 @@ async fn async_main(cfg: Config) -> Result<()> {
     let qps_task = state.cfg.querylog.bind.map(|_| {
         tokio::spawn(crate::querylog::worker::run_qps_sampler(
             qps_ring.clone(),
+            stats_ring.clone(),
             ql_handle.counters.clone(),
             ql_shutdown.subscribe(),
         ))

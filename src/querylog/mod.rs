@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-pub use ring::{EventRing, QpsRing};
+pub use ring::{EventRing, PerSecondSnapshot, QpsRing, StatsRing};
 
 // ── Serialization helpers ─────────────────────────────────────────────────────
 
@@ -323,6 +323,7 @@ pub struct WorkerState {
     pub counters: Arc<QueryLogCounters>,
     pub file_cfg: Option<QueryLogFileConfig>,
     pub shutdown: tokio::sync::watch::Receiver<bool>,
+    pub stats_ring: Arc<StatsRing>,
 }
 
 /// Build a `QueryLogHandle` + optional worker state from config.
@@ -333,11 +334,13 @@ pub fn build(
     QueryLogHandle,
     Option<WorkerState>,
     Arc<QpsRing>,
+    Arc<StatsRing>,
     tokio::sync::watch::Sender<bool>,
 ) {
     let counters = Arc::new(QueryLogCounters::new());
     let seq = Arc::new(AtomicU64::new(0));
     let qps_ring = Arc::new(QpsRing::new());
+    let stats_ring = Arc::new(StatsRing::new());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let collect = cfg.enabled && (cfg.memory > 0 || cfg.file.is_some());
@@ -348,7 +351,7 @@ pub fn build(
             tx: None,
             answer_ips: false,
         };
-        return (handle, None, qps_ring, shutdown_tx);
+        return (handle, None, qps_ring, stats_ring, shutdown_tx);
     }
 
     let cap = cfg.channel.max(64);
@@ -367,8 +370,9 @@ pub fn build(
         counters,
         file_cfg: cfg.file,
         shutdown: shutdown_rx,
+        stats_ring: stats_ring.clone(),
     };
-    (handle, Some(worker), qps_ring, shutdown_tx)
+    (handle, Some(worker), qps_ring, stats_ring, shutdown_tx)
 }
 
 #[cfg(test)]
@@ -395,7 +399,7 @@ mod tests {
 
     #[test]
     fn disabled_config_has_no_event_channel() {
-        let (handle, worker, _, _) = build(QueryLogConfig {
+        let (handle, worker, _, _, _) = build(QueryLogConfig {
             enabled: false,
             memory: 1000,
             channel: 4096,
@@ -408,7 +412,7 @@ mod tests {
 
     #[test]
     fn full_channel_is_counted_without_blocking() {
-        let (handle, worker, _, _) = build(QueryLogConfig {
+        let (handle, worker, _, _, _) = build(QueryLogConfig {
             enabled: true,
             memory: 1,
             channel: 1,
@@ -428,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_drains_events_during_shutdown() {
-        let (handle, worker, _, shutdown) = build(QueryLogConfig {
+        let (handle, worker, _, _, shutdown) = build(QueryLogConfig {
             enabled: true,
             memory: 4,
             channel: 64,

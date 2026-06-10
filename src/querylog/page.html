@@ -82,6 +82,21 @@ tr:hover td{background:var(--surface2)}
 .badge-err{background:rgba(239,68,68,.12);color:var(--red)}
 .more-btn-wrap{text-align:center;margin-top:14px}
 
+/* Section label */
+.section-label{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;margin-top:4px}
+
+/* Range buttons */
+.range-btns{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.range-btn{padding:5px 12px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;font-size:12px;color:var(--text2);border-radius:6px;transition:background .12s,border-color .12s,color .12s}
+.range-btn:hover{background:var(--border);color:var(--text)}
+.range-btn.active{background:var(--accent-dim);border-color:var(--accent);color:var(--accent);font-weight:600}
+
+/* Groups table */
+.tag-pill{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;margin:1px 2px}
+.tag-include{background:rgba(34,197,94,.12);color:var(--green)}
+.tag-exclude{background:rgba(239,68,68,.12);color:var(--red)}
+.tag-catchall{color:var(--text2);font-style:italic}
+
 /* Auth overlay */
 #auth-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px)}
 #auth-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px 36px;width:320px;text-align:center}
@@ -133,6 +148,7 @@ tr:hover td{background:var(--surface2)}
   <div id="view-dashboard" class="view active">
     <div class="view-title">Dashboard</div>
 
+    <div class="section-label">Since startup</div>
     <div class="stat-grid">
       <div class="stat-box">
         <div class="stat-label">Total Queries</div>
@@ -177,9 +193,58 @@ tr:hover td{background:var(--surface2)}
       </div>
     </div>
 
+    <div class="section-label" id="agg-section-label">Last 1h</div>
+    <div class="range-btns">
+      <button class="range-btn" data-secs="60" onclick="setRange(60)">1m</button>
+      <button class="range-btn" data-secs="300" onclick="setRange(300)">5m</button>
+      <button class="range-btn" data-secs="900" onclick="setRange(900)">15m</button>
+      <button class="range-btn active" data-secs="3600" onclick="setRange(3600)">1h</button>
+      <button class="range-btn" data-secs="21600" onclick="setRange(21600)">6h</button>
+      <button class="range-btn" data-secs="86400" onclick="setRange(86400)">24h</button>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-label">Total Queries</div>
+        <div class="stat-value" id="agg-queries">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Cache Hit Rate</div>
+        <div class="stat-value" id="agg-cache-rate">—</div>
+        <div class="stat-sub" id="agg-cache-hits">— hits</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Cache Hits</div>
+        <div class="stat-value" id="agg-cache-hits-val">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Upstream OK</div>
+        <div class="stat-value" id="agg-upstream-ok">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Upstream Errors</div>
+        <div class="stat-value" id="agg-upstream-err" style="color:var(--red)">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Null / Filtered</div>
+        <div class="stat-value" id="agg-null-filtered">—</div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-title">QPS History (last 12 min)</div>
       <canvas id="qps-chart"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Routing Groups</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th>#</th><th>Group</th><th>Match Rules</th><th>Filter QTYPE</th><th>Upstream</th>
+          </tr></thead>
+          <tbody id="groups-tbody"><tr><td colspan="5" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card">
@@ -278,6 +343,118 @@ function showView(v) {
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
+let statsRangeSeconds = 3600;
+let groupsLoaded = false;
+
+const RANGE_LABELS = {60:'1m',300:'5m',900:'15m',3600:'1h',21600:'6h',86400:'24h'};
+
+function setRange(secs) {
+  statsRangeSeconds = secs;
+  document.querySelectorAll('.range-btn').forEach(btn => {
+    btn.classList.toggle('active', parseInt(btn.dataset.secs) === secs);
+  });
+  const label = RANGE_LABELS[secs] || (secs + 's');
+  document.getElementById('agg-section-label').textContent = 'Last ' + label;
+  loadAggregateStats();
+}
+
+async function loadAggregateStats() {
+  try {
+    const r = await tryFetch('/api/stats/aggregate?seconds=' + statsRangeSeconds);
+    if (!r) return;
+    const d = await r.json();
+    renderAggregateStats(d);
+  } catch(e) {}
+}
+
+function renderAggregateStats(d) {
+  document.getElementById('agg-queries').textContent = fmt(d.queries);
+  document.getElementById('agg-cache-rate').textContent =
+    (d.cache_hit_rate_pct || 0).toFixed(1) + '%';
+  document.getElementById('agg-cache-hits').textContent = fmt(d.cache_hits) + ' hits';
+  document.getElementById('agg-cache-hits-val').textContent = fmt(d.cache_hits);
+  document.getElementById('agg-upstream-ok').textContent = fmt(d.upstream_ok);
+  document.getElementById('agg-upstream-err').textContent = fmt(d.upstream_err);
+  document.getElementById('agg-null-filtered').textContent =
+    fmt((d.null_responses || 0) + (d.filtered || 0));
+}
+
+async function loadGroups() {
+  try {
+    const r = await tryFetch('/api/groups');
+    if (!r) return;
+    const groups = await r.json();
+    renderGroups(groups);
+    groupsLoaded = true;
+  } catch(e) {}
+}
+
+const QTYPE_NAMES = {1:'A',2:'NS',5:'CNAME',6:'SOA',12:'PTR',15:'MX',16:'TXT',28:'AAAA',33:'SRV',64:'SVCB',65:'HTTPS',255:'ANY',256:'URI',257:'CAA'};
+
+function qtypeName(n) {
+  return QTYPE_NAMES[n] || ('TYPE' + n);
+}
+
+function renderGroups(groups) {
+  const tbody = document.getElementById('groups-tbody');
+  if (!groups || !groups.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text2);text-align:center">No groups configured</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  groups.forEach((g, i) => {
+    const tr = document.createElement('tr');
+
+    // Name cell with optional badge
+    let namePart = '<strong>' + esc(g.name) + '</strong>';
+    if (g.is_null) namePart += ' <span class="badge badge-null">null</span>';
+    else if (!g.has_upstream) namePart += ' <span class="badge badge-filtered">no upstream</span>';
+
+    // Tags cell
+    let tagsPart;
+    if (!g.tags || g.tags.length === 0) {
+      tagsPart = '<span class="tag-catchall">catch-all</span>';
+    } else {
+      tagsPart = g.tags.map(t => {
+        const countStr = t.count > 0 ? ' (' + fmtCount(t.count) + ' rules)' : '';
+        if (t.include) {
+          return '<span class="tag-pill tag-include">' + esc(t.tag) + countStr + '</span>';
+        } else {
+          return '<span class="tag-pill tag-exclude">!' + esc(t.tag) + countStr + '</span>';
+        }
+      }).join('');
+    }
+
+    // Filter qtype cell
+    let qtypePart = '';
+    if (g.filter_qtype && g.filter_qtype.length > 0) {
+      qtypePart = g.filter_qtype.map(n => qtypeName(n)).join(', ');
+    } else {
+      qtypePart = '<span style="color:var(--text2)">—</span>';
+    }
+
+    // Upstream cell
+    let upstreamPart = g.has_upstream
+      ? '<span style="color:var(--green)">yes</span>'
+      : '<span style="color:var(--text2)">—</span>';
+
+    tr.innerHTML =
+      '<td style="color:var(--text2)">' + (i + 1) + '</td>' +
+      '<td>' + namePart + '</td>' +
+      '<td style="white-space:normal;max-width:300px">' + tagsPart + '</td>' +
+      '<td>' + qtypePart + '</td>' +
+      '<td>' + upstreamPart + '</td>';
+    frag.appendChild(tr);
+  });
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function fmtCount(n) {
+  if (n >= 1000) return (n / 1000).toFixed(0) + 'K';
+  return n.toString();
+}
+
 async function loadDashboard() {
   const r = await tryFetch('/api/stats');
   if (!r) return;
@@ -299,8 +476,10 @@ async function loadDashboard() {
   const failEl = document.getElementById('stat-cache-refresh-fail');
   failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
   document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
+  loadAggregateStats();
   loadChart();
   loadDashUpstreams();
+  if (!groupsLoaded) loadGroups();
 }
 
 async function loadChart() {
@@ -556,8 +735,10 @@ function refreshAll() {
     const failEl = document.getElementById('stat-cache-refresh-fail');
     failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
     document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
+    loadAggregateStats();
     loadChart();
     loadDashUpstreams();
+    loadGroups();
   }
 
   // Auto-refresh dashboard every 5 s
