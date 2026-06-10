@@ -25,6 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
+const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
+
 /// Bind `worker_threads` SO_REUSEPORT UDP sockets and race them in a `JoinSet`.
 pub async fn serve_udp(state: Arc<AppState>) -> Result<()> {
     let bind = state.cfg.bind;
@@ -42,8 +44,7 @@ pub async fn serve_udp(state: Arc<AppState>) -> Result<()> {
         crate::startup!("listen udp://{}", addr);
         return serve_udp_socket(sockets.remove(0), state).await;
     }
-    crate::startup!("listen udp://{}", addr);
-    crate::verbose!("listen udp://{} shards={}", addr, n);
+    crate::startup!("listen udp://{} shards={}", addr, n);
     let mut set = JoinSet::new();
     for socket in sockets {
         let s = state.clone();
@@ -72,8 +73,7 @@ pub async fn serve_tcp(state: Arc<AppState>) -> Result<()> {
         crate::startup!("listen tcp://{}", addr);
         return serve_tcp_listener(listeners.remove(0), state).await;
     }
-    crate::startup!("listen tcp://{}", addr);
-    crate::verbose!("listen tcp://{} shards={}", addr, n);
+    crate::startup!("listen tcp://{} shards={}", addr, n);
     let mut set = JoinSet::new();
     for listener in listeners {
         let s = state.clone();
@@ -87,12 +87,11 @@ pub async fn serve_tcp(state: Arc<AppState>) -> Result<()> {
 }
 
 async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Result<()> {
-    let mut recv_buf = BytesMut::with_capacity(4096);
+    let mut recv_buf = BytesMut::with_capacity(MAX_DNS_MESSAGE);
     let mut send_buf = BytesMut::with_capacity(4096);
     loop {
         recv_buf.clear();
         let (_n, peer) = socket.recv_buf_from(&mut recv_buf).await?;
-        crate::stats::inc_queries_udp();
 
         match try_fast_path_into(&recv_buf, peer, &state, &mut send_buf) {
             FastPathOutcome::Response { resp, refresh } => {
@@ -115,7 +114,8 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
                 // Materialize the packet only for the async slow path; cache/filter hits
                 // are answered directly from the reusable BytesMut receive buffer.
                 let packet =
-                    std::mem::replace(&mut recv_buf, BytesMut::with_capacity(4096)).freeze();
+                    std::mem::replace(&mut recv_buf, BytesMut::with_capacity(MAX_DNS_MESSAGE))
+                        .freeze();
                 let state = state.clone();
                 let socket = socket.clone();
                 tokio::spawn(async move {
@@ -126,9 +126,7 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
                             let _ = socket.send_to(&resp, peer).await;
                         }
                         Ok(None) => {}
-                        Err(err) => {
-                            crate::verbose!("dns event=query_error from={peer} error={err:#}");
-                        }
+                        Err(_) => {}
                     }
                 });
             }
@@ -141,9 +139,7 @@ async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) ->
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_tcp_conn(stream, peer, state).await {
-                crate::verbose!("dns event=tcp_query_error from={peer} error={err:#}");
-            }
+            let _ = handle_tcp_conn(stream, peer, state).await;
         });
     }
 }
@@ -164,7 +160,6 @@ async fn handle_tcp_conn(
         if len == 0 {
             continue;
         }
-        crate::stats::inc_queries_tcp();
         let mut packet = BytesMut::zeroed(len);
         stream.read_exact(&mut packet).await?;
 

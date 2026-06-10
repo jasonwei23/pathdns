@@ -5,6 +5,7 @@
 
 use crate::server::{AppState, CustomGroup, ResolvedFallback};
 use crate::upstream::UpstreamPool;
+use std::sync::Arc;
 
 /// The upstream target selected for a query.
 #[derive(Clone, Copy)]
@@ -41,6 +42,14 @@ impl<'a> RouteTarget<'a> {
     pub fn upstream(&self) -> Option<&'a UpstreamPool> {
         match self {
             Self::Group(group) => group.upstream.as_ref(),
+            Self::Race { .. } | Self::NoneIpSet { .. } => None,
+        }
+    }
+
+    /// Returns a human-readable display string for the upstream address(es), if any.
+    pub fn upstream_display(&self) -> Option<Arc<str>> {
+        match self {
+            Self::Group(group) => group.upstream.as_ref().map(|p| p.addr_display.clone()),
             Self::Race { .. } | Self::NoneIpSet { .. } => None,
         }
     }

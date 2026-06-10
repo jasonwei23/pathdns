@@ -1,7 +1,5 @@
-use super::inflight::{Completion, InflightRegistry};
-use super::{
-    apply_ecs_mode, connect_tcp_nodelay, now_ms, tcp_write_framed, UpstreamRequest,
-};
+use super::inflight::InflightRegistry;
+use super::{apply_ecs_mode, connect_tcp_nodelay, now_ms, tcp_write_framed, UpstreamRequest};
 use crate::config::EcsMode;
 use crate::dns;
 use anyhow::{anyhow, Context, Result};
@@ -51,13 +49,6 @@ impl TcpMux {
         max_inflight: usize,
         ecs_mode: EcsMode,
     ) -> Self {
-        crate::verbose!(
-            "upstream name={name} proto={} remote={remote}",
-            match connector {
-                MuxConnector::Tcp => "tcp",
-                MuxConnector::Tls { .. } => "tls",
-            }
-        );
         Self {
             name,
             remote,
@@ -141,12 +132,10 @@ impl TcpMux {
                 let pending = self.pending.clone();
                 let generation = self.generation.clone();
                 let write_conn = self.write_half.clone();
-                let name = self.name.clone();
                 tokio::spawn(async move {
-                    mux_reader_loop(read_half, pending, generation, my_gen, write_conn, name).await;
+                    mux_reader_loop(read_half, pending, generation, my_gen, write_conn).await;
                 });
 
-                crate::verbose!("upstream name={} event=connected gen={my_gen}", self.name);
                 Ok(())
             }
             Err(e) => {
@@ -155,10 +144,6 @@ impl TcpMux {
                 let backoff_ms = (50u64 << failures.min(7)).min(5000);
                 self.reconnect_not_before_ms
                     .store(now_ms() + backoff_ms, Ordering::Relaxed);
-                crate::verbose!(
-                    "upstream name={} event=connect_failed failures={failures} backoff_ms={backoff_ms}",
-                    self.name
-                );
                 Err(e)
             }
         }
@@ -203,12 +188,6 @@ impl TcpMux {
             Ok(Ok(())) => {}
         }
 
-        crate::verbose!(
-            "upstream name={} proto=tcp remote={} event=send id={upstream_id}",
-            self.name,
-            self.remote
-        );
-
         // Await response from reader task.
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -216,14 +195,7 @@ impl TcpMux {
                 "upstream {} tcp response channel closed",
                 self.name
             )),
-            Err(_elapsed) => {
-                crate::verbose!(
-                    "upstream name={} proto=tcp remote={} event=timeout",
-                    self.name,
-                    self.remote
-                );
-                Err(anyhow!("upstream {} tcp timeout", self.name))
-            }
+            Err(_elapsed) => Err(anyhow!("upstream {} tcp timeout", self.name)),
         }
     }
 }
@@ -236,7 +208,6 @@ async fn mux_reader_loop(
     global_gen: Arc<AtomicU64>,
     my_gen: u64,
     write_conn: Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
-    name: String,
 ) {
     let mut buf = BytesMut::with_capacity(4096);
     loop {
@@ -246,11 +217,8 @@ async fn mux_reader_loop(
         }
 
         let mut len_buf = [0u8; 2];
-        if let Err(e) = reader.read_exact(&mut len_buf).await {
+        if reader.read_exact(&mut len_buf).await.is_err() {
             if global_gen.load(Ordering::Relaxed) == my_gen {
-                crate::verbose!(
-                    "upstream name={name} proto=tcp event=read_error gen={my_gen} error={e:#}"
-                );
                 // Clear write half and drain all pending (callers see channel-closed error).
                 *write_conn.lock().await = None;
                 pending.clear();
@@ -270,21 +238,14 @@ async fn mux_reader_loop(
 
         buf.clear();
         buf.resize(resp_len, 0);
-        if let Err(e) = reader.read_exact(&mut buf).await {
+        if reader.read_exact(&mut buf).await.is_err() {
             if global_gen.load(Ordering::Relaxed) == my_gen {
-                crate::verbose!(
-                    "upstream name={name} proto=tcp event=read_body_error gen={my_gen} error={e:#}"
-                );
                 *write_conn.lock().await = None;
                 pending.clear();
             }
             return;
         }
 
-        if let Completion::Mismatch(id) = pending.complete(&mut buf, resp_len) {
-            crate::verbose!(
-                "upstream name={name} proto=tcp event=question_mismatch id={id} — keeping pending, dropping stale/mismatched response"
-            );
-        }
+        let _ = pending.complete(&mut buf, resp_len);
     }
 }

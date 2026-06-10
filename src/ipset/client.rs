@@ -44,10 +44,10 @@ impl NetfilterClient {
         self.sock.send_raw(&req.encode(seq))?;
 
         let msg = self.recv_for_test(seq)?;
-        Ok(match set {
+        match set {
             SetName::IpSet(_) => codec::decode_ipset_test(msg.msg_type, &msg.data),
-            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type),
-        })
+            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type, &msg.data),
+        }
     }
 
     /// Add `ips` to `set`.  Relies on `EEXIST` for duplicates (blind add).

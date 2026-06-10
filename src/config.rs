@@ -146,6 +146,41 @@ pub struct FallbackConfig {
     pub noip_as_primary_ip: bool,
 }
 
+/// Configuration for the query log subsystem.
+#[derive(Debug, Clone)]
+pub struct QueryLogConfig {
+    /// Whether the querylog section was present in the configuration.
+    pub enabled: bool,
+    /// HTTP API bind address. `None` = no HTTP listener.
+    pub bind: Option<SocketAddr>,
+    /// Bearer token for API auth. `None` = no auth required.
+    pub token: Option<String>,
+    /// Ring buffer capacity. 0 = event collection disabled (counters only).
+    pub memory: usize,
+    /// mpsc channel capacity.
+    pub channel: usize,
+    /// Extract A/AAAA answer IPs into detailed events.
+    pub answer_ips: bool,
+    pub file: Option<QueryLogFileConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryLogFileConfig {
+    pub dir: PathBuf,
+    /// Rotate when the active segment exceeds this size in MiB.
+    pub max_mb: u64,
+    /// Maximum number of completed (compressed) segments to retain.
+    pub max_segments: usize,
+    /// Maximum events to accumulate before one write call.
+    pub batch_size: usize,
+    /// How often the worker flushes its OS buffer (milliseconds).
+    pub flush_interval_ms: u64,
+    /// Delete compressed segments older than this many days. `None` = no age limit.
+    pub retention_days: Option<u32>,
+    /// Gzip-compress segments after rotation.
+    pub compress: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -157,7 +192,6 @@ pub struct Config {
     pub inflight_queue_ms: u64,
     pub worker_threads: usize,
     pub fallback: FallbackConfig,
-    pub verbose: bool,
     pub cache_size: usize,
     pub cache_stale_expire_ttl: u64,
     pub cache_stale_ttl: u32,
@@ -172,7 +206,7 @@ pub struct Config {
     pub cache_persist_interval: u64,
     pub udp_buf_size: usize,
     pub udp_pool_size: usize,
-    pub metrics_addr: Option<SocketAddr>,
+    pub querylog: QueryLogConfig,
     pub groups: Vec<GroupSpec>,
     pub ipset: Option<IpSetConfig>,
     pub verdict_cache: Option<VerdictCacheConfig>,
@@ -207,12 +241,12 @@ impl Config {
     }
 
     pub fn parse_args() -> Result<Self> {
-        let (config_path, verbose) = parse_cli()?;
+        let config_path = parse_cli()?;
         let json = crate::config_json::load_json_config(&config_path)?;
-        Self::from_json(json, verbose)
+        Self::from_json(json)
     }
 
-    pub(crate) fn from_json(json: JsonConfig, cli_verbose: bool) -> Result<Self> {
+    pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
         let bind_raw = json.bind.as_deref().unwrap_or("127.0.0.1:65353");
         let (listen_udp, listen_tcp) = resolve_bind_proto(bind_raw)?;
         let bind_addr = {
@@ -276,6 +310,74 @@ impl Config {
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
         let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads).max(1);
 
+        // Parse querylog section.
+        let querylog = if let Some(ql) = json.querylog {
+            let bind = ql.bind.as_deref().map(parse_addr).transpose()?;
+            if ql
+                .token
+                .as_deref()
+                .is_some_and(|token| token.trim().is_empty())
+            {
+                return Err(anyhow!("querylog.token must not be empty"));
+            }
+            let channel = ql.channel.unwrap_or(4096);
+            if channel == 0 {
+                return Err(anyhow!("querylog.channel must be at least 1"));
+            }
+            if channel > 1_000_000 {
+                return Err(anyhow!("querylog.channel must not exceed 1000000"));
+            }
+            let memory = ql.memory.unwrap_or(1000);
+            if memory > 10_000_000 {
+                return Err(anyhow!("querylog.memory must not exceed 10000000"));
+            }
+            let file = if let Some(f) = ql.file {
+                let dir = PathBuf::from(f.dir.unwrap_or_else(|| "./querylog".to_string()));
+                let max_mb = f.max_mb.unwrap_or(100);
+                let max_segments = f.max_segments.unwrap_or(10);
+                if max_mb == 0 {
+                    return Err(anyhow!("querylog.file.max-mb must be at least 1"));
+                }
+                if max_segments == 0 {
+                    return Err(anyhow!("querylog.file.max-segments must be at least 1"));
+                }
+                let batch_size = f.batch_size.unwrap_or(256).max(1);
+                let flush_interval_ms = f.flush_interval_ms.unwrap_or(500).max(50);
+                let retention_days = f.retention_days;
+                let compress = f.compress.unwrap_or(true);
+                Some(QueryLogFileConfig {
+                    dir,
+                    max_mb,
+                    max_segments,
+                    batch_size,
+                    flush_interval_ms,
+                    retention_days,
+                    compress,
+                })
+            } else {
+                None
+            };
+            QueryLogConfig {
+                enabled: true,
+                bind,
+                token: ql.token,
+                memory,
+                channel,
+                answer_ips: ql.answer_ips.unwrap_or(false),
+                file,
+            }
+        } else {
+            QueryLogConfig {
+                enabled: false,
+                bind: None,
+                token: None,
+                memory: 0,
+                channel: 4096,
+                answer_ips: false,
+                file: None,
+            }
+        };
+
         Ok(Self {
             bind: bind_addr,
             listen_udp,
@@ -285,7 +387,7 @@ impl Config {
             inflight_queue_ms,
             worker_threads,
             fallback,
-            verbose: json.verbose.unwrap_or(false) || cli_verbose,
+            querylog,
             cache_size: json.cache.as_ref().and_then(|c| c.size).unwrap_or(10000),
             cache_stale_expire_ttl: json
                 .cache
@@ -321,7 +423,6 @@ impl Config {
                 .unwrap_or(0),
             udp_buf_size,
             udp_pool_size,
-            metrics_addr: json.metrics_addr.as_deref().map(parse_addr).transpose()?,
             groups,
             ipset,
             verdict_cache,
@@ -339,10 +440,9 @@ impl Config {
 
 // ── CLI parsing ─────────────────────────────────────────────────────────────
 
-fn parse_cli() -> Result<(PathBuf, bool)> {
+fn parse_cli() -> Result<PathBuf> {
     let args: Vec<String> = std::env::args().collect();
     let mut config: Option<PathBuf> = None;
-    let mut verbose = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -353,7 +453,6 @@ fn parse_cli() -> Result<(PathBuf, bool)> {
                     .ok_or_else(|| anyhow!("-c requires a config file path"))?;
                 config = Some(PathBuf::from(path));
             }
-            "-v" => verbose = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -366,7 +465,7 @@ fn parse_cli() -> Result<(PathBuf, bool)> {
     }
     let config = config
         .ok_or_else(|| anyhow!("Error: configuration file not specified.\nUse -h for help."))?;
-    Ok((config, verbose))
+    Ok(config)
 }
 
 fn print_help() {
@@ -375,7 +474,6 @@ fn print_help() {
          \n\
          Options:\n\
            -c <config.json>   Load configuration file (required)\n\
-           -v                 Enable verbose output\n\
            -h                 Show this help message\n\
          \n\
          All configuration is read from the JSON file specified with -c."
@@ -1031,5 +1129,48 @@ impl UpstreamProto {
 
     fn uses_tls_name(self) -> bool {
         matches!(self, Self::Tls | Self::Https | Self::Quic | Self::H3)
+    }
+}
+
+#[cfg(test)]
+mod querylog_tests {
+    use super::*;
+
+    fn parse(input: &str) -> Result<Config> {
+        let json: JsonConfig = serde_json::from_str(input)?;
+        Config::from_json(json)
+    }
+
+    #[test]
+    fn omitted_querylog_is_fully_disabled() {
+        let cfg = parse(r#"{"fallback":{"default-group":"null"}}"#).unwrap();
+        assert!(!cfg.querylog.enabled);
+        assert_eq!(cfg.querylog.memory, 0);
+        assert!(cfg.querylog.bind.is_none());
+        assert!(cfg.querylog.file.is_none());
+    }
+
+    #[test]
+    fn present_querylog_uses_safe_defaults() {
+        let cfg = parse(r#"{"fallback":{"default-group":"null"},"querylog":{}}"#).unwrap();
+        assert!(cfg.querylog.enabled);
+        assert_eq!(cfg.querylog.memory, 1000);
+        assert_eq!(cfg.querylog.channel, 4096);
+        assert!(!cfg.querylog.answer_ips);
+    }
+
+    #[test]
+    fn invalid_querylog_limits_are_rejected() {
+        assert!(
+            parse(r#"{"fallback":{"default-group":"null"},"querylog":{"channel":0}}"#).is_err()
+        );
+        assert!(
+            parse(r#"{"fallback":{"default-group":"null"},"querylog":{"file":{"max-mb":0}}}"#)
+                .is_err()
+        );
+        assert!(parse(
+            r#"{"fallback":{"default-group":"null"},"querylog":{"file":{"max-segments":0}}}"#
+        )
+        .is_err());
     }
 }

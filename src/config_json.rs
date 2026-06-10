@@ -67,8 +67,9 @@ pub(crate) struct JsonConfig {
     // Listener
     pub(crate) bind: Option<String>,
     pub(crate) worker_threads: Option<usize>,
-    pub(crate) verbose: Option<bool>,
-    pub(crate) metrics_addr: Option<String>,
+
+    // Query log / dashboard
+    pub(crate) querylog: Option<JsonQueryLogSection>,
 
     // Upstreams / transport
     pub(crate) timeout_ms: Option<u64>,
@@ -157,6 +158,36 @@ pub(crate) struct JsonGroupEntry {
     pub(crate) cache: Option<JsonGroupCacheSection>,
     /// Accept both integer and array of integers.
     pub(crate) filter_qtype: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct JsonQueryLogSection {
+    pub(crate) bind: Option<String>,
+    pub(crate) token: Option<String>,
+    /// In-memory ring capacity. 0 = disable event collection (counters still active).
+    pub(crate) memory: Option<usize>,
+    /// mpsc channel depth.
+    pub(crate) channel: Option<usize>,
+    /// Extract A/AAAA answer IPs into each event. Disabled by default.
+    pub(crate) answer_ips: Option<bool>,
+    pub(crate) file: Option<JsonQueryLogFile>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct JsonQueryLogFile {
+    pub(crate) dir: Option<String>,
+    pub(crate) max_mb: Option<u64>,
+    pub(crate) max_segments: Option<usize>,
+    /// Maximum events to accumulate before one write call (default 256).
+    pub(crate) batch_size: Option<usize>,
+    /// How often the worker flushes the OS buffer in ms (default 500).
+    pub(crate) flush_interval_ms: Option<u64>,
+    /// Delete compressed segments older than this many days.
+    pub(crate) retention_days: Option<u32>,
+    /// Gzip-compress segments after rotation (default true).
+    pub(crate) compress: Option<bool>,
 }
 
 /// Parse a JSON config file and return the `JsonConfig` struct.

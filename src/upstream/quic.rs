@@ -70,7 +70,6 @@ impl DoQUpstream {
         max_inflight: usize,
     ) -> Result<Self> {
         let endpoint = make_quic_endpoint(remote, &name, b"doq")?;
-        crate::verbose!("upstream name={name} proto=doq remote={remote} sni={server_name}");
         let permits = if max_inflight > 0 {
             max_inflight
         } else {
@@ -104,21 +103,14 @@ impl DoQUpstream {
             .await
             .map_err(|_| anyhow!("upstream {}: DoQ connect timeout", self.name))?
             .with_context(|| format!("upstream {}: DoQ QUIC handshake failed", self.name))?;
-        crate::verbose!(
-            "upstream name={} proto=doq remote={} event=connected",
-            self.name,
-            self.remote
-        );
         *guard = Some(conn.clone());
         Ok(conn)
     }
 
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
-        let _permit = self
-            .inflight
-            .clone()
-            .acquire_owned()
+        let _permit = tokio::time::timeout(self.timeout, self.inflight.clone().acquire_owned())
             .await
+            .map_err(|_| anyhow!("upstream {}: inflight wait timeout", self.name))?
             .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
 
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
@@ -215,9 +207,6 @@ impl H3Upstream {
         max_inflight: usize,
     ) -> Result<Self> {
         let endpoint = make_quic_endpoint(remote, &name, b"h3")?;
-        crate::verbose!(
-            "upstream name={name} proto=h3 remote={remote} sni={server_name} path={path}"
-        );
         let permits = if max_inflight > 0 {
             max_inflight
         } else {
@@ -270,12 +259,6 @@ impl H3Upstream {
             .await
             .map_err(|_| anyhow!("upstream {}: H3 connect timeout", self.name))??;
 
-        crate::verbose!(
-            "upstream name={} proto=h3 remote={} event=connected",
-            self.name,
-            self.remote
-        );
-
         let cloned = send_req.clone();
         *guard = Some(H3Conn {
             quic: quic_conn,
@@ -285,11 +268,9 @@ impl H3Upstream {
     }
 
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
-        let _permit = self
-            .inflight
-            .clone()
-            .acquire_owned()
+        let _permit = tokio::time::timeout(self.timeout, self.inflight.clone().acquire_owned())
             .await
+            .map_err(|_| anyhow!("upstream {}: inflight wait timeout", self.name))?
             .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
 
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
@@ -347,10 +328,7 @@ impl H3Upstream {
                 .map_err(|e| anyhow!("upstream {name}: H3 recv_response failed: {e}"))?;
 
             if response.status() != http::StatusCode::OK {
-                return Err(anyhow!(
-                    "upstream {name}: H3 HTTP/3 {}",
-                    response.status()
-                ));
+                return Err(anyhow!("upstream {name}: H3 HTTP/3 {}", response.status()));
             }
 
             let mut body: Vec<u8> = Vec::new();
@@ -366,9 +344,7 @@ impl H3Upstream {
                         }
                     }
                     Ok(None) => break,
-                    Err(e) => {
-                        return Err(anyhow!("upstream {name}: H3 recv_data failed: {e}"))
-                    }
+                    Err(e) => return Err(anyhow!("upstream {name}: H3 recv_data failed: {e}")),
                 }
             }
             Ok(body)

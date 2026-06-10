@@ -100,7 +100,11 @@ impl SuffixTable {
             if self.level_interest & (1u8 << (level - 1)) == 0 {
                 continue;
             }
-            let start = if level <= count { suffix_starts[level - 1] } else { 0 };
+            let start = if level <= count {
+                suffix_starts[level - 1]
+            } else {
+                0
+            };
             if self.entries.contains_key(&name[start..]) {
                 return true;
             }
@@ -185,7 +189,10 @@ mod tests {
         assert!(t.contains_suffix("a.b.c.d.e.f.g.h"), "exact match");
         assert!(t.contains_suffix("x.a.b.c.d.e.f.g.h"), "9-label query");
         assert!(t.contains_suffix("y.x.a.b.c.d.e.f.g.h"), "10-label query");
-        assert!(!t.contains_suffix("b.c.d.e.f.g.h"), "shorter name should not match");
+        assert!(
+            !t.contains_suffix("b.c.d.e.f.g.h"),
+            "shorter name should not match"
+        );
     }
 
     #[test]

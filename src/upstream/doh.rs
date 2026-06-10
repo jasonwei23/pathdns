@@ -60,9 +60,6 @@ impl DoHUpstream {
         } else {
             format!("{}:{}", server_name, remote.port())
         };
-        crate::verbose!(
-            "upstream name={name} proto=https remote={remote} sni={server_name} path={path}"
-        );
         Self {
             name,
             remote,
@@ -252,7 +249,8 @@ fn doh_parse_status(headers: &str, name: &str) -> Result<u16> {
         .lines()
         .next()
         .ok_or_else(|| anyhow!("upstream {name}: empty DoH response"))?;
-    let code = line.split(' ')
+    let code = line
+        .split(' ')
         .nth(1)
         .ok_or_else(|| anyhow!("upstream {name}: malformed DoH status line"))?;
     code.parse::<u16>()

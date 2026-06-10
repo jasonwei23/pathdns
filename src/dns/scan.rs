@@ -77,8 +77,7 @@ pub fn effective_ttl_and_offsets(
     let ar = u16::from_be_bytes([packet[10], packet[11]]) as usize;
     // Single pass: collect TTL offsets and, when the answer section is empty,
     // the SOA TTL from the authority section (RFC 2308).
-    let (offsets, an_offsets, soa_ttl) =
-        ttl_offsets_and_soa(packet, question_end, an, ns, ar)?;
+    let (offsets, an_offsets, soa_ttl) = ttl_offsets_and_soa(packet, question_end, an, ns, ar)?;
 
     // NODATA / NXDOMAIN (no answer records): RFC 2308 mandates min(SOA_TTL, SOA_MINIMUM).
     let raw_ttl = if an == 0 {

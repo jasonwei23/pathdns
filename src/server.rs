@@ -49,13 +49,14 @@ pub struct AppState {
     pub(crate) remote_inflight: singleflight::InflightTable,
     pub refresh_gate: RefreshGate,
     pub refresh_tx: tokio::sync::mpsc::Sender<crate::cache::CacheRefresh>,
-    pub ipset: Option<IpSetManager>,
+    pub ipset: Option<Arc<IpSetManager>>,
     pub verdict_cache: VerdictCache,
     pub needs_geosite: bool,
     pub geosite: ArcSwapOption<GeoSiteDb>,
     pub routing_index: RouteIndex,
     pub fallback: ResolvedFallback,
     pub stale_client_timeout_ms: u64,
+    pub querylog: crate::querylog::QueryLogHandle,
 }
 
 pub struct RefreshGate {
@@ -82,6 +83,7 @@ impl CustomGroup {
 impl AppState {
     pub async fn new(
         cfg: Config,
+        querylog: crate::querylog::QueryLogHandle,
     ) -> Result<(
         Self,
         tokio::sync::mpsc::Receiver<crate::cache::CacheRefresh>,
@@ -112,6 +114,7 @@ impl AppState {
                         &format!("group-{}", spec.name),
                         &spec.upstream,
                         &upstream_cfg,
+                        Some(querylog.counters.clone()),
                     )
                     .await?,
                 )
@@ -159,9 +162,14 @@ impl AppState {
         }
 
         #[cfg(target_os = "linux")]
-        let ipset = cfg.ipset.as_ref().map(IpSetManager::new).transpose()?;
+        let ipset = cfg
+            .ipset
+            .as_ref()
+            .map(IpSetManager::new)
+            .transpose()?
+            .map(Arc::new);
         #[cfg(not(target_os = "linux"))]
-        let ipset: Option<IpSetManager> = None;
+        let ipset: Option<Arc<IpSetManager>> = None;
         if let Some(ipset) = &ipset {
             crate::startup!("netlink {}", ipset.summary());
         }
@@ -210,6 +218,7 @@ impl AppState {
                 routing_index,
                 fallback,
                 stale_client_timeout_ms,
+                querylog,
             },
             refresh_rx,
         ))
@@ -273,8 +282,7 @@ fn load_geosite(cfg: &Config, needed_tags: &HashSet<String>) -> Result<Option<Ar
     let db = GeoSiteDb::load(&cfg.geosite_files, needed_tags)
         .context("failed to load GeoSite database")?;
     let mut total = 0usize;
-    for (tag, count) in db.tag_counts() {
-        crate::verbose!("geosite tag={tag} matchers={count}");
+    for (_tag, count) in db.tag_counts() {
         total += count;
     }
     crate::startup!(

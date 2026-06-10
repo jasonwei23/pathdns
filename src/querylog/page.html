@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pathdns</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f11;
+  --surface:#18181b;
+  --surface2:#1e1e24;
+  --border:#2a2a35;
+  --text:#e8e8ea;
+  --text2:#8888a0;
+  --accent:#6366f1;
+  --accent-dim:rgba(99,102,241,.12);
+  --green:#22c55e;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --blue:#38bdf8;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden}
+
+/* Sidebar */
+#sidebar{width:200px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+#sidebar-title{padding:20px 18px 16px;font-size:18px;font-weight:700;color:var(--text);letter-spacing:-.02em}
+#sidebar-title span{color:var(--accent)}
+#sidebar nav{padding:4px 8px;flex:1}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;cursor:pointer;color:var(--text2);font-size:13px;border-radius:8px;text-decoration:none;transition:background .12s,color .12s;margin-bottom:2px}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--accent);background:var(--accent-dim);font-weight:600}
+.nav-icon{width:16px;height:16px;opacity:.7;flex-shrink:0}
+.nav-item.active .nav-icon{opacity:1}
+
+/* Main */
+#main{flex:1;overflow-y:auto;padding:28px 32px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.view{display:none;animation:fadeUp .2s ease}
+.view.active{display:block}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.view-title{font-size:20px;font-weight:700;margin-bottom:20px;color:var(--text);letter-spacing:-.02em}
+
+/* Stat grid */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;transition:border-color .15s}
+.stat-box:hover{border-color:var(--accent)}
+.stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.stat-value{font-size:28px;font-weight:700;line-height:1;color:var(--text)}
+.stat-sub{font-size:11px;color:var(--text2);margin-top:5px}
+
+/* Cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+.card-title{font-size:13px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px}
+#qps-chart{width:100%;height:140px;display:block}
+
+/* Tables */
+.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
+.toolbar input{flex:1;padding:7px 11px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;border-radius:7px;outline:none;transition:border-color .12s}
+.toolbar input:focus{border-color:var(--accent)}
+.toolbar input::placeholder{color:var(--text2)}
+.btn{padding:7px 14px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;font-size:13px;color:var(--text);border-radius:7px;transition:background .12s,border-color .12s}
+.btn:hover{background:var(--border)}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-danger{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
+.btn-danger:hover{background:rgba(239,68,68,.2)}
+.check-label{font-size:13px;color:var(--text2);display:flex;align-items:center;gap:6px;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--text);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface2)}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:.02em}
+.badge-cache{background:rgba(34,197,94,.12);color:var(--green)}
+.badge-upstream{background:rgba(56,189,248,.12);color:var(--blue)}
+.badge-stale{background:rgba(245,158,11,.12);color:var(--amber)}
+.badge-sf{background:rgba(99,102,241,.12);color:var(--accent)}
+.badge-null{background:rgba(239,68,68,.12);color:var(--red)}
+.badge-filtered{background:rgba(148,163,184,.12);color:var(--text2)}
+.badge-overload{background:rgba(239,68,68,.12);color:var(--red)}
+.badge-ok{background:rgba(34,197,94,.12);color:var(--green)}
+.badge-err{background:rgba(239,68,68,.12);color:var(--red)}
+.more-btn-wrap{text-align:center;margin-top:14px}
+
+/* Auth overlay */
+#auth-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px)}
+#auth-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px 36px;width:320px;text-align:center}
+#auth-box h2{margin-bottom:6px;font-size:18px;font-weight:700;color:var(--text)}
+#auth-box p{color:var(--text2);font-size:13px;margin-bottom:18px}
+#auth-input{width:100%;padding:9px 12px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;margin-bottom:12px;outline:none;border-radius:8px;transition:border-color .12s}
+#auth-input:focus{border-color:var(--accent)}
+#auth-btn{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;font-size:13px;cursor:pointer;font-weight:600;border-radius:8px;transition:filter .12s}
+#auth-btn:hover{filter:brightness(1.1)}
+
+@media(max-width:900px){
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:600px){
+  #sidebar{width:52px}
+  #sidebar-title,#sidebar-title span,.nav-item span{display:none}
+  #main{padding:16px}
+}
+</style>
+</head>
+<body>
+
+<div id="auth-overlay" style="display:none">
+  <div id="auth-box">
+    <h2>pathdns</h2>
+    <p>Enter your API token to continue</p>
+    <input id="auth-input" type="password" placeholder="Bearer token" autocomplete="current-password">
+    <button id="auth-btn" onclick="submitToken()">Sign in</button>
+  </div>
+</div>
+
+<div id="sidebar">
+  <div id="sidebar-title">path<span>dns</span></div>
+  <nav>
+    <a class="nav-item active" href="#dashboard" onclick="showView('dashboard');return false" data-view="dashboard">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span>Dashboard</span>
+    </a>
+    <a class="nav-item" href="#querylog" onclick="showView('querylog');return false" data-view="querylog">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 8h6M9 16h4M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z"/></svg>
+      <span>Query Log</span>
+    </a>
+  </nav>
+</div>
+
+<div id="main">
+
+  <!-- Dashboard -->
+  <div id="view-dashboard" class="view active">
+    <div class="view-title">Dashboard</div>
+
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-label">Total Queries</div>
+        <div class="stat-value" id="stat-total">—</div>
+        <div class="stat-sub" id="stat-qps-hint">— qps</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Cache Hit Rate</div>
+        <div class="stat-value" id="stat-cache-rate">—</div>
+        <div class="stat-sub" id="stat-cache-hits">— hits</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Avg Resolution</div>
+        <div class="stat-value" id="stat-rtt">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Upstream OK / Err</div>
+        <div class="stat-value" id="stat-upstream">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Singleflight Hits</div>
+        <div class="stat-value" id="stat-sf">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Stale Served</div>
+        <div class="stat-value" id="stat-stale">—</div>
+        <div class="stat-sub" id="stat-refresh">— refreshes</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Cache Refreshes</div>
+        <div class="stat-value" id="stat-cache-refresh">—</div>
+        <div class="stat-sub" id="stat-cache-refresh-fail"></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Inflight Drops</div>
+        <div class="stat-value" id="stat-drops">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Query Log Drops</div>
+        <div class="stat-value" id="stat-log-drops">—</div>
+        <div class="stat-sub" id="stat-log-queue">— queued</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">QPS History (last 12 min)</div>
+      <canvas id="qps-chart"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Upstream Nodes</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th>Group</th><th>Node</th><th>OK</th><th>Errors</th><th>Timeouts</th><th>Cancelled</th><th>Active</th><th>Avg RTT</th>
+          </tr></thead>
+          <tbody id="dash-up-tbody"><tr><td colspan="8" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Query Log -->
+  <div id="view-querylog" class="view">
+    <div class="view-title">Query Log</div>
+    <div class="card">
+      <div class="toolbar">
+        <input id="ql-filter" type="text" placeholder="Filter by domain…" oninput="filterChanged()">
+        <button class="btn btn-danger" onclick="clearLog()">Clear</button>
+        <label class="check-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"> Auto-refresh</label>
+      </div>
+      <div style="overflow-x:auto">
+        <table id="ql-table">
+          <thead><tr>
+            <th>Time</th><th>Client</th><th>Proto</th><th>QName</th>
+            <th>Type</th><th>RCode</th><th>Elapsed</th><th>Source</th>
+            <th>Group</th><th>Upstream</th>
+          </tr></thead>
+          <tbody id="ql-tbody"><tr><td colspan="10" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
+        </table>
+      </div>
+      <div class="more-btn-wrap">
+        <button class="btn" id="ql-more" onclick="loadMore()" style="display:none">Load more</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('pathdns_token') || '';
+let currentView = 'dashboard';
+let qlEvents = [];
+let qlBeforeSeq = null;
+let autoRefreshTimer = null;
+let dashTimer = null;
+let filterTimer = null;
+
+function api(path, opts) {
+  return fetch(path, {
+    headers: TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {},
+    ...opts
+  });
+}
+
+async function tryFetch(path, opts) {
+  try {
+    const r = await api(path, opts);
+    if (r.status === 401) { showAuth(); return null; }
+    return r;
+  } catch(e) { return null; }
+}
+
+function showAuth() {
+  document.getElementById('auth-overlay').style.display = 'flex';
+}
+
+function submitToken() {
+  TOKEN = document.getElementById('auth-input').value.trim();
+  sessionStorage.setItem('pathdns_token', TOKEN);
+  document.getElementById('auth-overlay').style.display = 'none';
+  refreshAll();
+}
+
+document.getElementById('auth-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitToken();
+});
+
+function showView(v) {
+  document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById('view-' + v);
+  if (!el) return;
+  el.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(el => {
+    if (el.dataset.view === v) el.classList.add('active');
+  });
+  currentView = v;
+  history.replaceState(null, '', v === 'dashboard' ? location.pathname : '#' + v);
+  if (v === 'dashboard') loadDashboard();
+  else if (v === 'querylog') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
+}
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+
+async function loadDashboard() {
+  const r = await tryFetch('/api/stats');
+  if (!r) return;
+  const s = await r.json();
+  document.getElementById('stat-total').textContent = fmt(s.queries_total);
+  document.getElementById('stat-qps-hint').textContent = s.qps_now + ' qps';
+  document.getElementById('stat-cache-rate').textContent = s.cache_hit_rate_pct.toFixed(1) + '%';
+  document.getElementById('stat-cache-hits').textContent = fmt(s.cache_hits) + ' hits';
+  document.getElementById('stat-rtt').textContent = fmtRtt(s.avg_resolution_us);
+  document.getElementById('stat-upstream').textContent = fmt(s.upstream_ok) + ' / ' + fmt(s.upstream_err);
+  document.getElementById('stat-drops').textContent = fmt(s.inflight_drops);
+  document.getElementById('stat-log-drops').textContent =
+    fmt(s.events_dropped_full + s.events_dropped_closed);
+  document.getElementById('stat-log-queue').textContent =
+    fmt(s.queue_depth) + ' queued; peak ' + fmt(s.queue_high_watermark);
+  document.getElementById('stat-sf').textContent = fmt(s.singleflight_hits);
+  document.getElementById('stat-stale').textContent = fmt(s.stale_served);
+  document.getElementById('stat-cache-refresh').textContent = fmt(s.cache_refresh_started);
+  const failEl = document.getElementById('stat-cache-refresh-fail');
+  failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
+  document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
+  loadChart();
+  loadDashUpstreams();
+}
+
+async function loadChart() {
+  const r = await tryFetch('/api/stats/history?n=720');
+  if (!r) return;
+  const data = await r.json();
+  drawChart(data);
+}
+
+async function loadDashUpstreams() {
+  const r = await tryFetch('/api/upstreams');
+  if (!r) return;
+  const groups = await r.json();
+  const tbody = document.getElementById('dash-up-tbody');
+  const frag = document.createDocumentFragment();
+  for (const g of groups) {
+    for (const n of g.nodes) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + esc(g.group) + '</td>' +
+        '<td title="' + esc(n.name) + '">' + esc(n.name) + '</td>' +
+        '<td style="color:var(--green)">' + fmt(n.queries_ok) + '</td>' +
+        '<td style="color:var(--red)">' + fmt(n.queries_err) + '</td>' +
+        '<td style="color:var(--amber)">' + fmt(n.queries_timeout) + '</td>' +
+        '<td>' + fmt(n.queries_cancelled) + '</td>' +
+        '<td>' + n.active_inflight + '</td>' +
+        '<td>' + fmtRtt(n.avg_rtt_us) + '</td>';
+      frag.appendChild(tr);
+    }
+  }
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function drawChart(data) {
+  const canvas = document.getElementById('qps-chart');
+  const W = canvas.offsetWidth || 600; const H = 140;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (!data || !data.length) return;
+
+  const pad = {t: 8, r: 12, b: 28, l: 38};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const max = Math.max(...data, 1);
+  const n = data.length;
+
+  // Grid lines
+  ctx.strokeStyle = '#2a2a35'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + ch * (1 - i / 4);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillStyle = '#555'; ctx.font = '10px system-ui'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(max * i / 4), pad.l - 5, y + 4);
+  }
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ch);
+  grad.addColorStop(0, 'rgba(99,102,241,.35)');
+  grad.addColorStop(1, 'rgba(99,102,241,.0)');
+
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = pad.l + cw * i / (n - 1 || 1);
+    const y = pad.t + ch * (1 - v / max);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  // Close path for fill
+  const lastX = pad.l + cw * (n - 1) / (n - 1 || 1);
+  ctx.lineTo(lastX, pad.t + ch);
+  ctx.lineTo(pad.l, pad.t + ch);
+  ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  // Line (re-draw on top)
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = pad.l + cw * i / (n - 1 || 1);
+    const y = pad.t + ch * (1 - v / max);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Time labels
+  ctx.fillStyle = '#555'; ctx.font = '10px system-ui'; ctx.textAlign = 'center';
+  const now = new Date();
+  const step = Math.max(1, Math.floor(n / 6));
+  for (let i = 0; i < n; i += step) {
+    const secsAgo = n - 1 - i;
+    const t = new Date(now - secsAgo * 1000);
+    const label = t.getHours().toString().padStart(2,'0') + ':' + t.getMinutes().toString().padStart(2,'0');
+    const x = pad.l + cw * i / (n - 1 || 1);
+    ctx.fillText(label, x, H - 6);
+  }
+}
+
+// ── Query Log ──────────────────────────────────────────────────────────────
+
+async function loadQueryLog() {
+  const filter = document.getElementById('ql-filter').value.trim();
+  let url = '/api/querylog?limit=100';
+  if (qlBeforeSeq !== null) url += '&before_seq=' + qlBeforeSeq;
+  if (filter) url += '&q=' + encodeURIComponent(filter);
+
+  const r = await tryFetch(url);
+  if (!r) return;
+  const events = await r.json();
+
+  if (qlBeforeSeq === null) {
+    qlEvents = events;
+  } else {
+    qlEvents = qlEvents.concat(events);
+  }
+
+  renderQueryLog();
+
+  const moreBtn = document.getElementById('ql-more');
+  if (events.length >= 100) {
+    qlBeforeSeq = Math.min(...events.map(e => e.seq));
+    moreBtn.style.display = 'inline-block';
+  } else {
+    moreBtn.style.display = 'none';
+  }
+}
+
+function renderQueryLog() {
+  const tbody = document.getElementById('ql-tbody');
+  if (!qlEvents.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text2);text-align:center">No entries</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const ev of qlEvents) {
+    const tr = document.createElement('tr');
+    const t = new Date(ev.time);
+    const timeStr = t.toLocaleTimeString();
+    const src = sourceTag(ev.source);
+    const rcode = ev.rcode === 0
+      ? '<span class="badge badge-ok">NOERR</span>'
+      : ev.rcode === 3
+      ? '<span class="badge badge-err">NXDOM</span>'
+      : '<span class="badge badge-err">' + ev.rcode + '</span>';
+    tr.innerHTML =
+      '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
+      '<td>' + esc(ev.client) + '</td>' +
+      '<td>' + esc(ev.protocol) + '</td>' +
+      '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
+      '<td>' + esc(ev.qtype_name) + '</td>' +
+      '<td>' + rcode + '</td>' +
+      '<td>' + fmtRtt(ev.elapsed_us) + '</td>' +
+      '<td>' + src + '</td>' +
+      '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>' +
+      '<td title="' + esc(ev.upstream || '') + '">' + (ev.upstream ? esc(ev.upstream.split('/').pop()) : '<span style="color:var(--text2)">—</span>') + '</td>';
+    frag.appendChild(tr);
+  }
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function sourceTag(src) {
+  const map = {cache:'badge-cache',upstream:'badge-upstream',stale:'badge-stale',singleflight:'badge-sf',null:'badge-null',filtered:'badge-filtered',overload:'badge-overload'};
+  const cls = map[src] || 'badge-ok';
+  return '<span class="badge ' + cls + '">' + esc(src) + '</span>';
+}
+
+function filterChanged() {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(() => {
+    qlEvents = []; qlBeforeSeq = null;
+    loadQueryLog();
+  }, 250);
+}
+
+function loadMore() {
+  loadQueryLog();
+}
+
+async function clearLog() {
+  await tryFetch('/api/querylog', {method: 'DELETE'});
+  qlEvents = []; qlBeforeSeq = null;
+  renderQueryLog();
+}
+
+function toggleAuto() {
+  const on = document.getElementById('ql-auto').checked;
+  clearInterval(autoRefreshTimer);
+  autoRefreshTimer = null;
+  if (on) {
+    autoRefreshTimer = setInterval(() => { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }, 5000);
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function fmt(n) {
+  if (n === undefined || n === null) return '0';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function fmtRtt(us) {
+  if (!us) return '0 us';
+  if (us >= 1000) return (us / 1000).toFixed(1) + ' ms';
+  return us + ' us';
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function refreshAll() {
+  if (currentView === 'dashboard') loadDashboard();
+  else if (currentView === 'querylog' && document.getElementById('ql-auto').checked) {
+    qlEvents = []; qlBeforeSeq = null; loadQueryLog();
+  }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+
+(async () => {
+  // Restore view from URL hash
+  const hash = location.hash.replace('#', '');
+  const initView = hash === 'querylog' ? 'querylog' : 'dashboard';
+
+  const r = await api('/api/stats');
+  if (r.status === 401) { showAuth(); return; }
+
+  if (initView !== 'dashboard') {
+    showView(initView);
+  } else {
+    const s = await r.json();
+    document.getElementById('stat-total').textContent = fmt(s.queries_total);
+    document.getElementById('stat-qps-hint').textContent = s.qps_now + ' qps';
+    document.getElementById('stat-cache-rate').textContent = s.cache_hit_rate_pct.toFixed(1) + '%';
+    document.getElementById('stat-cache-hits').textContent = fmt(s.cache_hits) + ' hits';
+    document.getElementById('stat-rtt').textContent = fmtRtt(s.avg_resolution_us);
+    document.getElementById('stat-upstream').textContent = fmt(s.upstream_ok) + ' / ' + fmt(s.upstream_err);
+    document.getElementById('stat-drops').textContent = fmt(s.inflight_drops);
+    document.getElementById('stat-log-drops').textContent =
+      fmt(s.events_dropped_full + s.events_dropped_closed);
+    document.getElementById('stat-log-queue').textContent =
+      fmt(s.queue_depth) + ' queued; peak ' + fmt(s.queue_high_watermark);
+    document.getElementById('stat-sf').textContent = fmt(s.singleflight_hits);
+    document.getElementById('stat-stale').textContent = fmt(s.stale_served);
+    document.getElementById('stat-cache-refresh').textContent = fmt(s.cache_refresh_started);
+    const failEl = document.getElementById('stat-cache-refresh-fail');
+    failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
+    document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
+    loadChart();
+    loadDashUpstreams();
+  }
+
+  // Auto-refresh dashboard every 5 s
+  dashTimer = setInterval(() => {
+    if (currentView === 'dashboard') loadDashboard();
+  }, 5000);
+})();
+</script>
+</body>
+</html>

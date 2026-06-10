@@ -22,8 +22,9 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - Query type filtering with optional group and GeoSite tag conditions.
 - Native Linux netlink backend for ipset/nftset test and add operations (no shell-out).
 - Per-upstream hedged requests: fire a second upstream after a configurable delay.
-- Prometheus metrics endpoint.
-- Silent in normal operation; `-v` enables full diagnostic logging.
+- Native query log subsystem: per-query structured events through a bounded non-blocking channel, in-memory ring buffer, optional rotating MessagePack files with gzip compression and age-based retention, and an authenticated HTTP API with a built-in dashboard.
+- Always-on lock-free counters with negligible hot-path overhead; detailed event collection is opt-in.
+- Operational statistics are exposed only through the built-in dashboard/API; there is no verbose per-query stderr mode or separate metrics endpoint.
 
 ---
 
@@ -59,13 +60,12 @@ Produces a static ELF binary (~1.5 MB).
 ## CLI
 
 ```
-pathdns -c <config.json> [-v] [-h]
+pathdns -c <config.json> [-h]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-c <FILE>` | Path to JSON config file (required) |
-| `-v` | Enable verbose/diagnostic logging |
 | `-h` | Print help and exit |
 
 All configuration is done via the JSON file. There are no other CLI flags.
@@ -139,8 +139,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
 | `upstream-udp-sockets` | int | CPU count | UDP socket pool size per upstream node. |
 | `hedge-delay-ms` | int (ms) | `0` (disabled) | Fire a second upstream after N ms with no reply. |
-| `verbose` | bool | `false` | Enable diagnostic logging (same as `-v`). |
-| `metrics-addr` | string | — | Prometheus scrape address (e.g. `"0.0.0.0:9153"`). |
+| `querylog` | object | — | Query log / dashboard settings (see [Query Log](#query-log--dashboard)). |
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
 | `no-ipset-blacklist` | bool | `false` | Allow loopback/unspecified IPs in ipset add operations. |
 | `group` | array | — | Routing groups (see [Groups](#groups)). |
@@ -279,6 +278,75 @@ Caches primary/secondary routing decisions for the `"none"` fallback to avoid re
 |-------|------|---------|-------------|
 | `size` | int | — | Capacity in entries (`0` disables). |
 | `ttl` | int (seconds) | `0` (no expiry) | Per-entry TTL. |
+
+### Query Log
+
+Configures per-query event collection and the dashboard HTTP API. The section is optional; omit it entirely to keep only the always-on lock-free counters.
+
+```json
+"querylog": {
+  "bind":    "0.0.0.0:8080",
+  "token":   "your-secret-token",
+  "memory":  1000,
+  "channel": 4096,
+  "answer-ips": false,
+  "file": {
+    "dir":              "/var/lib/pathdns/querylog",
+    "max-mb":           100,
+    "max-segments":     10,
+    "batch-size":       256,
+    "flush-interval-ms": 500,
+    "retention-days":   30,
+    "compress":         true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bind` | string | — | Listen address for the dashboard + HTTP API (e.g. `"0.0.0.0:8080"`). Omit to disable the API. |
+| `token` | string | — | Bearer token required on every API request (`Authorization: Bearer <token>`). When omitted, the API is unauthenticated — only safe on a trusted network. |
+| `memory` | int | `1000` | In-memory ring buffer capacity. `0` disables the ring; file collection can still remain active. |
+| `channel` | int | `4096` | Bounded mpsc channel depth between the DNS hot path and the log worker. When full, new events are dropped (non-blocking) rather than stalling queries. |
+| `answer-ips` | bool | `false` | Extract A/AAAA answer IPs into detailed events. Disabled by default because it requires scanning each response. |
+| `file.dir` | string | `"./querylog"` | Directory for rotating MessagePack segments. Created if missing. |
+| `file.max-mb` | int (MB) | `100` | Rotate to a new segment when the current one reaches this size. |
+| `file.max-segments` | int | `10` | Keep at most this many compressed segments; oldest are pruned. |
+| `file.batch-size` | int | `256` | Maximum events to accumulate before one write call. Reduces syscall overhead at high query rates. |
+| `file.flush-interval-ms` | int (ms) | `500` | How often the background worker flushes its write buffer to the OS. |
+| `file.retention-days` | int | — | Delete compressed segments whose embedded timestamp is older than this many days. Applied in addition to `max-segments`. |
+| `file.compress` | bool | `true` | Gzip-compress segments after rotation. Disabling saves CPU at the cost of larger on-disk files. |
+
+Omitting the entire `querylog` section fully disables detailed event collection. When the section is present, event collection is enabled when `memory > 0` or a `file` section is present. The hot path reserves capacity in a bounded channel before constructing an event; if the channel is full, the event is dropped and the DNS response is unaffected. Serialisation and batched file writes are handled by the background worker — the DNS hot path never performs I/O.
+
+**File format:** active segments are named `querylog-{timestamp}.msgpack` (a sequence of concatenated MessagePack maps, one per event). On rotation the segment is gzip-compressed to `querylog-{timestamp}.msgpack.gz` in a background thread-pool task so the worker never stalls.
+
+Dashboard counters count each successfully parsed client query once at ingress. Internal cache refreshes are tracked separately and do not affect client QPS, query totals, average resolution time, or detailed client events.
+
+Each event is a JSON object:
+
+```json
+{
+  "seq": 12345,
+  "time": "2026-06-10T08:21:33.123456Z",
+  "client": "192.168.1.50",
+  "client_port": 51234,
+  "protocol": "udp",
+  "qname": "example.com",
+  "qtype": 1,
+  "qtype_name": "A",
+  "rcode": 0,
+  "elapsed_us": 1820,
+  "response_bytes": 76,
+  "source": "upstream",
+  "group": "overseas",
+  "upstream": null,
+  "answer_ips": ["93.184.216.34"],
+  "error": null
+}
+```
+
+`source` is one of `cache`, `stale`, `upstream`, `singleflight`, `filtered`, `overload`, or `null`.
 
 ---
 
@@ -459,23 +527,28 @@ Tags from multiple files are merged:
 
 ---
 
-## Prometheus Metrics
+## Query Log & Dashboard
 
-Enable with `"metrics-addr": "0.0.0.0:9153"`.
+Enable by adding a `querylog` section with a `bind` address (see [Query Log config](#query-log)). Browse to `http://<bind>/` for the built-in dashboard, or query the JSON API directly.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `dns_queries_total{proto}` | counter | Queries received (udp/tcp) |
-| `dns_cache_lookups_total{result}` | counter | Cache hits / misses / stale |
-| `dns_cache_refresh_total{result}` | counter | Background refresh outcomes |
-| `dns_singleflight_hits_total` | counter | Deduplicated in-flight queries |
-| `dns_inflight_total{result}` | counter | Queries that hit `max-inflight`: `result="queued"` waited in queue; `result="dropped"` were shed with SERVFAIL |
-| `dns_queries_routed_total{target}` | counter | Routing decisions (none_race / null / group / aaaa_filtered) |
-| `dns_query_latency_seconds` | histogram | End-to-end slow-path latency |
-| `dns_upstream_queries_total{upstream,result}` | counter | Per-upstream ok/err counts |
-| `dns_upstream_rtt_seconds{upstream}` | histogram | Per-upstream RTT |
-| `dns_upstream_active_inflight{upstream}` | gauge | In-flight queries per upstream |
-| `dns_geosite_reloads_total{result}` | counter | GeoSite hot-reload outcomes |
+When a token is configured, the dashboard HTML remains publicly loadable so its sign-in form can be displayed. All `/api/*` requests require `Authorization: Bearer <token>`.
+
+| Method & path | Description |
+|---------------|-------------|
+| `GET /` | Single-page dashboard (overview cards, QPS chart, query log, upstream table). |
+| `GET /api/stats` | Snapshot of counters: total queries, cache-hit rate, current QPS, average RTT, upstream ok/err, inflight drops, ring length. |
+| `GET /api/stats/history?n=<N>` | Last `N` seconds of per-second QPS samples (max 3600). |
+| `GET /api/querylog?limit=<L>&before_seq=<S>&q=<filter>` | Recent events from the in-memory ring, newest first. `before_seq` paginates older entries; `q` filters by qname substring. |
+| `DELETE /api/querylog` | Clear the in-memory event ring. |
+| `GET /api/querylog/files` | JSON array of available compressed historical segments with their names and sizes (`[{"name":"querylog-…msgpack.gz","size_bytes":…}]`). Returns `[]` when file logging is disabled. |
+| `GET /api/querylog/history?file=<name>&limit=<L>&q=<filter>` | Decode a historical `.msgpack.gz` segment and return its events as JSON. `file` must be a name returned by `/api/querylog/files`; `limit` caps results (max 10 000); `q` filters by qname substring. Decoding runs in a background thread and does not block the DNS path. |
+| `GET /api/upstreams` | Per-upstream-node stats: ok/err/timeout counts, active inflight, RTT. |
+
+Example:
+
+```sh
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:8080/api/stats
+```
 
 ---
 

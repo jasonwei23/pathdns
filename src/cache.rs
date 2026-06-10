@@ -1,9 +1,9 @@
 //! DNS response cache with RFC-compliant TTL management.
 //!
-//! Entries are keyed by FNV-1a hash of the DNS question section (qname + qtype + qclass).
-//! qname label bytes are normalised to ASCII lowercase during hashing so that
-//! `www.EXAMPLE.com` and `www.example.com` produce the same key (RFC 4343).
-//! qtype and qclass are hashed without case folding.
+//! Entries are keyed by the complete query semantics except the client ID.
+//! QNAME label bytes are normalised to ASCII lowercase, while header flags and
+//! additional records remain exact so ECS, DNSSEC, COOKIE, and similar variants
+//! cannot share answers accidentally.
 //!
 //! On a cache hit, TTLs in the response packet are patched in-place to reflect remaining time.
 //!
@@ -36,10 +36,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type CacheKey = u64;
 
-/// FNV-1a hash of DNS question bytes with qname label bytes normalised to lowercase.
-pub fn cache_key(question: &[u8]) -> CacheKey {
+/// FNV-1a hash of a complete DNS query excluding its two-byte client ID.
+pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
     let mut h = Fnv1a::new();
-    let mut pos = 0;
+    if query.len() < 12 || question_end < 16 || question_end > query.len() {
+        return h.finish();
+    }
+
+    h.write(&query[2..12]);
+    let question = &query[12..question_end];
+    let mut pos = 0usize;
 
     while let Some(&len) = question.get(pos) {
         h.write_byte(len);
@@ -56,32 +62,7 @@ pub fn cache_key(question: &[u8]) -> CacheKey {
 
     // Tail (QTYPE/QCLASS) hashed exactly, matching dns::questions_match semantics.
     h.write(question.get(pos..).unwrap_or(&[]));
-    h.finish()
-}
-
-/// Sentinel key for NXDOMAIN cross-qtype caching.
-/// Derived from the qname-only hash by XOR with a fixed pattern.
-fn nxdomain_key(qname_hash: CacheKey) -> CacheKey {
-    qname_hash ^ 0xFFFF_FFFF_FFFF_FFFF
-}
-
-/// Compute a hash of just the qname portion of a DNS question (excluding qtype/qclass).
-fn qname_only_hash(question: &[u8]) -> CacheKey {
-    let mut h = Fnv1a::new();
-    let mut pos = 0;
-
-    while let Some(&len) = question.get(pos) {
-        h.write_byte(len);
-        pos += 1;
-        if len == 0 {
-            break;
-        }
-        let end = (pos + len as usize).min(question.len());
-        for &b in &question[pos..end] {
-            h.write_byte(b.to_ascii_lowercase());
-        }
-        pos = end;
-    }
+    h.write(query.get(question_end..).unwrap_or(&[]));
     h.finish()
 }
 
@@ -116,6 +97,7 @@ enum EntryFreshness {
 pub struct CacheLookup {
     pub packet: Bytes,
     pub refresh: Option<CacheRefresh>,
+    pub qname: Arc<str>,
     /// True when the entry's TTL had expired but it was within the stale window.
     /// The caller should count this as a stale hit and spawn a background refresh.
     pub is_stale: bool,
@@ -127,6 +109,7 @@ pub struct CacheLookup {
 #[derive(Debug, Clone)]
 pub struct CacheLookupMeta {
     pub refresh: Option<CacheRefresh>,
+    pub qname: Arc<str>,
     pub is_stale: bool,
     /// Index of the group that originally cached this entry (u16::MAX = unknown).
     pub group_id: u16,
@@ -204,24 +187,36 @@ impl DnsCache {
     /// Look up a fresh or (when stale_secs > 0) proactively-served stale entry.
     /// Returns `CacheLookup.is_stale = true` when the entry's TTL had expired but it
     /// was still within the stale window; the caller should spawn a background refresh.
-    pub fn get(&self, question: &[u8], client_id: u16) -> Option<CacheLookup> {
-        self.lookup(question, client_id, self.stale_expire_ttl > 0)
+    pub fn get(&self, query: &[u8], question_end: usize, client_id: u16) -> Option<CacheLookup> {
+        self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0)
     }
 
     /// Look up and write the response packet into a caller-provided buffer.
     /// Returns metadata without allocating a new `Bytes` for the packet.
     pub fn get_into(
         &self,
-        question: &[u8],
+        query: &[u8],
+        question_end: usize,
         client_id: u16,
         out: &mut BytesMut,
     ) -> Option<CacheLookupMeta> {
-        self.lookup_into(question, client_id, self.stale_expire_ttl > 0, out)
+        self.lookup_into(
+            query,
+            question_end,
+            client_id,
+            self.stale_expire_ttl > 0,
+            out,
+        )
     }
 
     /// Unconditional stale lookup used as an error fallback (upstream SERVFAIL / failure).
-    pub fn get_stale(&self, question: &[u8], client_id: u16) -> Option<CacheLookup> {
-        self.lookup(question, client_id, true)
+    pub fn get_stale(
+        &self,
+        query: &[u8],
+        question_end: usize,
+        client_id: u16,
+    ) -> Option<CacheLookup> {
+        self.lookup(query, question_end, client_id, true)
     }
 
     /// Merge a group's cache policy over the global defaults.
@@ -286,14 +281,6 @@ impl DnsCache {
             group_id,
         });
 
-        // If this response is NXDOMAIN, also store a sentinel under the qname-only key
-        // so future queries for the same name with any qtype can be served an NXDOMAIN.
-        if dns::rcode(entry.packet.as_ref()) == 3 {
-            let question_bytes: &[u8] = &question;
-            let nx_key = nxdomain_key(qname_only_hash(question_bytes));
-            cache.insert(nx_key, entry.clone());
-        }
-
         cache.insert(ins.key, entry);
     }
 
@@ -314,30 +301,20 @@ impl DnsCache {
         }
     }
 
-    fn lookup(&self, question: &[u8], client_id: u16, allow_stale: bool) -> Option<CacheLookup> {
+    fn lookup(
+        &self,
+        query: &[u8],
+        question_end: usize,
+        client_id: u16,
+        allow_stale: bool,
+    ) -> Option<CacheLookup> {
         let cache = self.cache.as_ref()?;
-        let key = cache_key(question);
-        let (entry, evict_key, is_sentinel) = match cache.get(&key) {
-            Some(e) if dns::questions_match(e.question.as_ref(), question) => (e, key, false),
-            _ => {
-                // Cache miss: check NXDOMAIN sentinel for any-qtype NXDOMAIN.
-                let nx_key = nxdomain_key(qname_only_hash(question));
-                let nx_entry = cache.get(&nx_key)?;
-                // Verify qname matches (ignore qtype, but require same qclass).
-                if !dns::qnames_match(nx_entry.question.as_ref(), question) {
-                    return None;
-                }
-                let qlen = question.len();
-                let eq_len = nx_entry.question.len();
-                if qlen < 2
-                    || eq_len < 2
-                    || question[qlen - 2..] != nx_entry.question.as_ref()[eq_len - 2..]
-                {
-                    return None;
-                }
-                (nx_entry, nx_key, true)
-            }
-        };
+        let question = query.get(12..question_end)?;
+        let key = cache_key(query, question_end);
+        let entry = cache.get(&key)?;
+        if !queries_match(entry.query.as_ref(), query, question_end) {
+            return None;
+        }
 
         let now = Instant::now();
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
@@ -345,7 +322,7 @@ impl DnsCache {
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
             EntryFreshness::Expired { evict } => {
                 if evict {
-                    cache.invalidate(&evict_key);
+                    cache.invalidate(&key);
                 }
                 return None;
             }
@@ -357,21 +334,15 @@ impl DnsCache {
 
         let mut packet = BytesMut::from(entry.packet.as_ref());
         let _ = dns::set_id(&mut packet, client_id);
-        if is_sentinel {
-            // Patch qtype in the Question section to match the incoming query.
-            let qlen = question.len();
-            if qlen >= 4 {
-                let qtype_off = 12 + qlen - 4;
-                if qtype_off + 2 <= packet.len() {
-                    packet[qtype_off..qtype_off + 2].copy_from_slice(&question[qlen - 4..qlen - 2]);
-                }
-            }
+        if packet.len() >= question_end {
+            packet[12..question_end].copy_from_slice(question);
         }
         dns::patch_ttls_at(&mut packet, &entry.ttl_offsets, wire_ttl);
         let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
         Some(CacheLookup {
             packet: packet.freeze(),
             refresh,
+            qname: entry.qname.clone(),
             is_stale,
             group_id: entry.group_id,
         })
@@ -379,32 +350,19 @@ impl DnsCache {
 
     fn lookup_into(
         &self,
-        question: &[u8],
+        query: &[u8],
+        question_end: usize,
         client_id: u16,
         allow_stale: bool,
         out: &mut BytesMut,
     ) -> Option<CacheLookupMeta> {
         let cache = self.cache.as_ref()?;
-        let key = cache_key(question);
-        let (entry, evict_key, is_sentinel) = match cache.get(&key) {
-            Some(e) if dns::questions_match(e.question.as_ref(), question) => (e, key, false),
-            _ => {
-                let nx_key = nxdomain_key(qname_only_hash(question));
-                let nx_entry = cache.get(&nx_key)?;
-                if !dns::qnames_match(nx_entry.question.as_ref(), question) {
-                    return None;
-                }
-                let qlen = question.len();
-                let eq_len = nx_entry.question.len();
-                if qlen < 2
-                    || eq_len < 2
-                    || question[qlen - 2..] != nx_entry.question.as_ref()[eq_len - 2..]
-                {
-                    return None;
-                }
-                (nx_entry, nx_key, true)
-            }
-        };
+        let question = query.get(12..question_end)?;
+        let key = cache_key(query, question_end);
+        let entry = cache.get(&key)?;
+        if !queries_match(entry.query.as_ref(), query, question_end) {
+            return None;
+        }
 
         let now = Instant::now();
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
@@ -412,7 +370,7 @@ impl DnsCache {
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
             EntryFreshness::Expired { evict } => {
                 if evict {
-                    cache.invalidate(&evict_key);
+                    cache.invalidate(&key);
                 }
                 return None;
             }
@@ -423,19 +381,14 @@ impl DnsCache {
         out.clear();
         out.extend_from_slice(&entry.packet);
         let _ = dns::set_id(out, client_id);
-        if is_sentinel {
-            let qlen = question.len();
-            if qlen >= 4 {
-                let qtype_off = 12 + qlen - 4;
-                if qtype_off + 2 <= out.len() {
-                    out[qtype_off..qtype_off + 2].copy_from_slice(&question[qlen - 4..qlen - 2]);
-                }
-            }
+        if out.len() >= question_end {
+            out[12..question_end].copy_from_slice(question);
         }
         dns::patch_ttls_at(out, &entry.ttl_offsets, wire_ttl);
         let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
         Some(CacheLookupMeta {
             refresh,
+            qname: entry.qname.clone(),
             is_stale,
             group_id: entry.group_id,
         })
@@ -520,9 +473,7 @@ impl DnsCache {
             .unwrap_or_default()
             .as_secs();
 
-        // Collect live, non-sentinel entries.
-        // Sentinel entries (NXDOMAIN cross-qtype keys) are excluded: they are re-derived
-        // automatically on load when the canonical NXDOMAIN entry is inserted.
+        // Collect live entries.
         let mut entries: Vec<(CacheKey, Arc<Entry>)> = Vec::new();
         for (key, entry) in cache.iter() {
             let stale_remaining = entry
@@ -534,10 +485,6 @@ impl DnsCache {
             if remaining == 0 && stale_remaining == 0 {
                 continue;
             }
-            // Skip sentinel entries; they are identified by key == nxdomain_key(qname_only_hash).
-            if *key == nxdomain_key(qname_only_hash(&entry.question)) {
-                continue;
-            }
             entries.push((*key, entry));
         }
 
@@ -545,7 +492,7 @@ impl DnsCache {
         atomic_write(path, |w| {
             // Magic encodes format implicitly; change it when the on-disk layout changes.
             // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-            w.write_all(b"PDNSC004")?;
+            w.write_all(b"PDNSC005")?;
             w.write_all(&fingerprint.to_le_bytes())?;
             w.write_all(&(count as u32).to_le_bytes())?;
 
@@ -609,7 +556,7 @@ impl DnsCache {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).context("read magic")?;
         anyhow::ensure!(
-            &magic == b"PDNSC004",
+            &magic == b"PDNSC005",
             "unrecognised cache file format (magic mismatch)"
         );
 
@@ -681,17 +628,25 @@ impl DnsCache {
                 group_id: entry_group_id,
             });
 
-            // Re-derive NXDOMAIN sentinel if needed.
-            if dns::rcode(entry.packet.as_ref()) == 3 {
-                let nx_key = nxdomain_key(qname_only_hash(&question_arc));
-                cache.insert(nx_key, entry.clone());
-            }
             cache.insert(key, entry);
             loaded += 1;
         }
 
         Ok(loaded)
     }
+}
+
+fn queries_match(stored: &[u8], query: &[u8], question_end: usize) -> bool {
+    if stored.len() != query.len() || question_end > query.len() {
+        return false;
+    }
+    let Some(stored_question_end) = dns::question_end(stored) else {
+        return false;
+    };
+    stored_question_end == question_end
+        && stored.get(2..12) == query.get(2..12)
+        && dns::questions_match(&stored[12..question_end], &query[12..question_end])
+        && stored.get(question_end..) == query.get(question_end..)
 }
 
 pub(crate) fn read_u16(r: &mut impl Read) -> Result<u16> {
@@ -797,8 +752,7 @@ mod tests {
         policy: Option<&GroupCachePolicy>,
     ) -> (Vec<u8>, usize) {
         let (response, query, question_end) = make_test_packets(ttl);
-        let question = &query[12..question_end];
-        let key = cache_key(question);
+        let key = cache_key(&query, question_end);
         let resolved = cache.resolve_policy(policy);
         cache.add(
             CacheInsert {
@@ -822,8 +776,9 @@ mod tests {
             ..no_override_policy()
         };
         let (query, question_end) = add_to_cache(&cache, 10, Some(&policy));
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         // DNS said 10s, group min_ttl=60 → wire TTL must be at least 60.
         assert_eq!(read_wire_ttl(&hit.packet), 60);
     }
@@ -836,8 +791,9 @@ mod tests {
             ..no_override_policy()
         };
         let (query, question_end) = add_to_cache(&cache, 3600, Some(&policy));
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         // DNS said 3600s, group max_ttl=300 → wire TTL must not exceed 300.
         assert_eq!(read_wire_ttl(&hit.packet), 300);
     }
@@ -848,8 +804,9 @@ mod tests {
         cfg.min_ttl = 45;
         let cache = DnsCache::new(&cfg);
         let (query, question_end) = add_to_cache(&cache, 5, None);
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         assert_eq!(read_wire_ttl(&hit.packet), 45);
     }
 
@@ -859,8 +816,9 @@ mod tests {
         cfg.max_ttl = 120;
         let cache = DnsCache::new(&cfg);
         let (query, question_end) = add_to_cache(&cache, 86400, None);
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         assert_eq!(read_wire_ttl(&hit.packet), 120);
     }
 
@@ -873,8 +831,9 @@ mod tests {
             ..no_override_policy()
         };
         let (query, question_end) = add_to_cache(&cache, 100, Some(&policy));
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         assert!(
             hit.refresh.is_some(),
             "expected a refresh request with refresh_percent=100"
@@ -885,8 +844,9 @@ mod tests {
     fn no_refresh_without_policy() {
         let cache = DnsCache::new(&base_cache_config());
         let (query, question_end) = add_to_cache(&cache, 100, None);
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         assert!(
             hit.refresh.is_none(),
             "expected no refresh when no policy is set"
@@ -904,9 +864,58 @@ mod tests {
             ..no_override_policy()
         };
         let (query, question_end) = add_to_cache(&cache, 10, Some(&policy));
-        let question = &query[12..question_end];
-        let hit = cache.get(question, 1).expect("expected cache hit");
+        let hit = cache
+            .get(&query, question_end, 1)
+            .expect("expected cache hit");
         // With group min_ttl=5 taking precedence, wire TTL = 10 (the DNS TTL, since 10 > 5).
         assert_eq!(read_wire_ttl(&hit.packet), 10);
+    }
+
+    #[test]
+    fn edns_variant_does_not_share_cache_entry() {
+        let cache = DnsCache::new(&base_cache_config());
+        let (response, query, question_end) = make_test_packets(100);
+        let resolved = cache.resolve_policy(None);
+        cache.add(
+            CacheInsert {
+                key: cache_key(&query, question_end),
+                qname: Arc::from("test.local"),
+                question_end,
+                query: &query,
+                packet: &response,
+            },
+            &resolved,
+            0,
+        );
+
+        let mut edns_query = query.clone();
+        edns_query[11] = 1; // ARCOUNT = 1
+        edns_query.extend_from_slice(&[
+            0x00, // root owner name
+            0x00, 0x29, // OPT
+            0x10, 0x00, // UDP payload size
+            0x00, 0x00, 0x80, 0x00, // DO flag
+            0x00, 0x00, // RDLEN
+        ]);
+
+        assert!(cache.get(&edns_query, question_end, 2).is_none());
+    }
+
+    #[test]
+    fn cache_hit_restores_current_question_case() {
+        let cache = DnsCache::new(&base_cache_config());
+        let (query, question_end) = add_to_cache(&cache, 100, None);
+        let mut mixed_case_query = query;
+        mixed_case_query[13..17].copy_from_slice(b"TeSt");
+        mixed_case_query[18..23].copy_from_slice(b"LoCaL");
+
+        let hit = cache
+            .get(&mixed_case_query, question_end, 2)
+            .expect("expected case-insensitive cache hit");
+
+        assert_eq!(
+            &hit.packet[12..question_end],
+            &mixed_case_query[12..question_end]
+        );
     }
 }

@@ -1,0 +1,511 @@
+//! Hand-rolled HTTP API for the query log dashboard.
+//!
+//! Routes:
+//!   GET  /                        → dashboard HTML (embedded)
+//!   GET  /api/stats               → current counters + avg RTT + QPS
+//!   GET  /api/stats/history       → last 3600 per-second QPS counts
+//!   GET  /api/querylog            → paginated events from ring (?limit=&before_seq=&q=)
+//!   DELETE /api/querylog          → clear ring buffer
+//!   GET  /api/querylog/files      → list compressed historical segments
+//!   GET  /api/querylog/history    → decode a historical segment (?file=name&limit=&q=)
+//!   GET  /api/upstreams           → per-node stats snapshot
+
+use super::{QpsRing, QueryLogHandle};
+use crate::querylog::ring::EventRing;
+use crate::querylog::worker::micros_to_rfc3339;
+use crate::server::AppState;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+static DASHBOARD_HTML: &str = include_str!("page.html");
+
+pub async fn serve(
+    addr: SocketAddr,
+    token: Option<String>,
+    ring: Arc<EventRing>,
+    qps_ring: Arc<QpsRing>,
+    handle: QueryLogHandle,
+    state: Arc<AppState>,
+) {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("warn: querylog api=bind_failed addr={addr} error={e}");
+            return;
+        }
+    };
+    crate::startup!("querylog api=http://{addr}");
+    let token = Arc::new(token);
+    loop {
+        let Ok((mut conn, _peer)) = listener.accept().await else {
+            continue;
+        };
+        let ring = ring.clone();
+        let qps_ring = qps_ring.clone();
+        let handle = handle.clone();
+        let state = state.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let Ok(Ok(req)) =
+                tokio::time::timeout(Duration::from_secs(5), read_request(&mut conn)).await
+            else {
+                return;
+            };
+
+            let (status, body, content_type) =
+                dispatch(req, &ring, &qps_ring, &handle, &state, token.as_deref()).await;
+
+            let header = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: {content_type}\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: no-store\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                body.len()
+            );
+            let _ = conn.write_all(header.as_bytes()).await;
+            let _ = conn.write_all(&body).await;
+        });
+    }
+}
+
+// ── Request parsing ───────────────────────────────────────────────────────────
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    query: String,
+    auth: Option<String>,
+}
+
+async fn read_request(conn: &mut tokio::net::TcpStream) -> std::io::Result<HttpRequest> {
+    let mut buf = vec![0u8; 4096];
+    let mut total = 0;
+    loop {
+        let n = conn.read(&mut buf[total..]).await?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if total >= buf.len() {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf[..total]);
+    parse_http_request(&text)
+}
+
+fn parse_http_request(text: &str) -> std::io::Result<HttpRequest> {
+    let mut lines = text.lines();
+    let request_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
+    let method = parts.first().copied().unwrap_or("GET").to_string();
+    let full_path = parts.get(1).copied().unwrap_or("/");
+    let (path, query) = if let Some(pos) = full_path.find('?') {
+        (&full_path[..pos], &full_path[pos + 1..])
+    } else {
+        (full_path, "")
+    };
+
+    let mut auth = None;
+    for line in lines {
+        if line.to_lowercase().starts_with("authorization:") {
+            let value = line[14..].trim();
+            if let Some(tok) = value.strip_prefix("Bearer ") {
+                auth = Some(tok.trim().to_string());
+            }
+        }
+    }
+
+    Ok(HttpRequest {
+        method: method.to_uppercase(),
+        path: path.to_string(),
+        query: query.to_string(),
+        auth,
+    })
+}
+
+fn parse_query_param(query: &str, key: &str) -> Option<String> {
+    for part in query.split('&') {
+        if let Some((k, v)) = part.split_once('=') {
+            if k == key {
+                return percent_decode(v);
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex(bytes[i + 1])?;
+                let lo = hex(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+async fn dispatch(
+    req: HttpRequest,
+    ring: &EventRing,
+    qps_ring: &QpsRing,
+    handle: &QueryLogHandle,
+    state: &AppState,
+    token: Option<&str>,
+) -> (&'static str, Vec<u8>, &'static str) {
+    if matches!(
+        (req.method.as_str(), req.path.as_str()),
+        ("GET", "/") | ("GET", "/index.html")
+    ) {
+        return (
+            "200 OK",
+            DASHBOARD_HTML.as_bytes().to_vec(),
+            "text/html; charset=utf-8",
+        );
+    }
+
+    if let Some(expected) = token {
+        let provided = req.auth.as_deref().unwrap_or("");
+        if provided != expected {
+            return (
+                "401 Unauthorized",
+                br#"{"error":"unauthorized"}"#.to_vec(),
+                "application/json",
+            );
+        }
+    }
+
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/stats") => {
+            let body = render_stats(handle, qps_ring, ring);
+            ("200 OK", body, "application/json")
+        }
+
+        ("GET", "/api/stats/history") => {
+            let n = parse_query_param(&req.query, "n")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3600)
+                .min(3600);
+            let data = qps_ring.snapshot(n);
+            let body = serde_json::to_vec(&data).unwrap_or_default();
+            ("200 OK", body, "application/json")
+        }
+
+        ("GET", "/api/querylog") => {
+            let limit = parse_query_param(&req.query, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(100);
+            let before_seq =
+                parse_query_param(&req.query, "before_seq").and_then(|v| v.parse::<u64>().ok());
+            let filter = parse_query_param(&req.query, "q");
+            let events = ring.query(before_seq, limit, filter.as_deref());
+            let body = render_ring_events(&events);
+            ("200 OK", body, "application/json")
+        }
+
+        ("DELETE", "/api/querylog") => {
+            ring.clear();
+            ("204 No Content", vec![], "application/json")
+        }
+
+        // List available compressed historical segments.
+        ("GET", "/api/querylog/files") => {
+            let dir = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone());
+            match dir {
+                None => {
+                    let body = b"[]".to_vec();
+                    ("200 OK", body, "application/json")
+                }
+                Some(dir) => {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::querylog::worker::list_history_files(&dir)
+                    })
+                    .await
+                    .unwrap_or_default();
+
+                    let json_list: Vec<serde_json::Value> = result
+                        .into_iter()
+                        .map(|(name, size)| serde_json::json!({"name": name, "size_bytes": size}))
+                        .collect();
+                    let body = serde_json::to_vec(&json_list).unwrap_or_default();
+                    ("200 OK", body, "application/json")
+                }
+            }
+        }
+
+        // Decode a specific historical segment and return its events as JSON.
+        ("GET", "/api/querylog/history") => {
+            let file_name = parse_query_param(&req.query, "file").unwrap_or_default();
+            let limit = parse_query_param(&req.query, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1000);
+            let filter = parse_query_param(&req.query, "q");
+
+            let Some(dir) = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone()) else {
+                return (
+                    "404 Not Found",
+                    br#"{"error":"file logging disabled"}"#.to_vec(),
+                    "application/json",
+                );
+            };
+
+            if !safe_history_filename(&file_name) {
+                return (
+                    "400 Bad Request",
+                    br#"{"error":"invalid file name"}"#.to_vec(),
+                    "application/json",
+                );
+            }
+
+            let path = dir.join(&file_name);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::querylog::worker::read_history_file(&path, limit, filter.as_deref())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(events)) => {
+                    let body = serde_json::to_vec(&events).unwrap_or_default();
+                    ("200 OK", body, "application/json")
+                }
+                _ => (
+                    "500 Internal Server Error",
+                    br#"{"error":"read failed"}"#.to_vec(),
+                    "application/json",
+                ),
+            }
+        }
+
+        ("GET", "/api/upstreams") => {
+            let body = render_upstreams(state);
+            ("200 OK", body, "application/json")
+        }
+
+        _ => (
+            "404 Not Found",
+            br#"{"error":"not found"}"#.to_vec(),
+            "application/json",
+        ),
+    }
+}
+
+// ── Security helpers ──────────────────────────────────────────────────────────
+
+/// Accept only safe, unambiguous historical segment file names.
+/// Must start with "querylog-" and end with ".msgpack.gz"; no path separators.
+fn safe_history_filename(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name.starts_with("querylog-")
+        && name.ends_with(".msgpack.gz")
+}
+
+// ── JSON renderers ────────────────────────────────────────────────────────────
+
+fn render_stats(handle: &QueryLogHandle, qps_ring: &QpsRing, ring: &EventRing) -> Vec<u8> {
+    let c = &handle.counters;
+    let total = c.queries_total.load(Ordering::Relaxed);
+    let cache = c.cache_hits.load(Ordering::Relaxed);
+    let up_ok = c.upstream_ok.load(Ordering::Relaxed);
+    let up_err = c.upstream_err.load(Ordering::Relaxed);
+    let drops = c.inflight_drops.load(Ordering::Relaxed);
+    let queued = c.inflight_queued.load(Ordering::Relaxed);
+    let rtt_sum = c.rtt_sum_us.load(Ordering::Relaxed);
+    let rtt_n = c.rtt_count.load(Ordering::Relaxed);
+    let avg_resolution_us = if rtt_n > 0 { rtt_sum / rtt_n } else { 0 };
+    let cache_rate = if total > 0 {
+        cache as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let qps_now = qps_ring.snapshot(1).first().copied().unwrap_or(0);
+    let ring_len = ring.len();
+    let sf_hits = c.singleflight_hits.load(Ordering::Relaxed);
+    let stale_served = c.stale_served.load(Ordering::Relaxed);
+    let refresh_started = c.cache_refresh_started.load(Ordering::Relaxed);
+    let refresh_failed = c.cache_refresh_failed.load(Ordering::Relaxed);
+    let hedged = c.hedged_queries.load(Ordering::Relaxed);
+    let filtered = c.filtered.load(Ordering::Relaxed);
+    let null_responses = c.null_responses.load(Ordering::Relaxed);
+    let events_enqueued = c.events_enqueued.load(Ordering::Relaxed);
+    let events_processed = c.events_processed.load(Ordering::Relaxed);
+    let events_dropped_full = c.events_dropped_full.load(Ordering::Relaxed);
+    let events_dropped_closed = c.events_dropped_closed.load(Ordering::Relaxed);
+    let queue_high_watermark = c.queue_high_watermark.load(Ordering::Relaxed);
+    let ring_evictions = c.ring_evictions.load(Ordering::Relaxed);
+    let file_write_errors = c.file_write_errors.load(Ordering::Relaxed);
+
+    serde_json::to_vec(&serde_json::json!({
+        "queries_total": total,
+        "queries_udp": c.queries_udp.load(Ordering::Relaxed),
+        "queries_tcp": c.queries_tcp.load(Ordering::Relaxed),
+        "cache_hits": cache,
+        "cache_hit_rate_pct": cache_rate,
+        "upstream_ok": up_ok,
+        "upstream_err": up_err,
+        "inflight_drops": drops,
+        "inflight_queued": queued,
+        "avg_resolution_us": avg_resolution_us,
+        "qps_now": qps_now,
+        "ring_len": ring_len,
+        "singleflight_hits": sf_hits,
+        "stale_served": stale_served,
+        "cache_refresh_started": refresh_started,
+        "cache_refresh_failed": refresh_failed,
+        "hedged_queries": hedged,
+        "filtered": filtered,
+        "null_responses": null_responses,
+        "events_enqueued": events_enqueued,
+        "events_processed": events_processed,
+        "events_dropped_full": events_dropped_full,
+        "events_dropped_closed": events_dropped_closed,
+        "queue_depth": handle.queue_depth(),
+        "queue_high_watermark": queue_high_watermark,
+        "ring_evictions": ring_evictions,
+        "file_write_errors": file_write_errors,
+    }))
+    .unwrap_or_default()
+}
+
+fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8> {
+    let values: Vec<_> = events
+        .iter()
+        .map(|ev| {
+            let answer_ips: Vec<String> = ev.answer_ips.iter().map(ToString::to_string).collect();
+            serde_json::json!({
+                "seq": ev.seq,
+                "time": micros_to_rfc3339(ev.unix_micros),
+                "client": ev.client.to_string(),
+                "client_port": ev.client_port,
+                "protocol": ev.protocol,
+                "qname": ev.qname.as_ref(),
+                "qtype": ev.qtype,
+                "qtype_name": super::qtype_name(ev.qtype),
+                "rcode": ev.rcode,
+                "elapsed_us": ev.elapsed_us,
+                "response_bytes": ev.response_bytes,
+                "source": ev.source,
+                "group": ev.group.as_deref(),
+                "upstream": ev.upstream.as_deref(),
+                "answer_ips": answer_ips,
+                "error": ev.error.as_deref(),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&values).unwrap_or_default()
+}
+
+fn render_upstreams(state: &AppState) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1024);
+    out.push(b'[');
+    let mut first_group = true;
+    for group in &state.groups {
+        let Some(pool) = &group.upstream else {
+            continue;
+        };
+        if !first_group {
+            out.push(b',');
+        }
+        first_group = false;
+        let prefix = format!("group-{}", group.name);
+        let snaps = pool.node_snapshots(&prefix);
+        let nodes_json = render_node_snapshots(&snaps);
+        let entry = serde_json::json!({
+            "group": group.name.as_str(),
+            "nodes": nodes_json,
+        });
+        out.extend_from_slice(serde_json::to_string(&entry).unwrap_or_default().as_bytes());
+    }
+    out.push(b']');
+    out
+}
+
+fn render_node_snapshots(snaps: &[crate::stats::NodeStatsSnapshot]) -> Vec<serde_json::Value> {
+    snaps
+        .iter()
+        .map(|s| {
+            let avg_rtt_us = if s.rtt_count() > 0 {
+                s.rtt_sum_us / s.rtt_count()
+            } else {
+                0
+            };
+            serde_json::json!({
+                "name": s.name.as_str(),
+                "queries_ok": s.queries_ok,
+                "queries_err": s.queries_err,
+                "queries_timeout": s.queries_timeout,
+                "queries_cancelled": s.queries_cancelled,
+                "active_inflight": s.active_inflight,
+                "avg_rtt_us": avg_rtt_us,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_params_are_percent_decoded() {
+        assert_eq!(
+            parse_query_param("q=hello%20world", "q").as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(
+            parse_query_param("q=%E4%BE%8B%E5%AD%90", "q").as_deref(),
+            Some("例子")
+        );
+    }
+
+    #[test]
+    fn invalid_percent_encoding_is_rejected() {
+        assert!(parse_query_param("q=%zz", "q").is_none());
+    }
+
+    #[test]
+    fn safe_filename_rejects_path_traversal() {
+        assert!(!safe_history_filename("../etc/passwd"));
+        assert!(!safe_history_filename("querylog-1234.msgpack")); // not .gz
+        assert!(!safe_history_filename("other-1234.msgpack.gz")); // wrong prefix
+        assert!(!safe_history_filename("querylog-1234/x.msgpack.gz")); // slash
+        assert!(safe_history_filename("querylog-00001749000000000000.msgpack.gz"));
+    }
+}
