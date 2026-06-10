@@ -54,7 +54,6 @@ pub struct QueryLogEvent {
     #[serde(serialize_with = "ser_ip")]
     pub client: IpAddr,
     pub client_port: u16,
-    pub protocol: &'static str, // "udp" | "tcp"
     pub qname: Arc<str>,
     pub qtype: u16,
     pub rcode: u8,
@@ -75,7 +74,6 @@ pub struct DecodedEvent {
     pub unix_micros: u64,
     pub client: String,
     pub client_port: u16,
-    pub protocol: String,
     pub qname: String,
     pub qtype: u16,
     pub rcode: u8,
@@ -383,7 +381,6 @@ mod tests {
             unix_micros: 0,
             client: "127.0.0.1".parse().unwrap(),
             client_port: 53,
-            protocol: "udp",
             qname: Arc::from("example.com"),
             qtype: 1,
             rcode: 0,

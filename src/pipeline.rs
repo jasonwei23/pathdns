@@ -104,14 +104,6 @@ fn group_id_to_name(group_id: u16, state: &AppState) -> Option<Arc<str>> {
 }
 
 #[inline]
-fn proto_name(proto: ClientProto) -> &'static str {
-    match proto {
-        ClientProto::Udp => "udp",
-        ClientProto::Tcp => "tcp",
-    }
-}
-
-#[inline]
 fn record_query_received(ql: &crate::querylog::QueryLogHandle, proto: ClientProto) {
     ql.counters.queries_total.fetch_add(1, Ordering::Relaxed);
     match proto {
@@ -183,7 +175,6 @@ pub(crate) fn try_fast_path(
                 unix_micros: crate::querylog::unix_micros_now(),
                 client: peer.ip(),
                 client_port: peer.port(),
-                protocol: proto_name(proto),
                 qname: hit.qname.clone(),
                 qtype: fast_info.qtype,
                 rcode: dns::rcode(&hit.packet),
@@ -263,7 +254,6 @@ pub(crate) fn try_fast_path_into(
                 unix_micros: crate::querylog::unix_micros_now(),
                 client: peer.ip(),
                 client_port: peer.port(),
-                protocol: "udp",
                 qname: meta.qname.clone(),
                 qtype: fast_info.qtype,
                 rcode: dns::rcode(send_buf),
@@ -840,7 +830,7 @@ fn emit_slow_event(
     error: Option<Arc<str>>,
     elapsed_us: u64,
 ) {
-    let Some((peer, proto)) = ctx.client() else {
+    let Some((peer, _proto)) = ctx.client() else {
         return;
     };
     let ql = &state.querylog;
@@ -852,7 +842,6 @@ fn emit_slow_event(
         unix_micros: crate::querylog::unix_micros_now(),
         client: peer.ip(),
         client_port: peer.port(),
-        protocol: proto_name(proto),
         qname: ctx.info.qname.clone(),
         qtype: ctx.info.qtype,
         rcode: dns::rcode(resp),

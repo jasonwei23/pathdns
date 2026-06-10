@@ -414,7 +414,6 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
                 "time": micros_to_rfc3339(ev.unix_micros),
                 "client": ev.client.to_string(),
                 "client_port": ev.client_port,
-                "protocol": ev.protocol,
                 "qname": ev.qname.as_ref(),
                 "qtype": ev.qtype,
                 "qtype_name": super::qtype_name(ev.qtype),
