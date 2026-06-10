@@ -135,7 +135,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
-| `timeout-ms` | int (ms) | `5000` | Upstream query timeout. |
+| `timeout-ms` | int (ms) | `3000` | Upstream query timeout. |
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
 | `upstream-udp-sockets` | int | CPU count | UDP socket pool size per upstream node. |
 | `hedge-delay-ms` | int (ms) | `0` (disabled) | Fire a second upstream after N ms with no reply. |
@@ -331,7 +331,6 @@ Each event is a JSON object:
   "time": "2026-06-10T08:21:33.123456Z",
   "client": "192.168.1.50",
   "client_port": 51234,
-  "protocol": "udp",
   "qname": "example.com",
   "qtype": 1,
   "qtype_name": "A",
@@ -529,15 +528,17 @@ Tags from multiple files are merged:
 
 ## Query Log & Dashboard
 
-Enable by adding a `querylog` section with a `bind` address (see [Query Log config](#query-log)). Browse to `http://<bind>/` for the built-in dashboard, or query the JSON API directly.
+Enable by adding a `querylog` section with a `bind` address (see [Query Log config](#query-log)). Browse to `http://<bind>/` for the built-in web dashboard, or query the JSON API directly.
 
 When a token is configured, the dashboard HTML remains publicly loadable so its sign-in form can be displayed. All `/api/*` requests require `Authorization: Bearer <token>`.
 
 | Method & path | Description |
 |---------------|-------------|
-| `GET /` | Single-page dashboard (overview cards, QPS chart, query log, upstream table). |
+| `GET /` | Single-page web dashboard: lifetime stat cards, a time-range selector (1 m / 5 m / 15 m / 1 h / 6 h / 24 h) showing windowed counters, a QPS chart, a routing groups table, a query log, and an upstream table. |
 | `GET /api/stats` | Snapshot of counters: total queries, cache-hit rate, current QPS, average RTT, upstream ok/err, inflight drops, ring length. |
 | `GET /api/stats/history?n=<N>` | Last `N` seconds of per-second QPS samples (max 3600). |
+| `GET /api/stats/aggregate?seconds=<N>` | Aggregated counters over the last N seconds (1–86400). Returns total queries, cache hits/rate, upstream ok/err, null responses, stale served, filtered. Used by the dashboard time-range selector. |
+| `GET /api/groups` | Routing groups in match order with their GeoSite tags (include/exclude), per-tag rule count, `filter-qtype`, and whether they have an upstream or are null groups. |
 | `GET /api/querylog?limit=<L>&before_seq=<S>&q=<filter>` | Recent events from the in-memory ring, newest first. `before_seq` paginates older entries; `q` filters by qname substring. |
 | `DELETE /api/querylog` | Clear the in-memory event ring. |
 | `GET /api/querylog/files` | JSON array of available compressed historical segments with their names and sizes (`[{"name":"querylog-…msgpack.gz","size_bytes":…}]`). Returns `[]` when file logging is disabled. |
