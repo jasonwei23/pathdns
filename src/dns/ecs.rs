@@ -96,6 +96,7 @@ fn strip_ecs_from_opt(packet: &[u8], rdata_start: usize, rdata_end: usize) -> Op
 /// - If an OPT RR is present: replaces any existing ECS option with the new one.
 /// - If no OPT RR is present: appends a minimal OPT RR containing only the ECS option
 ///   and increments ARCOUNT.
+///
 /// Always returns a new allocation.
 pub fn inject_or_replace_ecs(packet: &[u8], subnet: &EcsSubnet) -> Option<Vec<u8>> {
     if packet.len() < 12 {
@@ -201,7 +202,7 @@ fn encode_ecs_option(subnet: &EcsSubnet) -> Vec<u8> {
     } else {
         &full_addr[..]
     };
-    let byte_count = ((prefix_len as usize + 7) / 8).min(addr_bytes.len());
+    let byte_count = (prefix_len as usize).div_ceil(8).min(addr_bytes.len());
     let addr_truncated = &addr_bytes[..byte_count];
 
     // ECS data: family(2) + source_prefix_len(1) + scope_prefix_len(1) + address bytes

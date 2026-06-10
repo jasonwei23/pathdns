@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls;
 
 // DNS-over-HTTPS (DoH) HTTP/1.1 upstream.
 //
@@ -253,8 +252,7 @@ fn doh_parse_status(headers: &str, name: &str) -> Result<u16> {
         .lines()
         .next()
         .ok_or_else(|| anyhow!("upstream {name}: empty DoH response"))?;
-    let code = line
-        .splitn(3, ' ')
+    let code = line.split(' ')
         .nth(1)
         .ok_or_else(|| anyhow!("upstream {name}: malformed DoH status line"))?;
     code.parse::<u16>()

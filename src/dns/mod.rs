@@ -90,7 +90,7 @@ pub fn questions_match(a: &[u8], b: &[u8]) -> bool {
                 Some(&v) => v,
                 None => return false,
             };
-            if ba.to_ascii_lowercase() != bb.to_ascii_lowercase() {
+            if !ba.eq_ignore_ascii_case(&bb) {
                 return false;
             }
             pos += 1;

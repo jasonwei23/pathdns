@@ -71,7 +71,7 @@ impl IpSetManager {
         } else {
             None
         };
-        let test = cfg.test.as_ref().map(|p| SetPair::parse(p)).transpose()?;
+        let test = cfg.test.as_ref().map(SetPair::parse).transpose()?;
         Ok(Self {
             test,
             add_groups,

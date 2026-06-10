@@ -24,19 +24,8 @@ use crate::domain::SuffixTable;
 use anyhow::{anyhow, Context, Result};
 use moka::sync::Cache;
 use regex::Regex;
-use rustc_hash::FxBuildHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash};
 use std::path::Path;
-
-/// Hash key for the GeoSite result cache: combines tag and domain bytes.
-fn geosite_cache_key(tag: &str, domain: &str) -> u64 {
-    let mut h = FxBuildHasher::default().build_hasher();
-    tag.as_bytes().hash(&mut h);
-    0u8.hash(&mut h); // separator
-    domain.as_bytes().hash(&mut h);
-    std::hash::Hasher::finish(&h)
-}
 
 // Per-tag matcher storage.
 
@@ -83,8 +72,10 @@ impl TagMatchers {
 /// Compiled GeoSite database. Holds matchers for a selected subset of tags only.
 pub struct GeoSiteDb {
     tags: HashMap<String, TagMatchers>,
-    /// L2 result cache: `hash(tag || domain) -> bool`. Avoids full matcher walk on repeated queries.
-    result_cache: Cache<u64, bool>,
+    /// L2 result cache: `"tag\0domain" -> bool`. Avoids full matcher walk on repeated
+    /// queries. Keyed by the full strings (not a hash) so distinct (tag, domain) pairs
+    /// can never alias to the same entry.
+    result_cache: Cache<String, bool>,
 }
 
 impl GeoSiteDb {
@@ -141,8 +132,11 @@ impl GeoSiteDb {
     /// `domain` must already be normalized (lowercase, no trailing dot).
     /// `tag` must be lowercase.
     pub fn matches(&self, tag: &str, domain: &str) -> bool {
-        let cache_key = geosite_cache_key(tag, domain);
-        if let Some(cached) = self.result_cache.get(&cache_key) {
+        let mut cache_key = String::with_capacity(tag.len() + 1 + domain.len());
+        cache_key.push_str(tag);
+        cache_key.push('\0');
+        cache_key.push_str(domain);
+        if let Some(cached) = self.result_cache.get(cache_key.as_str()) {
             return cached;
         }
         let result = self.tags.get(tag).is_some_and(|m| m.matches(domain));

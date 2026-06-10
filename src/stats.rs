@@ -62,10 +62,8 @@ static ROUTED_AAAA_FILTERED: AtomicU64 = AtomicU64::new(0);
 
 static QUERY_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUERY_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
-static QUERY_LATENCY_HIST: [AtomicU64; RTT_BUCKETS] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; RTT_BUCKETS]
-};
+static QUERY_LATENCY_HIST: [AtomicU64; RTT_BUCKETS] =
+    [const { AtomicU64::new(0) }; RTT_BUCKETS];
 
 #[inline]
 #[cfg_attr(not(unix), allow(dead_code))] // only called from listener.rs which is #[cfg(unix)]

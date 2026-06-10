@@ -33,7 +33,7 @@ impl<'a> RouteTarget<'a> {
 
     pub fn skip_cache(&self) -> bool {
         match self {
-            Self::Group(group) => group.cache_policy.as_ref().map_or(false, |p| p.skip),
+            Self::Group(group) => group.cache_policy.as_ref().is_some_and(|p| p.skip),
             Self::Race { .. } | Self::NoneIpSet { .. } => false,
         }
     }

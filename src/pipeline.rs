@@ -275,7 +275,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
     if let Some(group) =
         state
             .routing_index
-            .route(&state.groups, &*ctx.info.qname, geosite.as_deref())
+            .route(&state.groups, &ctx.info.qname, geosite.as_deref())
     {
         crate::verbose!(
             "dns event=query id={} qtype={} qname={} group={} from={}",
@@ -701,7 +701,7 @@ async fn resolve_none_group_with_ipset(
         .as_ref()
         .ok_or_else(|| anyhow!("fallback secondary group has no upstream"))?;
 
-    if let Some(is_primary_domain) = state.verdict_cache.get(&*info.qname) {
+    if let Some(is_primary_domain) = state.verdict_cache.get(&info.qname) {
         crate::verbose!(
             "dns event=verdict_cache qname={} verdict={}",
             info.qname,
@@ -742,11 +742,11 @@ async fn resolve_none_group_with_ipset(
             let noip_as_primary = state.cfg.fallback.noip_as_primary_ip;
             match verdict {
                 TestVerdict::PrimaryIp => {
-                    state.verdict_cache.add(&*info.qname, true);
+                    state.verdict_cache.add(&info.qname, true);
                     Ok(resp)
                 }
                 TestVerdict::SecondaryIp => {
-                    state.verdict_cache.add(&*info.qname, false);
+                    state.verdict_cache.add(&info.qname, false);
                     secondary_resp.or(Ok(resp))
                 }
                 TestVerdict::NoIpFound if noip_as_primary => Ok(resp),
@@ -831,7 +831,7 @@ async fn do_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) {
         refresh.qname,
         refresh.qtype
     );
-    let Some(target) = router::choose_refresh_target(state, &*refresh.qname, refresh.qtype) else {
+    let Some(target) = router::choose_refresh_target(state, &refresh.qname, refresh.qtype) else {
         state.refresh_gate.end(&refresh.key);
         return;
     };

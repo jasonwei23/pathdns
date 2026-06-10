@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::oneshot;
-use tokio_rustls;
 
 type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
 type BoxedRead = Box<dyn AsyncRead + Send + Unpin>;
+/// Pending response channels: upstream_id → (client_id, sender, question bytes).
+type PendingMap = Arc<DashMap<u16, (u16, oneshot::Sender<Bytes>, Bytes), FxBuildHasher>>;
 
 pub(super) enum MuxConnector {
     Tcp,
@@ -35,8 +36,7 @@ pub(super) struct TcpMux {
     connector: MuxConnector,
     /// Write half of the active connection; `None` when not connected.
     write_half: Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
-    /// Pending response channels: upstream_id → (client_id, sender, question_bytes).
-    pending: Arc<DashMap<u16, (u16, oneshot::Sender<Bytes>, Bytes), FxBuildHasher>>,
+    pending: PendingMap,
     /// Incremented on every reconnect; reader tasks exit when their birth-generation diverges.
     generation: Arc<AtomicU64>,
     /// Counter for assigning upstream query IDs; mixed through `mix16` before use.
@@ -75,7 +75,7 @@ impl TcpMux {
             write_half: Arc::new(tokio::sync::Mutex::new(None)),
             reconnect_not_before_ms: AtomicU64::new(0),
             reconnect_fail_count: AtomicU32::new(0),
-            pending: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
+            pending: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             generation: Arc::new(AtomicU64::new(0)),
             next_id: AtomicU32::new(random_id_seed()),
             max_inflight,
@@ -277,7 +277,7 @@ impl Drop for TcpPendingGuard<'_> {
 /// Exits when the generation changes (superseded by a new connection) or on read error.
 async fn mux_reader_loop(
     mut reader: BoxedRead,
-    pending: Arc<DashMap<u16, (u16, oneshot::Sender<Bytes>, Bytes), FxBuildHasher>>,
+    pending: PendingMap,
     global_gen: Arc<AtomicU64>,
     my_gen: u64,
     write_conn: Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
@@ -314,10 +314,7 @@ async fn mux_reader_loop(
         }
 
         buf.clear();
-        if buf.capacity() < resp_len {
-            buf.reserve(resp_len - buf.capacity());
-        }
-        unsafe { buf.set_len(resp_len) };
+        buf.resize(resp_len, 0);
         if let Err(e) = reader.read_exact(&mut buf).await {
             if global_gen.load(Ordering::Relaxed) == my_gen {
                 crate::verbose!(

@@ -610,7 +610,7 @@ impl Drop for ActiveInflightGuard<'_> {
 impl UpstreamNode {
     fn enabled_for(&self, client_proto: ClientProto) -> bool {
         self.client_filter
-            .map_or(true, |proto| proto == client_proto)
+            .is_none_or(|proto| proto == client_proto)
     }
 
     /// Selection score: EWMA RTT × (1 + active_inflight).

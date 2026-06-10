@@ -81,8 +81,7 @@ fn qname_only_hash(question: &[u8]) -> CacheKey {
     let mut h = FNV_OFFSET;
     let mut pos = 0;
 
-    loop {
-        let Some(&len) = question.get(pos) else { break };
+    while let Some(&len) = question.get(pos) {
         h ^= len as u64;
         h = h.wrapping_mul(FNV_PRIME);
         pos += 1;
@@ -119,7 +118,7 @@ fn qname_eq_nocase(a: &[u8], b: &[u8]) -> bool {
             return false;
         }
         for i in 0..len_a as usize {
-            if a[pos + i].to_ascii_lowercase() != b[pos + i].to_ascii_lowercase() {
+            if !a[pos + i].eq_ignore_ascii_case(&b[pos + i]) {
                 return false;
             }
         }
@@ -153,7 +152,7 @@ fn question_eq_nocase(a: &[u8], b: &[u8]) -> bool {
             return false;
         }
         for i in pos..end {
-            if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            if !a[i].eq_ignore_ascii_case(&b[i]) {
                 return false;
             }
         }
