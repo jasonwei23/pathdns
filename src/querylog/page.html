@@ -42,16 +42,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 
 /* Stat grid */
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;transition:border-color .15s}
+.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;transition:border-color .15s}
 .stat-box:hover{border-color:var(--accent)}
+.stat-box-body{padding:16px 18px 10px}
 .stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
 .stat-value{font-size:28px;font-weight:700;line-height:1;color:var(--text)}
 .stat-sub{font-size:11px;color:var(--text2);margin-top:5px}
+.spark{display:block;width:100%;height:44px}
 
 /* Cards */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:16px}
 .card-title{font-size:13px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px}
-#qps-chart{width:100%;height:140px;display:block;cursor:crosshair}
 
 /* Tables */
 .toolbar{display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
@@ -143,8 +144,8 @@ tr:last-child td{border-bottom:none}
 .fi-name{font-size:11px;color:var(--text2);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fi-size{font-size:12px;color:var(--text2);white-space:nowrap;flex-shrink:0}
 
-/* Chart tooltip */
-#chart-tooltip{position:absolute;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;color:var(--text);pointer-events:none;display:none;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+/* Sparkline tooltip */
+#spark-tooltip{position:fixed;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;color:var(--text);pointer-events:none;display:none;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.4)}
 
 /* Upstream health dot */
 .health-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0;vertical-align:middle;margin-right:6px}
@@ -174,7 +175,7 @@ tr:last-child td{border-bottom:none}
 </style>
 </head>
 <body>
-<div id="chart-tooltip"></div>
+<div id="spark-tooltip"></div>
 
 <div id="auth-overlay" style="display:none">
   <div id="auth-box">
@@ -208,50 +209,80 @@ tr:last-child td{border-bottom:none}
     <div class="section-label">Since startup</div>
     <div class="stat-grid">
       <div class="stat-box">
-        <div class="stat-label">Total Queries</div>
-        <div class="stat-value" id="stat-total">—</div>
-        <div class="stat-sub" id="stat-qps-hint">— qps</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Total Queries</div>
+          <div class="stat-value" id="stat-total">—</div>
+          <div class="stat-sub" id="stat-qps-hint">— qps</div>
+        </div>
+        <canvas class="spark" id="spark-total" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Cache Hit Rate</div>
-        <div class="stat-value" id="stat-cache-rate">—</div>
-        <div class="stat-sub" id="stat-cache-hits">— hits</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Cache Hit Rate</div>
+          <div class="stat-value" id="stat-cache-rate">—</div>
+          <div class="stat-sub" id="stat-cache-hits">— hits</div>
+        </div>
+        <canvas class="spark" id="spark-cache-rate" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Cache Entries</div>
-        <div class="stat-value" id="stat-cache-entries">—</div>
-        <div class="stat-sub" id="stat-cache-cap">— capacity</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Cache Entries</div>
+          <div class="stat-value" id="stat-cache-entries">—</div>
+          <div class="stat-sub" id="stat-cache-cap">— capacity</div>
+        </div>
+        <canvas class="spark" id="spark-cache-entries" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Avg Resolution</div>
-        <div class="stat-value" id="stat-rtt">—</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Avg Resolution</div>
+          <div class="stat-value" id="stat-rtt">—</div>
+        </div>
+        <canvas class="spark" id="spark-rtt" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Upstream OK / Err</div>
-        <div class="stat-value" id="stat-upstream">—</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Upstream OK / Err</div>
+          <div class="stat-value" id="stat-upstream">—</div>
+        </div>
+        <canvas class="spark" id="spark-upstream" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Singleflight Hits</div>
-        <div class="stat-value" id="stat-sf">—</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Singleflight Hits</div>
+          <div class="stat-value" id="stat-sf">—</div>
+        </div>
+        <canvas class="spark" id="spark-sf" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Stale Served</div>
-        <div class="stat-value" id="stat-stale">—</div>
-        <div class="stat-sub" id="stat-refresh">— refreshes</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Stale Served</div>
+          <div class="stat-value" id="stat-stale">—</div>
+          <div class="stat-sub" id="stat-refresh">— refreshes</div>
+        </div>
+        <canvas class="spark" id="spark-stale" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Cache Refreshes</div>
-        <div class="stat-value" id="stat-cache-refresh">—</div>
-        <div class="stat-sub" id="stat-cache-refresh-fail"></div>
+        <div class="stat-box-body">
+          <div class="stat-label">Cache Refreshes</div>
+          <div class="stat-value" id="stat-cache-refresh">—</div>
+          <div class="stat-sub" id="stat-cache-refresh-fail"></div>
+        </div>
+        <canvas class="spark" id="spark-cache-refresh" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Inflight Drops</div>
-        <div class="stat-value" id="stat-drops">—</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Inflight Drops</div>
+          <div class="stat-value" id="stat-drops">—</div>
+        </div>
+        <canvas class="spark" id="spark-drops" height="44"></canvas>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Query Log Drops</div>
-        <div class="stat-value" id="stat-log-drops">—</div>
-        <div class="stat-sub" id="stat-log-queue">— queued</div>
+        <div class="stat-box-body">
+          <div class="stat-label">Query Log Drops</div>
+          <div class="stat-value" id="stat-log-drops">—</div>
+          <div class="stat-sub" id="stat-log-queue">— queued</div>
+        </div>
+        <canvas class="spark" id="spark-log-drops" height="44"></canvas>
       </div>
     </div>
 
@@ -290,11 +321,6 @@ tr:last-child td{border-bottom:none}
         <div class="stat-label">Null / Filtered</div>
         <div class="stat-value" id="agg-null-filtered">—</div>
       </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title" id="chart-title">QPS History — last 1h</div>
-      <canvas id="qps-chart"></canvas>
     </div>
 
     <div class="card">
@@ -462,7 +488,6 @@ function setRange(secs) {
   const label = RANGE_LABELS[secs] || (secs + 's');
   document.getElementById('agg-section-label').textContent = 'Last ' + label;
   loadAggregateStats();
-  loadChart(Math.min(secs, 3600)); // history API capped at 3600 samples
 }
 
 async function loadAggregateStats() {
@@ -562,111 +587,89 @@ async function loadDashboard() {
   const failEl = document.getElementById('stat-cache-refresh-fail');
   failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
   document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
+  // Sparkline sampling
+  const d = field => prevStats ? Math.max(0, (s[field]||0) - (prevStats[field]||0)) : 0;
+  pushSpark('total',        s.qps_now || 0);
+  pushSpark('cacheRate',    s.cache_hit_rate_pct || 0);
+  pushSpark('cacheEntries', entries);
+  pushSpark('rtt',          s.avg_resolution_us || 0);
+  pushSpark('upstream',     d('upstream_err'));
+  pushSpark('sf',           d('singleflight_hits'));
+  pushSpark('stale',        d('stale_served'));
+  pushSpark('cacheRefresh', d('cache_refresh_started'));
+  pushSpark('drops',        d('inflight_drops'));
+  pushSpark('logDrops',     d('events_dropped_full') + d('events_dropped_closed'));
+  prevStats = s;
+  drawAllSparklines();
   loadAggregateStats();
-  loadChart(Math.min(statsRangeSeconds, 3600));
   loadDashUpstreams();
   loadGroups();
 }
 
-// ── Chart ─────────────────────────────────────────────────────────────────────
+// ── Sparklines ────────────────────────────────────────────────────────────────
 
-let chartData = [];
-let chartPad = {t:8, r:12, b:28, l:38};
-let chartCanvas = null;
+const SPARK_LEN = 40;
+const sparkHistory = {};
+let prevStats = null;
 
-async function loadChart(n) {
-  const r = await tryFetch('/api/stats/history?n=' + n);
-  if (!r) return;
-  chartData = await r.json();
-  const label = RANGE_LABELS[statsRangeSeconds] || (statsRangeSeconds + 's');
-  const capNote = statsRangeSeconds > 3600 ? ' (1h max)' : '';
-  document.getElementById('chart-title').textContent = 'QPS History — last ' + label + capNote;
-  drawChart();
+function pushSpark(key, val) {
+  if (!sparkHistory[key]) sparkHistory[key] = [];
+  sparkHistory[key].push(isFinite(val) ? val : 0);
+  if (sparkHistory[key].length > SPARK_LEN) sparkHistory[key].shift();
 }
 
-function drawChart() {
-  const canvas = document.getElementById('qps-chart');
-  chartCanvas = canvas;
-  const data = chartData;
-  const W = canvas.offsetWidth || 600, H = 140;
-  canvas.width = W; canvas.height = H;
+function drawSparkline(id, data, color) {
+  const canvas = document.getElementById(id);
+  if (!canvas || !data || data.length < 2) return;
+  const W = canvas.clientWidth || canvas.offsetWidth;
+  if (W <= 0) return;
+  canvas.width = W;
+  const H = canvas.height;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, W, H);
-  if (!data || !data.length) return;
-
-  const pad = chartPad;
-  const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
+  const n = data.length;
   const max = Math.max(...data, 1);
-  const n = data.length;
-
-  ctx.strokeStyle = '#2a2a35'; ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = pad.t + ch * (1 - i/4);
-    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
-    ctx.fillStyle = '#555'; ctx.font = '10px system-ui'; ctx.textAlign = 'right';
-    ctx.fillText(Math.round(max * i/4), pad.l - 5, y + 4);
-  }
-
-  const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ch);
-  grad.addColorStop(0, 'rgba(99,102,241,.35)');
-  grad.addColorStop(1, 'rgba(99,102,241,.0)');
-
+  const xp = i => W * i / (n - 1);
+  const yp = v => H - (v / max) * (H - 4) - 2;
+  const r = parseInt(color.slice(1,3),16), g = parseInt(color.slice(3,5),16), b = parseInt(color.slice(5,7),16);
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, `rgba(${r},${g},${b},0.22)`);
+  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  // Filled area
   ctx.beginPath();
-  data.forEach((v, i) => {
-    const x = pad.l + cw * i / (n-1||1);
-    const y = pad.t + ch * (1 - v/max);
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.lineTo(pad.l + cw*(n-1)/(n-1||1), pad.t+ch);
-  ctx.lineTo(pad.l, pad.t+ch);
-  ctx.closePath();
+  ctx.moveTo(xp(0), yp(data[0]));
+  for (let i = 1; i < n; i++) {
+    const mx = (xp(i-1) + xp(i)) / 2;
+    ctx.bezierCurveTo(mx, yp(data[i-1]), mx, yp(data[i]), xp(i), yp(data[i]));
+  }
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
-
+  // Stroke line
   ctx.beginPath();
-  data.forEach((v, i) => {
-    const x = pad.l + cw * i / (n-1||1);
-    const y = pad.t + ch * (1 - v/max);
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 2; ctx.stroke();
-
-  ctx.fillStyle = '#555'; ctx.font = '10px system-ui'; ctx.textAlign = 'center';
-  const now = new Date();
-  const step = Math.max(1, Math.floor(n/6));
-  for (let i = 0; i < n; i += step) {
-    const secsAgo = n - 1 - i;
-    const t = new Date(now - secsAgo * 1000);
-    const label = t.getHours().toString().padStart(2,'0') + ':' + t.getMinutes().toString().padStart(2,'0');
-    ctx.fillText(label, pad.l + cw * i / (n-1||1), H - 6);
+  ctx.moveTo(xp(0), yp(data[0]));
+  for (let i = 1; i < n; i++) {
+    const mx = (xp(i-1) + xp(i)) / 2;
+    ctx.bezierCurveTo(mx, yp(data[i-1]), mx, yp(data[i]), xp(i), yp(data[i]));
   }
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = 'round'; ctx.stroke();
 }
 
-// Chart tooltip on hover
-document.getElementById('qps-chart').addEventListener('mousemove', function(e) {
-  const data = chartData;
-  if (!data || !data.length) return;
-  const canvas = this;
-  const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const pad = chartPad;
-  const cw = (canvas.offsetWidth || 600) - pad.l - pad.r;
-  const n = data.length;
-  const idx = Math.round((mx - pad.l) / cw * (n - 1));
-  if (idx < 0 || idx >= n) { hideTooltip(); return; }
-  const qps = data[idx];
-  const secsAgo = n - 1 - idx;
-  const t = new Date(Date.now() - secsAgo * 1000);
-  const timeStr = t.getHours().toString().padStart(2,'0') + ':' + t.getMinutes().toString().padStart(2,'0') + ':' + t.getSeconds().toString().padStart(2,'0');
-  const tip = document.getElementById('chart-tooltip');
-  tip.textContent = timeStr + '  —  ' + qps + ' qps';
-  tip.style.display = 'block';
-  tip.style.left = (e.clientX + 12) + 'px';
-  tip.style.top = (e.clientY - 8) + 'px';
-});
-document.getElementById('qps-chart').addEventListener('mouseleave', hideTooltip);
-function hideTooltip() {
-  document.getElementById('chart-tooltip').style.display = 'none';
+function drawAllSparklines() {
+  drawSparkline('spark-total',         sparkHistory.total,        '#6366f1');
+  drawSparkline('spark-cache-rate',    sparkHistory.cacheRate,    '#22c55e');
+  drawSparkline('spark-cache-entries', sparkHistory.cacheEntries, '#38bdf8');
+  drawSparkline('spark-rtt',           sparkHistory.rtt,          '#f59e0b');
+  drawSparkline('spark-upstream',      sparkHistory.upstream,     '#ef4444');
+  drawSparkline('spark-sf',            sparkHistory.sf,           '#6366f1');
+  drawSparkline('spark-stale',         sparkHistory.stale,        '#f59e0b');
+  drawSparkline('spark-cache-refresh', sparkHistory.cacheRefresh, '#6366f1');
+  drawSparkline('spark-drops',         sparkHistory.drops,        '#ef4444');
+  drawSparkline('spark-log-drops',     sparkHistory.logDrops,     '#ef4444');
 }
+
+window.addEventListener('resize', () => {
+  if (currentView === 'dashboard') drawAllSparklines();
+});
 
 async function loadDashUpstreams() {
   const r = await tryFetch('/api/upstreams');
