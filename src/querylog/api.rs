@@ -395,14 +395,14 @@ async fn dispatch(
 // ── Security helpers ──────────────────────────────────────────────────────────
 
 /// Accept only safe, unambiguous historical segment file names.
-/// Must start with "querylog-" and end with ".msgpack.gz"; no path separators.
+/// Must start with "querylog-" and end with ".msgpack" or ".msgpack.gz"; no path separators.
 fn safe_history_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains("..")
         && name.starts_with("querylog-")
-        && name.ends_with(".msgpack.gz")
+        && (name.ends_with(".msgpack.gz") || name.ends_with(".msgpack"))
 }
 
 // ── JSON renderers ────────────────────────────────────────────────────────────
@@ -642,9 +642,9 @@ mod tests {
     #[test]
     fn safe_filename_rejects_path_traversal() {
         assert!(!safe_history_filename("../etc/passwd"));
-        assert!(!safe_history_filename("querylog-1234.msgpack")); // not .gz
         assert!(!safe_history_filename("other-1234.msgpack.gz")); // wrong prefix
         assert!(!safe_history_filename("querylog-1234/x.msgpack.gz")); // slash
         assert!(safe_history_filename("querylog-00001749000000000000.msgpack.gz"));
+        assert!(safe_history_filename("querylog-00001749000000000000.msgpack"));
     }
 }
