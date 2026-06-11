@@ -182,7 +182,11 @@ pub(crate) fn try_fast_path(
                 response_bytes: hit.packet.len() as u32,
                 source: if hit.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(hit.group_id, state),
-                answer_ips: smallvec::SmallVec::new(),
+                answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
+                    dns::answer_ips(&hit.packet, fast_info.question_end)
+                } else {
+                    smallvec::SmallVec::new()
+                },
             });
         }
         return FastPathOutcome::Response {
@@ -260,7 +264,11 @@ pub(crate) fn try_fast_path_into(
                 response_bytes: send_buf.len() as u32,
                 source: if meta.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(meta.group_id, state),
-                answer_ips: smallvec::SmallVec::new(),
+                answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
+                    dns::answer_ips(send_buf, fast_info.question_end)
+                } else {
+                    smallvec::SmallVec::new()
+                },
             });
         }
         let resp = send_buf.split().freeze();
