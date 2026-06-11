@@ -100,13 +100,6 @@ impl VerdictCache {
         self.inner.is_some()
     }
 
-    pub fn len(&self) -> usize {
-        let Some(cache) = self.inner.as_ref() else {
-            return 0;
-        };
-        cache.run_pending_tasks();
-        cache.entry_count() as usize
-    }
 
     /// `true` when an entry inserted at `inserted_unix` is past its deadline.
     /// Only relevant for reloaded entries: in-process entries are expired by the

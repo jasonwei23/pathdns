@@ -223,10 +223,6 @@ impl DnsCache {
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.cache.is_some()
-    }
-
     pub fn entry_count(&self) -> u64 {
         self.cache.as_ref().map(|c| c.entry_count()).unwrap_or(0)
     }
@@ -241,12 +237,14 @@ impl DnsCache {
     /// Look up a fresh or (when stale_secs > 0) proactively-served stale entry.
     /// Returns `CacheLookup.is_stale = true` when the entry's TTL had expired but it
     /// was still within the stale window; the caller should spawn a background refresh.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, query: &[u8], question_end: usize, client_id: u16) -> Option<CacheLookup> {
         self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, false)
     }
 
     /// Look up and write the response packet into a caller-provided buffer.
     /// Returns metadata without allocating a new `Bytes` for the packet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_into(
         &self,
         query: &[u8],
@@ -376,14 +374,6 @@ impl DnsCache {
         cache.insert(ins.key, entry);
     }
 
-    /// Number of entries currently in the cache (approximate; runs pending evictions first).
-    pub fn len(&self) -> usize {
-        let Some(cache) = &self.cache else {
-            return 0;
-        };
-        cache.run_pending_tasks();
-        cache.entry_count() as usize
-    }
 
     /// Discard all cached entries. Called when the routing policy changes (GeoSite reload)
     /// so that stale responses produced under the old group decisions are not returned.

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-pub use ring::{EventRing, PerSecondSnapshot, QpsRing, StatsRing};
+pub use ring::{EventRing, QpsRing, StatsRing};
 
 // ── Serialization helpers ─────────────────────────────────────────────────────
 
@@ -173,6 +173,7 @@ pub struct QueryLogHandle {
 impl QueryLogHandle {
     /// Returns a handle where event emission is disabled (no channel).
     /// Counters are still active.
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             counters: Arc::new(QueryLogCounters::new()),
@@ -186,12 +187,6 @@ impl QueryLogHandle {
     #[inline]
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Send an event to the log worker without blocking the DNS path.
-    #[inline]
-    pub fn try_emit(&self, event: QueryLogEvent) {
-        self.try_emit_with(|_| event);
     }
 
     /// Reserve channel capacity before constructing an event.
@@ -279,7 +274,6 @@ pub struct WorkerState {
     pub counters: Arc<QueryLogCounters>,
     pub file_cfg: Option<QueryLogFileConfig>,
     pub shutdown: tokio::sync::watch::Receiver<bool>,
-    pub stats_ring: Arc<StatsRing>,
 }
 
 /// Build a `QueryLogHandle` + optional worker state from config.
@@ -326,7 +320,6 @@ pub fn build(
         counters,
         file_cfg: cfg.file,
         shutdown: shutdown_rx,
-        stats_ring: stats_ring.clone(),
     };
     (handle, Some(worker), qps_ring, stats_ring, shutdown_tx)
 }

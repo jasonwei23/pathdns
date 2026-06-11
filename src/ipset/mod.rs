@@ -79,18 +79,6 @@ impl IpSetManager {
         })
     }
 
-    pub fn summary(&self) -> String {
-        let mut parts = if let Some(t) = &self.test {
-            vec![format!("test={}", t.summary())]
-        } else {
-            vec![]
-        };
-        for (name, pair) in &self.add_groups {
-            parts.push(format!("group:{name}={}", pair.summary()));
-        }
-        parts.join(" ")
-    }
-
     pub fn test_response(&self, ips: &[IpAddr]) -> TestVerdict {
         if self.test.is_none() {
             return TestVerdict::OtherCase;

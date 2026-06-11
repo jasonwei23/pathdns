@@ -187,8 +187,6 @@ pub struct UpstreamPool {
     next: AtomicUsize,
     /// When `Some(δ)`, a second upstream is started after δ with no response.
     hedge_delay: Option<Duration>,
-    /// Human-readable string of upstream addresses (e.g. "119.29.29.29" or "tls://1.1.1.1, tcp://8.8.8.8").
-    pub addr_display: Arc<str>,
     /// Optional querylog counters — used to increment hedged_queries when Phase 2 fires.
     querylog_counters: Option<Arc<crate::querylog::QueryLogCounters>>,
 }
@@ -426,21 +424,10 @@ impl UpstreamPool {
             }
             crate::startup!("{msg}");
         }
-        // Build a human-readable display string for the upstream addresses.
-        let addr_display: Arc<str> = Arc::from(
-            addrs
-                .iter()
-                .map(format_upstream_addr)
-                .collect::<Vec<_>>()
-                .join(", ")
-                .as_str(),
-        );
-
         Ok(Self {
             nodes,
             next: AtomicUsize::new(0),
             hedge_delay: cfg.hedge_delay,
-            addr_display,
             querylog_counters,
         })
     }
@@ -533,16 +520,6 @@ impl UpstreamPool {
                     .min_by_key(|(_, n)| n.selection_score())
             })
             .map(|(i, _)| i)
-    }
-
-    pub async fn exchange(
-        &self,
-        packet: Bytes,
-        client_id: u16,
-        client_proto: ClientProto,
-    ) -> Result<Bytes> {
-        self.exchange_observed(packet, client_id, client_proto, true)
-            .await
     }
 
     pub async fn exchange_observed(

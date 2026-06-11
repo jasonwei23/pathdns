@@ -5,7 +5,6 @@
 
 use crate::server::{AppState, CustomGroup, ResolvedFallback};
 use crate::upstream::UpstreamPool;
-use std::sync::Arc;
 
 /// The upstream target selected for a query.
 #[derive(Clone, Copy)]

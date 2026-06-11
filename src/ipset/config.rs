@@ -43,19 +43,6 @@ impl SetPair {
         }
     }
 
-    pub(super) fn summary(&self) -> String {
-        format!(
-            "{},{}",
-            self.v4
-                .as_ref()
-                .map(SetName::display_name)
-                .unwrap_or_else(|| "-".to_string()),
-            self.v6
-                .as_ref()
-                .map(SetName::display_name)
-                .unwrap_or_else(|| "-".to_string())
-        )
-    }
 }
 
 impl SetName {
@@ -78,27 +65,6 @@ impl SetName {
         }
     }
 
-    pub(super) fn display_name(&self) -> String {
-        match self {
-            Self::IpSet(name) => name.clone(),
-            Self::NftSet { family, table, set } => {
-                format!("{}@{}@{}", family.name(), table, set)
-            }
-        }
-    }
-}
-
-impl NftFamily {
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::Inet => "inet",
-            Self::Ip => "ip",
-            Self::Ip6 => "ip6",
-            Self::Arp => "arp",
-            Self::Bridge => "bridge",
-            Self::Netdev => "netdev",
-        }
-    }
 }
 
 fn parse_nft_family(value: &str) -> Result<NftFamily> {
