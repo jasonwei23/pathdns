@@ -227,6 +227,17 @@ impl DnsCache {
         self.cache.is_some()
     }
 
+    pub fn entry_count(&self) -> u64 {
+        self.cache.as_ref().map(|c| c.entry_count()).unwrap_or(0)
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.cache
+            .as_ref()
+            .and_then(|c| c.policy().max_capacity())
+            .unwrap_or(0)
+    }
+
     /// Look up a fresh or (when stale_secs > 0) proactively-served stale entry.
     /// Returns `CacheLookup.is_stale = true` when the entry's TTL had expired but it
     /// was still within the stale window; the caller should spawn a background refresh.

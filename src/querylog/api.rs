@@ -206,7 +206,7 @@ async fn dispatch(
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/stats") => {
-            let body = render_stats(handle, qps_ring, ring);
+            let body = render_stats(handle, qps_ring, ring, state);
             ("200 OK", body, "application/json")
         }
 
@@ -370,7 +370,7 @@ fn safe_history_filename(name: &str) -> bool {
 
 // ── JSON renderers ────────────────────────────────────────────────────────────
 
-fn render_stats(handle: &QueryLogHandle, qps_ring: &QpsRing, ring: &EventRing) -> Vec<u8> {
+fn render_stats(handle: &QueryLogHandle, qps_ring: &QpsRing, ring: &EventRing, state: &AppState) -> Vec<u8> {
     let c = &handle.counters;
     let total = c.queries_total.load(Ordering::Relaxed);
     let cache = c.cache_hits.load(Ordering::Relaxed);
@@ -431,6 +431,8 @@ fn render_stats(handle: &QueryLogHandle, qps_ring: &QpsRing, ring: &EventRing) -
         "queue_high_watermark": queue_high_watermark,
         "ring_evictions": ring_evictions,
         "file_write_errors": file_write_errors,
+        "cache_entries": state.cache.entry_count(),
+        "cache_capacity": state.cache.capacity(),
     }))
     .unwrap_or_default()
 }
