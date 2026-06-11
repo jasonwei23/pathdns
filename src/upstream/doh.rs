@@ -57,13 +57,22 @@ impl DoHUpstream {
         let upstream_id = mix16(self.next_id.fetch_add(1, Ordering::Relaxed));
         dns::set_id(&mut pkt, upstream_id)?;
 
+        // Apply 0x20 QNAME case mixing.
+        let q_end = 12 + req.question.len();
+        let seed = upstream_id as u64
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_micros() as u64)
+                .unwrap_or(0));
+        dns::mix_qname_case(&mut pkt, q_end, seed);
+
         let response = tokio::time::timeout(
             self.timeout,
             self.client
                 .post(&self.url)
                 .header("Content-Type", "application/dns-message")
                 .header("Accept", "application/dns-message")
-                .body(pkt)
+                .body(pkt.clone())
                 .send(),
         )
         .await
@@ -94,6 +103,14 @@ impl DoHUpstream {
         let mut body = body.to_vec();
         super::validate_upstream_response(&body, upstream_id, &req.question)
             .map_err(|e| anyhow!("upstream {}: DoH {e}", self.name))?;
+        if let Some(resp_qend) = dns::question_end(&body) {
+            if !dns::verify_qname_case_echo(&pkt, q_end, &body, resp_qend) {
+                return Err(anyhow!(
+                    "upstream {}: DoH 0x20 QNAME case mismatch",
+                    self.name
+                ));
+            }
+        }
         dns::set_id(&mut body, req.client_id)?;
         Ok(Bytes::from(body))
     }

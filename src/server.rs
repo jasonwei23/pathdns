@@ -3,7 +3,7 @@
 //! Query lifecycle logic lives in `pipeline`; listener sockets live in `listener`.
 
 use crate::cache::{CacheKey, DnsCache};
-use crate::config::{Config, FallbackTarget};
+use crate::config::{Config, EcsMode, FallbackTarget};
 use crate::geosite::GeoSiteDb;
 use crate::ipset::IpSetManager;
 #[cfg(unix)]
@@ -74,6 +74,9 @@ pub struct CustomGroup {
     pub filter_qtype: std::collections::HashSet<u16>,
     pub geosite_include: Vec<String>,
     pub geosite_exclude: Vec<String>,
+    /// True when every upstream in this group strips ECS (mode is Strip or unset).
+    /// Used to share a single cache entry across all clients rather than one per subnet.
+    pub strip_ecs: bool,
 }
 
 impl CustomGroup {
@@ -112,6 +115,10 @@ impl AppState {
                     .await?,
                 )
             };
+            let strip_ecs = spec
+                .upstream
+                .iter()
+                .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
             groups.push(CustomGroup {
                 name: spec.name.clone(),
                 upstream,
@@ -119,6 +126,7 @@ impl AppState {
                 filter_qtype: spec.filter_qtype.iter().copied().collect(),
                 geosite_include: spec.geosite_include.clone(),
                 geosite_exclude: spec.geosite_exclude.clone(),
+                strip_ecs,
             });
         }
 

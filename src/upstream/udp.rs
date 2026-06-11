@@ -89,6 +89,15 @@ impl UdpUpstream {
                 .register(&self.name, req.client_id, req.question)?;
         dns::set_id(&mut packet, upstream_id)?;
 
+        // Apply 0x20 QNAME case mixing.
+        let q_end = 12 + question.len();
+        let seed_0x20 = upstream_id as u64
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_micros() as u64)
+                .unwrap_or(0));
+        dns::mix_qname_case(&mut packet, q_end, seed_0x20);
+
         let socket_idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
         let socket = &self.sockets[socket_idx];
 
@@ -98,6 +107,15 @@ impl UdpUpstream {
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(resp)) => {
+                // Verify 0x20 case echo before checking TC.
+                if let Some(resp_qend) = dns::question_end(&resp) {
+                    if !dns::verify_qname_case_echo(packet.as_ref(), q_end, &resp, resp_qend) {
+                        return Err(anyhow!(
+                            "upstream {}: 0x20 QNAME case mismatch (possible spoof)",
+                            self.name
+                        ));
+                    }
+                }
                 if dns::is_truncated(&resp) {
                     match tcp_exchange_packet(self.remote, &packet, self.timeout, &self.name).await
                     {

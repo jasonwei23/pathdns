@@ -4,7 +4,7 @@
 //! Listener code owns sockets and framing; this module owns packet lifecycle after a DNS
 //! message has been received.
 
-use crate::cache::{cache_key, CacheKey, CacheRefresh};
+use crate::cache::{cache_key, cache_key_strip_ecs, CacheKey, CacheRefresh};
 use crate::dns;
 use crate::ipset::TestVerdict;
 use crate::router::RouteTarget;
@@ -157,7 +157,7 @@ pub(crate) fn try_fast_path(
     // Fast cache read: no qname allocation needed.
     if let Some(hit) = state
         .cache
-        .get(packet, fast_info.question_end, fast_info.id)
+        .get_with_ecs_fallback(packet, fast_info.question_end, fast_info.id)
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
@@ -236,7 +236,7 @@ pub(crate) fn try_fast_path_into(
     // Cache hit: write directly into the caller-provided send buffer.
     if let Some(meta) = state
         .cache
-        .get_into(packet, fast_info.question_end, fast_info.id, send_buf)
+        .get_into_with_ecs_fallback(packet, fast_info.question_end, fast_info.id, send_buf)
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
@@ -532,6 +532,16 @@ async fn exchange_with_dedupe(
     }
     let started = Instant::now();
     let ck = cache_key(&ctx.packet, ctx.info.question_end);
+    // Normalize cache key for strip-mode targets so all ECS clients share one entry.
+    let ck = if target.strip_ecs()
+        && dns::extract_variant(&ctx.packet, ctx.info.question_end)
+            .ecs_src
+            .is_some()
+    {
+        cache_key_strip_ecs(&ctx.packet, ctx.info.question_end)
+    } else {
+        ck
+    };
     let waiter = singleflight::register(&state.remote_inflight, ck)?;
 
     if let Some(mut rx) = waiter {
@@ -701,12 +711,22 @@ async fn exchange_with_dedupe(
                     // NoneIpSet ("none" fallback): use sentinel 65534 so cache hits show group "none".
                     _ => (state.cache.resolve_policy(None), GROUP_ID_NONE_FALLBACK),
                 };
+                let stripped_query: Option<bytes::Bytes> = if target.strip_ecs()
+                    && dns::extract_variant(&ctx.packet, ctx.info.question_end)
+                        .ecs_src
+                        .is_some()
+                {
+                    dns::strip_edns_ecs(&query_for_cache).map(bytes::Bytes::from)
+                } else {
+                    None
+                };
+                let cache_query: &[u8] = stripped_query.as_deref().unwrap_or(&query_for_cache);
                 state.cache.add(
                     crate::cache::CacheInsert {
                         key: ck,
                         qname: ctx.info.qname.clone(),
                         question_end: ctx.info.question_end,
-                        query: &query_for_cache,
+                        query: cache_query,
                         packet: resp.as_ref(),
                     },
                     &cache_policy,

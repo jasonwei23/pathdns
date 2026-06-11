@@ -161,6 +161,7 @@ impl TcpMux {
         // Register in the shared inflight table: allocates an upstream query ID
         // (different from client_id to avoid cross-query aliasing) and enforces
         // the per-upstream inflight cap.
+        let q_end = 12 + req.question.len();
         let (upstream_id, rx, _guard) =
             self.pending
                 .register(&self.name, req.client_id, req.question)?;
@@ -168,6 +169,10 @@ impl TcpMux {
         // Patch ID into a mutable copy, then write framed under a timed write lock.
         let mut pkt = raw_packet.to_vec();
         dns::set_id(&mut pkt, upstream_id)?;
+
+        // Apply 0x20 QNAME case mixing.
+        let seed_0x20 = upstream_id as u64 ^ (self.generation.load(Ordering::Relaxed) << 16);
+        dns::mix_qname_case(&mut pkt, q_end, seed_0x20);
 
         let name = &self.name;
         let write_result = tokio::time::timeout(self.timeout, async {
@@ -195,7 +200,18 @@ impl TcpMux {
 
         // Await response from reader task.
         match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                // Verify 0x20 case echo.
+                if let Some(resp_qend) = dns::question_end(&resp) {
+                    if !dns::verify_qname_case_echo(&pkt, q_end, &resp, resp_qend) {
+                        return Err(anyhow!(
+                            "upstream {}: 0x20 QNAME case mismatch (possible spoof)",
+                            self.name
+                        ));
+                    }
+                }
+                Ok(resp)
+            }
             Ok(Err(_closed)) => Err(anyhow!(
                 "upstream {} tcp response channel closed",
                 self.name

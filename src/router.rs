@@ -53,6 +53,17 @@ impl<'a> RouteTarget<'a> {
             Self::Race { .. } | Self::NoneIpSet { .. } => None,
         }
     }
+
+    /// Returns true when every upstream in this target strips ECS, meaning all clients
+    /// can share a single cache entry keyed on the ECS-stripped variant.
+    pub fn strip_ecs(&self) -> bool {
+        match self {
+            Self::Group(g) => g.strip_ecs,
+            Self::Race { primary, secondary } | Self::NoneIpSet { primary, secondary } => {
+                primary.strip_ecs && secondary.strip_ecs
+            }
+        }
+    }
 }
 
 /// Determine the `RouteTarget` for a (qname, qtype) using the fallback config.

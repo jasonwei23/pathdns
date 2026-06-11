@@ -48,6 +48,17 @@ pub type CacheKey = u64;
 /// queries with different OPT padding, unknown EDNS options, or varying ARCOUNT
 /// always share the same cache entry.
 pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
+    cache_key_impl(query, question_end, false)
+}
+
+/// Like [`cache_key`] but always hashes `0` for the ECS field regardless of
+/// whether the query contains an ECS option.  Used when the upstream strips ECS
+/// so that all clients share a single cache entry keyed on the stripped variant.
+pub fn cache_key_strip_ecs(query: &[u8], question_end: usize) -> CacheKey {
+    cache_key_impl(query, question_end, true)
+}
+
+fn cache_key_impl(query: &[u8], question_end: usize, strip_ecs: bool) -> CacheKey {
     let mut h = Fnv1a::new();
     if query.len() < 12 || question_end < 16 || question_end > query.len() {
         return h.finish();
@@ -81,12 +92,17 @@ pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
     h.write_byte(v.rd as u8);
     h.write_byte(v.ad as u8);
     h.write_byte(v.cd as u8);
-    match v.ecs_src {
-        None => h.write_byte(0),
-        Some(ecs) => {
-            h.write_byte(1);
-            h.write(&ecs.addr.to_be_bytes());
-            h.write_byte(ecs.prefix_len);
+    if strip_ecs {
+        // Always hash 0 for ECS so all clients share one entry regardless of subnet.
+        h.write_byte(0);
+    } else {
+        match v.ecs_src {
+            None => h.write_byte(0),
+            Some(ecs) => {
+                h.write_byte(1);
+                h.write(&ecs.addr.to_be_bytes());
+                h.write_byte(ecs.prefix_len);
+            }
         }
     }
 
@@ -215,7 +231,7 @@ impl DnsCache {
     /// Returns `CacheLookup.is_stale = true` when the entry's TTL had expired but it
     /// was still within the stale window; the caller should spawn a background refresh.
     pub fn get(&self, query: &[u8], question_end: usize, client_id: u16) -> Option<CacheLookup> {
-        self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0)
+        self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, false)
     }
 
     /// Look up and write the response packet into a caller-provided buffer.
@@ -232,6 +248,7 @@ impl DnsCache {
             question_end,
             client_id,
             self.stale_expire_ttl > 0,
+            false,
             out,
         )
     }
@@ -243,7 +260,44 @@ impl DnsCache {
         question_end: usize,
         client_id: u16,
     ) -> Option<CacheLookup> {
-        self.lookup(query, question_end, client_id, true)
+        self.lookup(query, question_end, client_id, true, false)
+    }
+
+    /// Try regular lookup first; if that misses and the query has an ECS option,
+    /// retry with the ECS-stripped cache key and relaxed variant matching.
+    /// This lets a strip-mode group serve all clients from one shared cache entry.
+    pub fn get_with_ecs_fallback(
+        &self,
+        query: &[u8],
+        question_end: usize,
+        client_id: u16,
+    ) -> Option<CacheLookup> {
+        if let Some(hit) = self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, false) {
+            return Some(hit);
+        }
+        if dns::extract_variant(query, question_end).ecs_src.is_some() {
+            self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, true)
+        } else {
+            None
+        }
+    }
+
+    /// Like [`get_with_ecs_fallback`] but writes directly into `out`.
+    pub fn get_into_with_ecs_fallback(
+        &self,
+        query: &[u8],
+        question_end: usize,
+        client_id: u16,
+        out: &mut BytesMut,
+    ) -> Option<CacheLookupMeta> {
+        if let Some(hit) = self.lookup_into(query, question_end, client_id, self.stale_expire_ttl > 0, false, out) {
+            return Some(hit);
+        }
+        if dns::extract_variant(query, question_end).ecs_src.is_some() {
+            self.lookup_into(query, question_end, client_id, self.stale_expire_ttl > 0, true, out)
+        } else {
+            None
+        }
     }
 
     /// Merge a group's cache policy over the global defaults.
@@ -334,12 +388,22 @@ impl DnsCache {
         question_end: usize,
         client_id: u16,
         allow_stale: bool,
+        strip_ecs: bool,
     ) -> Option<CacheLookup> {
         let cache = self.cache.as_ref()?;
         let question = query.get(12..question_end)?;
-        let key = cache_key(query, question_end);
+        let key = if strip_ecs {
+            cache_key_strip_ecs(query, question_end)
+        } else {
+            cache_key(query, question_end)
+        };
         let entry = cache.get(&key)?;
-        if !queries_match(entry.query.as_ref(), query, question_end) {
+        let matched = if strip_ecs {
+            queries_match_strip_ecs(entry.query.as_ref(), query, question_end)
+        } else {
+            queries_match(entry.query.as_ref(), query, question_end)
+        };
+        if !matched {
             return None;
         }
 
@@ -382,13 +446,23 @@ impl DnsCache {
         question_end: usize,
         client_id: u16,
         allow_stale: bool,
+        strip_ecs: bool,
         out: &mut BytesMut,
     ) -> Option<CacheLookupMeta> {
         let cache = self.cache.as_ref()?;
         let question = query.get(12..question_end)?;
-        let key = cache_key(query, question_end);
+        let key = if strip_ecs {
+            cache_key_strip_ecs(query, question_end)
+        } else {
+            cache_key(query, question_end)
+        };
         let entry = cache.get(&key)?;
-        if !queries_match(entry.query.as_ref(), query, question_end) {
+        let matched = if strip_ecs {
+            queries_match_strip_ecs(entry.query.as_ref(), query, question_end)
+        } else {
+            queries_match(entry.query.as_ref(), query, question_end)
+        };
+        if !matched {
             return None;
         }
 
@@ -686,6 +760,32 @@ fn queries_match(stored: &[u8], query: &[u8], question_end: usize) -> bool {
     // Compare EDNS semantics instead of raw additional-section bytes so that
     // equivalent queries differing only in OPT padding share cache entries.
     dns::extract_variant(stored, stored_question_end) == dns::extract_variant(query, question_end)
+}
+
+/// Like [`queries_match`] but ignores the `ecs_src` field when comparing variants.
+/// Used when the stored entry was cached with ECS stripped, so we only require the
+/// non-ECS EDNS semantics to match.
+fn queries_match_strip_ecs(stored: &[u8], query: &[u8], question_end: usize) -> bool {
+    if question_end > query.len() || query.len() < 12 || stored.len() < 12 {
+        return false;
+    }
+    let Some(stored_question_end) = dns::question_end(stored) else {
+        return false;
+    };
+    if stored_question_end != question_end {
+        return false;
+    }
+    if !dns::questions_match(&stored[12..question_end], &query[12..question_end]) {
+        return false;
+    }
+    let sv = dns::extract_variant(stored, stored_question_end);
+    let qv = dns::extract_variant(query, question_end);
+    sv.has_opt == qv.has_opt
+        && sv.do_bit == qv.do_bit
+        && sv.edns_version == qv.edns_version
+        && sv.rd == qv.rd
+        && sv.ad == qv.ad
+        && sv.cd == qv.cd
 }
 
 pub(crate) fn read_u16(r: &mut impl Read) -> Result<u16> {
@@ -1059,6 +1159,43 @@ mod tests {
         assert!(
             cache.get(&query_a, question_end, 1).is_some(),
             "ECS 1.2.3.0/24 query must still hit its own entry"
+        );
+    }
+
+    #[test]
+    fn cache_key_strip_ecs_matches_no_ecs_query() {
+        // With no ECS, strip_ecs key should equal normal key
+        let (_, query, question_end) = make_test_packets(100);
+        assert_eq!(cache_key(&query, question_end), cache_key_strip_ecs(&query, question_end));
+    }
+
+    #[test]
+    fn ecs_fallback_lookup_finds_strip_ecs_entry() {
+        let cache = DnsCache::new(&base_cache_config());
+        let (response, _, _) = make_test_packets(100);
+        let resolved = cache.resolve_policy(None);
+
+        // Cache a response with an ECS query from one subnet, using strip_ecs key
+        let (query_a, question_end) = make_ecs_query(3);
+        let stripped = dns::strip_edns_ecs(&query_a).unwrap();
+        let key = cache_key_strip_ecs(&query_a, question_end);
+        cache.add(
+            CacheInsert {
+                key,
+                qname: Arc::from("test.local"),
+                question_end,
+                query: &stripped,
+                packet: &response,
+            },
+            &resolved,
+            0,
+        );
+
+        // A different ECS subnet should find the strip_ecs cached entry via fallback
+        let (query_b, _) = make_ecs_query(77);
+        assert!(
+            cache.get_with_ecs_fallback(&query_b, question_end, 1).is_some(),
+            "ECS fallback should find the strip-ecs cached entry"
         );
     }
 

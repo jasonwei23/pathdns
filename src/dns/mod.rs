@@ -310,6 +310,96 @@ pub fn questions_match(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+/// Apply random QNAME case mixing to an outgoing query (DNS-0x20).
+/// `seed` is mixed from upstream TXID + generation counter for per-request uniqueness.
+pub fn mix_qname_case(pkt: &mut [u8], question_end: usize, seed: u64) {
+    if pkt.len() < 13 || question_end <= 12 {
+        return;
+    }
+    let mut pos = 12usize;
+    let mut rng = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    while pos + 1 < question_end.saturating_sub(4) {
+        let b = match pkt.get(pos) {
+            Some(&v) => v,
+            None => return,
+        };
+        pos += 1;
+        let len = b as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            return;
+        }
+        for _ in 0..len {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            if pos < question_end {
+                let byte = pkt[pos];
+                if byte.is_ascii_alphabetic() && rng & 1 != 0 {
+                    pkt[pos] ^= 0x20;
+                }
+            }
+            pos += 1;
+        }
+    }
+}
+
+/// Verify that the QNAME in the response question section case-matches what we sent.
+/// Returns `true` (accept) when QNAME bytes match exactly OR response is all-lowercase.
+/// Returns `false` (reject) when the response has mixed case that does NOT match ours.
+pub fn verify_qname_case_echo(
+    sent: &[u8],
+    sent_qend: usize,
+    recv: &[u8],
+    recv_qend: usize,
+) -> bool {
+    let sent_q = match sent.get(12..sent_qend.saturating_sub(4)) {
+        Some(s) => s,
+        None => return true,
+    };
+    let recv_q = match recv.get(12..recv_qend.saturating_sub(4)) {
+        Some(s) => s,
+        None => return true,
+    };
+    if sent_q.len() != recv_q.len() {
+        return true;
+    }
+
+    let mut pos = 0usize;
+    loop {
+        let len = match sent_q.get(pos) {
+            Some(&v) => v as usize,
+            None => break,
+        };
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            break;
+        }
+        pos += 1;
+        for i in 0..len {
+            let s = match sent_q.get(pos + i) {
+                Some(&v) => v,
+                None => return true,
+            };
+            let r = match recv_q.get(pos + i) {
+                Some(&v) => v,
+                None => return true,
+            };
+            if s != r {
+                if r != s.to_ascii_lowercase() {
+                    return false;
+                }
+            }
+        }
+        pos += len;
+    }
+    true
+}
+
 // Shared internal helpers.
 
 /// Walk a compressed or uncompressed DNS name starting at `pos`.
@@ -441,5 +531,66 @@ mod tests {
         let original_ptr = resp.as_ptr();
         let out = maybe_truncate_for_udp(resp, &q);
         assert_eq!(out.as_ptr(), original_ptr);
+    }
+
+    #[test]
+    fn mix_qname_case_toggles_some_letters() {
+        let (mut q, qe) = plain_query();
+        let original = q[12..qe].to_vec();
+        mix_qname_case(&mut q, qe, 12345678u64);
+        // At least some bytes in the QNAME should differ from original
+        let changed = q[12..qe].iter().zip(original.iter()).any(|(a, b)| a != b);
+        assert!(changed, "mix_qname_case should toggle at least some letters");
+    }
+
+    #[test]
+    fn verify_qname_case_echo_exact_match_accepted() {
+        let (q, qe) = plain_query();
+        let mut sent = q.clone();
+        mix_qname_case(&mut sent, qe, 99999u64);
+        // Exact echo: accepted
+        assert!(verify_qname_case_echo(&sent, qe, &sent, qe));
+    }
+
+    #[test]
+    fn verify_qname_case_echo_lowercase_response_accepted() {
+        let (q, qe) = plain_query();
+        let mut sent = q.clone();
+        // Set sent to uppercase in QNAME
+        for b in &mut sent[12..qe - 4] {
+            if b.is_ascii_alphabetic() {
+                *b = b.to_ascii_uppercase();
+            }
+        }
+        // Lowercase response is tolerated
+        let mut recv = q.clone();
+        for b in &mut recv[12..qe - 4] {
+            if b.is_ascii_alphabetic() {
+                *b = b.to_ascii_lowercase();
+            }
+        }
+        assert!(verify_qname_case_echo(&sent, qe, &recv, qe));
+    }
+
+    #[test]
+    fn verify_qname_case_echo_spoofed_case_rejected() {
+        let (q, qe) = plain_query();
+        let mut sent = q.clone();
+        mix_qname_case(&mut sent, qe, 42u64);
+        // Attacker sends back a different case pattern (all-uppercase)
+        let mut spoofed = q.clone();
+        for b in &mut spoofed[12..qe - 4] {
+            if b.is_ascii_alphabetic() {
+                *b = b.to_ascii_uppercase();
+            }
+        }
+        // If the sent had at least one lowercase letter, this should fail
+        let has_lowercase_in_sent = sent[12..qe - 4].iter().any(|b| b.is_ascii_lowercase());
+        if has_lowercase_in_sent {
+            assert!(
+                !verify_qname_case_echo(&sent, qe, &spoofed, qe),
+                "spoofed uppercase case should be rejected when sent had lowercase"
+            );
+        }
     }
 }
