@@ -79,6 +79,12 @@ pub(crate) struct JsonConfig {
     pub(crate) max_inflight: Option<usize>,
     pub(crate) inflight_queue_ms: Option<u64>,
     pub(crate) hedge_delay_ms: Option<u64>,
+    /// Maximum concurrent TCP client connections. 0 = unlimited.
+    pub(crate) tcp_max_connections: Option<usize>,
+    /// Timeout (ms) for reading the DNS message body after the 2-byte length prefix. 0 = disabled.
+    pub(crate) tcp_read_timeout_ms: Option<u64>,
+    /// Timeout (ms) for receiving the next request on an idle TCP connection. 0 = disabled.
+    pub(crate) tcp_idle_timeout_ms: Option<u64>,
 
     // GeoSite
     pub(crate) geosite_file: Option<Vec<String>>,

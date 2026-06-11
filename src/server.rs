@@ -44,6 +44,8 @@ pub enum ResolvedFallback {
 pub struct AppState {
     pub cfg: Config,
     pub limit: Arc<Semaphore>,
+    /// Connection-level semaphore for TCP. `None` = unlimited.
+    pub tcp_conn_limit: Option<Arc<Semaphore>>,
     pub cache: DnsCache,
     pub groups: Vec<CustomGroup>,
     pub(crate) remote_inflight: singleflight::InflightTable,
@@ -162,12 +164,15 @@ impl AppState {
         let routing_index = RouteIndex::build(&groups);
 
         let max = cfg.max_inflight;
+        let tcp_conn_limit = (cfg.tcp_max_connections > 0)
+            .then(|| Arc::new(Semaphore::new(cfg.tcp_max_connections)));
         let stale_client_timeout_ms = cfg.cache_stale_client_timeout;
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<crate::cache::CacheRefresh>(64);
         Ok((
             Self {
                 cfg,
                 limit: Arc::new(Semaphore::new(max)),
+                tcp_conn_limit,
                 cache,
                 groups,
                 remote_inflight: singleflight::InflightTable::new(),

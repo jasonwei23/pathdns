@@ -206,6 +206,12 @@ pub struct Config {
     pub cache_persist_interval: u64,
     pub udp_buf_size: usize,
     pub udp_pool_size: usize,
+    /// Maximum concurrent TCP client connections. 0 = unlimited.
+    pub tcp_max_connections: usize,
+    /// Timeout for reading the DNS message body. 0 = disabled.
+    pub tcp_read_timeout_ms: u64,
+    /// Timeout for waiting for the next request on an idle TCP connection. 0 = disabled.
+    pub tcp_idle_timeout_ms: u64,
     pub querylog: QueryLogConfig,
     pub groups: Vec<GroupSpec>,
     pub ipset: Option<IpSetConfig>,
@@ -372,6 +378,10 @@ impl Config {
             }
         };
 
+        let tcp_max_connections = json.tcp_max_connections.unwrap_or(1024);
+        let tcp_read_timeout_ms = json.tcp_read_timeout_ms.unwrap_or(5000);
+        let tcp_idle_timeout_ms = json.tcp_idle_timeout_ms.unwrap_or(30_000);
+
         Ok(Self {
             bind: bind_addrs,
             listen_udp,
@@ -382,6 +392,9 @@ impl Config {
             worker_threads,
             fallback,
             querylog,
+            tcp_max_connections,
+            tcp_read_timeout_ms,
+            tcp_idle_timeout_ms,
             cache_size: json.cache.as_ref().and_then(|c| c.size).unwrap_or(10000),
             cache_stale_expire_ttl: json
                 .cache
@@ -1188,6 +1201,42 @@ mod querylog_tests {
         assert_eq!(cfg.querylog.memory, 1000);
         assert_eq!(cfg.querylog.channel, 4096);
         assert!(!cfg.querylog.answer_ips);
+    }
+
+    #[test]
+    fn tcp_defaults_are_protective() {
+        let cfg = parse(r#"{"fallback":{"default-group":"null"}}"#).unwrap();
+        assert_eq!(cfg.tcp_max_connections, 1024);
+        assert_eq!(cfg.tcp_read_timeout_ms, 5000);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn tcp_zero_means_unlimited_or_disabled() {
+        let cfg = parse(
+            r#"{"fallback":{"default-group":"null"},
+                "tcp-max-connections":0,
+                "tcp-read-timeout-ms":0,
+                "tcp-idle-timeout-ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_max_connections, 0);
+        assert_eq!(cfg.tcp_read_timeout_ms, 0);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 0);
+    }
+
+    #[test]
+    fn tcp_custom_values_are_accepted() {
+        let cfg = parse(
+            r#"{"fallback":{"default-group":"null"},
+                "tcp-max-connections":256,
+                "tcp-read-timeout-ms":2000,
+                "tcp-idle-timeout-ms":10000}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_max_connections, 256);
+        assert_eq!(cfg.tcp_read_timeout_ms, 2000);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 10_000);
     }
 
     #[test]

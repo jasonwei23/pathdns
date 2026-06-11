@@ -21,8 +21,10 @@ use bytes::BytesMut;
 use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
@@ -135,9 +137,20 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
 async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Acquire a connection slot before spawning. When the limit is reached, drop
+        // the stream immediately (RST) rather than leaving clients waiting.
+        let conn_permit: Option<OwnedSemaphorePermit> =
+            if let Some(sem) = &state.tcp_conn_limit {
+                match sem.clone().try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => continue, // stream dropped here → client receives RST
+                }
+            } else {
+                None
+            };
         let state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_tcp_conn(stream, peer, state).await;
+            let _ = handle_tcp_conn(stream, peer, state, conn_permit).await;
         });
     }
 }
@@ -146,25 +159,58 @@ async fn handle_tcp_conn(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
     state: Arc<AppState>,
+    // Held for the lifetime of this connection; drop releases the slot.
+    _conn_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
+    let idle_timeout = (state.cfg.tcp_idle_timeout_ms > 0)
+        .then(|| Duration::from_millis(state.cfg.tcp_idle_timeout_ms));
+    let read_timeout = (state.cfg.tcp_read_timeout_ms > 0)
+        .then(|| Duration::from_millis(state.cfg.tcp_read_timeout_ms));
+
     loop {
+        // Wait for the 2-byte length prefix, applying the idle timeout.
+        // This also catches the "1-byte stall" attack: a client that sends
+        // only the first byte of the header is evicted when the timeout fires.
         let mut len_buf = [0u8; 2];
-        match stream.read_exact(&mut len_buf).await {
+        let len_result = match idle_timeout {
+            None => stream.read_exact(&mut len_buf).await,
+            Some(t) => {
+                match tokio::time::timeout(t, stream.read_exact(&mut len_buf)).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => return Ok(()), // idle timeout — close cleanly
+                }
+            }
+        };
+        match len_result {
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(err) => return Err(err.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(_) => return Ok(()),
         }
+
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
             continue;
         }
+
+        // Read the message body, applying the frame-read timeout.
         let mut packet = BytesMut::zeroed(len);
-        stream.read_exact(&mut packet).await?;
+        let body_result = match read_timeout {
+            None => stream.read_exact(&mut packet).await,
+            Some(t) => {
+                match tokio::time::timeout(t, stream.read_exact(&mut packet)).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => return Ok(()), // body read stalled — close
+                }
+            }
+        };
+        if body_result.is_err() {
+            return Ok(());
+        }
 
         match handle_packet_bytes(packet.freeze(), peer, ClientProto::Tcp, state.clone()).await {
             Ok(Some(resp)) => write_tcp_response(&mut stream, &resp).await?,
             Ok(None) => {}
-            Err(err) => return Err(err),
+            Err(_) => return Ok(()),
         }
     }
 }
