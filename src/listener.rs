@@ -98,6 +98,8 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
                 if let Some(r) = refresh {
                     spawn_cache_refresh(r, &state);
                 }
+                // Enforce the client's EDNS UDP payload limit (512 for non-EDNS).
+                let resp = crate::dns::maybe_truncate_for_udp(resp, &recv_buf);
                 // Try non-blocking send first; only spawn if the kernel buffer is momentarily full.
                 if let Err(e) = socket.try_send_to(&resp, peer) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -119,10 +121,14 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
                 let state = state.clone();
                 let socket = socket.clone();
                 tokio::spawn(async move {
+                    // Clone is O(1) (Bytes refcount bump); needed to enforce UDP size after
+                    // handle_packet_slow_preparsed takes ownership of `packet`.
+                    let query = packet.clone();
                     match handle_packet_slow_preparsed(packet, peer, ClientProto::Udp, state, info)
                         .await
                     {
                         Ok(Some(resp)) => {
+                            let resp = crate::dns::maybe_truncate_for_udp(resp, &query);
                             let _ = socket.send_to(&resp, peer).await;
                         }
                         Ok(None) => {}

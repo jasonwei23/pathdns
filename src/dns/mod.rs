@@ -11,6 +11,8 @@ mod ecs;
 mod query;
 mod scan;
 
+use bytes::{Bytes, BytesMut};
+
 // Shared types.
 
 #[derive(Debug, Clone)]
@@ -192,6 +194,72 @@ pub fn question_end(packet: &[u8]) -> Option<usize> {
     Some(end + 4)
 }
 
+/// Returns the maximum UDP response size this client will accept.
+///
+/// For non-EDNS clients (no OPT record), the RFC 1035 default of 512 bytes applies.
+/// For EDNS clients the value is the UDP payload size field from their OPT record,
+/// clamped to a minimum of 512 so a misconfigured zero never produces an empty stub.
+pub fn client_udp_payload_size(packet: &[u8], question_end: usize) -> u16 {
+    const MIN: u16 = 512;
+    if packet.len() < 12 {
+        return MIN;
+    }
+    let arcount = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+    if arcount == 0 || question_end >= packet.len() {
+        return MIN;
+    }
+    let mut pos = question_end;
+    for _ in 0..arcount {
+        let Some(name_end) = skip_name(packet, pos) else { break };
+        if name_end + 10 > packet.len() {
+            break;
+        }
+        let rr_type = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
+        let rdlen = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
+        let Some(rdata_end) =
+            (name_end + 10).checked_add(rdlen).filter(|&e| e <= packet.len())
+        else {
+            break;
+        };
+        if rr_type == 41 {
+            // OPT CLASS field encodes the sender's UDP payload size.
+            let size = u16::from_be_bytes([packet[name_end + 2], packet[name_end + 3]]);
+            return size.max(MIN);
+        }
+        pos = rdata_end;
+    }
+    MIN
+}
+
+/// If `resp` fits within the client's UDP payload limit it is returned unchanged (zero-copy).
+/// If it exceeds the limit, returns a minimal TC=1 stub containing only the DNS header and
+/// question section so the client retries over TCP (RFC 1035 §4.2.1).
+///
+/// `resp` must already have the correct client ID and original question case applied;
+/// those bytes are carried into the TC stub as-is.
+pub fn maybe_truncate_for_udp(resp: Bytes, query: &[u8]) -> Bytes {
+    let qe = match question_end(query) {
+        Some(v) => v,
+        None => return resp, // malformed query — can't determine limit, pass through
+    };
+    let max = client_udp_payload_size(query, qe) as usize;
+    if resp.len() <= max {
+        return resp; // fast path: no truncation needed
+    }
+    // Response exceeds the client's UDP limit.  Build a TC=1 stub by keeping
+    // only the header and question section (dropping all resource records).
+    if resp.len() < qe || qe < 12 {
+        return resp; // unexpected state — don't corrupt
+    }
+    let mut stub = BytesMut::with_capacity(qe);
+    stub.extend_from_slice(&resp[..qe]);
+    stub[2] |= 0x02;                   // set TC (truncated) bit
+    stub[6] = 0; stub[7] = 0;          // ANCOUNT = 0
+    stub[8] = 0; stub[9] = 0;          // NSCOUNT = 0
+    stub[10] = 0; stub[11] = 0;        // ARCOUNT = 0
+    stub.freeze()
+}
+
 /// Case-insensitive comparison of two DNS question wire-byte slices (`packet[12..question_end]`).
 /// Label bytes are compared case-insensitively; QTYPE and QCLASS (last 4 bytes) are exact.
 pub fn questions_match(a: &[u8], b: &[u8]) -> bool {
@@ -264,5 +332,114 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
         if pos > packet.len() {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal DNS query for "test.example" type A, no EDNS.
+    fn plain_query() -> (Vec<u8>, usize) {
+        let qname: &[u8] = b"\x04test\x07example\x00";
+        let mut q = vec![
+            0x00, 0x01, // ID
+            0x01, 0x00, // QR=0 RD=1
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // counts
+        ];
+        q.extend_from_slice(qname);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE A, QCLASS IN
+        let qe = q.len();
+        (q, qe)
+    }
+
+    /// Same query with an EDNS OPT record advertising `payload_size`.
+    fn edns_query(payload_size: u16) -> (Vec<u8>, usize) {
+        let (mut q, qe) = plain_query();
+        q[11] = 1; // ARCOUNT = 1
+        let [hi, lo] = payload_size.to_be_bytes();
+        q.extend_from_slice(&[
+            0x00,       // root owner name
+            0x00, 0x29, // type OPT (41)
+            hi, lo,     // UDP payload size
+            0x00, 0x00, // ext-rcode, version
+            0x00, 0x00, // flags
+            0x00, 0x00, // RDLEN = 0
+        ]);
+        (q, qe)
+    }
+
+    /// Fake response with enough bytes to trigger truncation.
+    fn large_response(query: &[u8], question_end: usize, extra: usize) -> Bytes {
+        let mut r = vec![0u8; question_end + extra];
+        r[..query.len().min(question_end)].copy_from_slice(&query[..query.len().min(question_end)]);
+        r[2] = 0x81; // QR=1 RD=1
+        r[3] = 0x80; // RA=1
+        Bytes::from(r)
+    }
+
+    #[test]
+    fn non_edns_client_limit_is_512() {
+        let (q, qe) = plain_query();
+        assert_eq!(client_udp_payload_size(&q, qe), 512);
+    }
+
+    #[test]
+    fn edns_client_limit_from_opt_payload_field() {
+        let (q, qe) = edns_query(4096);
+        assert_eq!(client_udp_payload_size(&q, qe), 4096);
+    }
+
+    #[test]
+    fn edns_payload_size_floored_at_512() {
+        let (q, qe) = edns_query(200);
+        assert_eq!(client_udp_payload_size(&q, qe), 512);
+    }
+
+    #[test]
+    fn small_response_passes_through_unchanged() {
+        let (q, qe) = plain_query();
+        let resp = large_response(&q, qe, 0); // exactly question_end bytes, well under 512
+        let original_ptr = resp.as_ptr();
+        let out = maybe_truncate_for_udp(resp, &q);
+        // Zero-copy: same underlying allocation.
+        assert_eq!(out.as_ptr(), original_ptr);
+    }
+
+    #[test]
+    fn oversized_non_edns_response_becomes_tc_stub() {
+        let (q, qe) = plain_query();
+        // Build a response larger than 512 bytes.
+        let resp = large_response(&q, qe, 600);
+        assert!(resp.len() > 512);
+        let stub = maybe_truncate_for_udp(resp, &q);
+        // Stub length equals question_end.
+        assert_eq!(stub.len(), qe);
+        // TC bit must be set (byte 2, bit 1).
+        assert_ne!(stub[2] & 0x02, 0, "TC bit not set");
+        // Record counts must be zeroed.
+        assert_eq!(&stub[6..12], &[0, 0, 0, 0, 0, 0], "record counts not zeroed");
+    }
+
+    #[test]
+    fn oversized_edns_response_becomes_tc_stub() {
+        let payload = 1232u16;
+        let (q, qe) = edns_query(payload);
+        // Build a response larger than the declared EDNS payload size.
+        let resp = large_response(&q, qe, (payload as usize) + 100);
+        assert!(resp.len() > payload as usize);
+        let stub = maybe_truncate_for_udp(resp, &q);
+        assert_eq!(stub.len(), qe);
+        assert_ne!(stub[2] & 0x02, 0, "TC bit not set");
+        assert_eq!(&stub[6..12], &[0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn response_within_edns_limit_passes_through() {
+        let (q, qe) = edns_query(4096);
+        let resp = large_response(&q, qe, 500); // question_end + 500 < 4096
+        let original_ptr = resp.as_ptr();
+        let out = maybe_truncate_for_udp(resp, &q);
+        assert_eq!(out.as_ptr(), original_ptr);
     }
 }
