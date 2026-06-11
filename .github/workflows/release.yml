@@ -16,8 +16,11 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+        run: cargo binstall -y cross
 
       - name: Build
         run: cross build --release --target aarch64-unknown-linux-musl
