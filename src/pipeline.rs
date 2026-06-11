@@ -288,25 +288,29 @@ pub(crate) async fn handle_packet_bytes(
         }
         FastPathOutcome::Drop => Ok(None),
         FastPathOutcome::Miss { info } => {
-            handle_packet_slow_preparsed(packet, peer, proto, state, info).await
+            handle_packet_slow_preparsed(packet, peer, proto, state, info, None).await
         }
     }
 }
 
 /// Slow path for cache misses. Skips the fast-path check and reuses the already
 /// parsed header/question offsets from `try_fast_path`.
+///
+/// `pre_permit`: a semaphore permit acquired BEFORE spawning the task (UDP path).
+/// Pass `None` for the TCP path — the permit is acquired inside the function.
 pub(crate) async fn handle_packet_slow_preparsed(
     packet: Bytes,
     peer: SocketAddr,
     proto: ClientProto,
     state: Arc<AppState>,
     fast_info: dns::FastQueryInfo,
+    pre_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Option<Bytes>> {
     let info = match dns::parse_query_from_fast(&packet, fast_info) {
         Ok(info) => info,
         Err(_) => return Ok(None),
     };
-    handle_packet_slow_with_info(packet, peer, proto, state, info).await
+    handle_packet_slow_with_info(packet, peer, proto, state, info, pre_permit).await
 }
 
 async fn handle_packet_slow_with_info(
@@ -315,48 +319,53 @@ async fn handle_packet_slow_with_info(
     proto: ClientProto,
     state: Arc<AppState>,
     info: dns::QueryInfo,
+    pre_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Option<Bytes>> {
-    let permit = match state.limit.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
-            let acquired = if state.cfg.inflight_queue_ms > 0 {
-                state
-                    .querylog
-                    .counters
-                    .inflight_queued
-                    .fetch_add(1, Ordering::Relaxed);
-                let wait = Duration::from_millis(state.cfg.inflight_queue_ms);
-                tokio::time::timeout(wait, state.limit.clone().acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-            } else {
-                None
-            };
-            match acquired {
-                Some(permit) => permit,
-                None => {
+    // Use a pre-acquired permit (UDP path, acquired before spawn) or acquire one now (TCP path).
+    let permit = match pre_permit {
+        Some(p) => p,
+        None => match state.limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
+                let acquired = if state.cfg.inflight_queue_ms > 0 {
                     state
                         .querylog
                         .counters
-                        .inflight_drops
+                        .inflight_queued
                         .fetch_add(1, Ordering::Relaxed);
-                    let servfail = dns::servfail_reply(&packet, info.question_end)
-                        .map(Bytes::from)
-                        .ok();
-                    if let Some(resp) = &servfail {
-                        let ctx = QueryContext {
-                            packet,
-                            info,
-                            origin: QueryOrigin::Client { peer, proto },
-                        };
-                        emit_slow_event(&ctx, &state, resp, "overload", None, 0);
+                    let wait = Duration::from_millis(state.cfg.inflight_queue_ms);
+                    tokio::time::timeout(wait, state.limit.clone().acquire_owned())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                } else {
+                    None
+                };
+                match acquired {
+                    Some(permit) => permit,
+                    None => {
+                        state
+                            .querylog
+                            .counters
+                            .inflight_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        let servfail = dns::servfail_reply(&packet, info.question_end)
+                            .map(Bytes::from)
+                            .ok();
+                        if let Some(resp) = &servfail {
+                            let ctx = QueryContext {
+                                packet,
+                                info,
+                                origin: QueryOrigin::Client { peer, proto },
+                            };
+                            emit_slow_event(&ctx, &state, resp, "overload", None, 0);
+                        }
+                        return Ok(servfail);
                     }
-                    return Ok(servfail);
                 }
             }
-        }
+        },
     };
 
     let resp = {
@@ -531,6 +540,12 @@ async fn exchange_with_dedupe(
         }
     }
     let started = Instant::now();
+    // Record routing generation before any upstream I/O. On GeoSite hot-reload, the
+    // generation is incremented before the cache is cleared. We check it before writing
+    // to the cache below to prevent stale responses from re-populating the fresh cache.
+    let routing_gen = state
+        .routing_generation
+        .load(std::sync::atomic::Ordering::Acquire);
     let ck = cache_key(&ctx.packet, ctx.info.question_end);
     // Normalize cache key for strip-mode targets so all ECS clients share one entry.
     let ck = if target.strip_ecs()
@@ -542,7 +557,10 @@ async fn exchange_with_dedupe(
     } else {
         ck
     };
-    let waiter = singleflight::register(&state.remote_inflight, ck)?;
+    // Mix routing generation into the singleflight key so followers from a previous
+    // routing generation do not join an in-flight request for a different route target.
+    let sf_ck = ck ^ routing_gen.wrapping_mul(0x9e3779b97f4a7c15);
+    let waiter = singleflight::register(&state.remote_inflight, sf_ck)?;
 
     if let Some(mut rx) = waiter {
         // Bound the follower wait so a panicking leader never leaves clients hung forever.
@@ -584,13 +602,35 @@ async fn exchange_with_dedupe(
         let Some(resp) = rx.borrow().clone() else {
             anyhow::bail!("singleflight leader returned no response");
         };
+        let elapsed = started.elapsed().as_micros() as u64;
+        // Guard against 64-bit hash collision: the leader may have resolved a different
+        // question. Verify the response question section matches ours (case-insensitively,
+        // to accommodate 0x20 QNAME case mixing applied by the TCP mux).
+        let leader_qend = dns::question_end(&resp);
+        if leader_qend != Some(ctx.info.question_end)
+            || resp.len() < ctx.info.question_end
+            || !resp[12..ctx.info.question_end].eq_ignore_ascii_case(ctx.question())
+        {
+            let servfail = Bytes::from(
+                dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
+            );
+            record_client_latency(&ctx, state, elapsed);
+            record_singleflight_hit(&ctx, state);
+            emit_slow_event(
+                &ctx,
+                state,
+                &servfail,
+                "singleflight",
+                Some(Arc::from(target.group_name())),
+                elapsed,
+            );
+            return Ok(servfail);
+        }
         let mut resp = BytesMut::from(resp.as_ref());
         dns::set_id(&mut resp, ctx.info.id)?;
-        if resp.len() >= ctx.info.question_end {
-            resp[12..ctx.info.question_end].copy_from_slice(ctx.question());
-        }
+        // Restore canonical case from the client's question (strips upstream 0x20 mixing).
+        resp[12..ctx.info.question_end].copy_from_slice(ctx.question());
         let resp = resp.freeze();
-        let elapsed = started.elapsed().as_micros() as u64;
         record_client_latency(&ctx, state, elapsed);
         record_singleflight_hit(&ctx, state);
         emit_slow_event(
@@ -605,7 +645,7 @@ async fn exchange_with_dedupe(
     }
     // If the leader task is cancelled while awaiting upstream I/O, Drop removes
     // the table entry so later callers can become the new leader instead of waiting forever.
-    let _leader = SingleflightLeader { state, key: ck };
+    let _leader = SingleflightLeader { state, key: sf_ck };
 
     // Leader path: compute skip_cache before consuming packet, clone for cache use.
     let skip_cache = target.skip_cache();
@@ -632,7 +672,7 @@ async fn exchange_with_dedupe(
             Ok(upstream_result) => upstream_result,
             Err(_timeout) => {
                 // Timeout fired first; serve stale to the client and spawn a background refresh.
-                singleflight::publish_bytes(&state.remote_inflight, &ck, stale_pkt.clone());
+                singleflight::publish_bytes(&state.remote_inflight, &sf_ck, stale_pkt.clone());
                 let elapsed = started.elapsed().as_micros() as u64;
                 record_client_latency(&ctx, state, elapsed);
                 if ctx.client().is_some() {
@@ -692,7 +732,14 @@ async fn exchange_with_dedupe(
             }
 
             maybe_add_response_ips(&target, ctx.info.question_end, state, resp.as_ref());
-            if !skip_cache {
+            // Skip cache write if the routing generation advanced (GeoSite hot-reload cleared
+            // the cache between when we started the query and when the response arrived).
+            if !skip_cache
+                && state
+                    .routing_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == routing_gen
+            {
                 let (cache_policy, group_id) = match &target {
                     RouteTarget::Group(g) => {
                         let gid = state
@@ -728,7 +775,7 @@ async fn exchange_with_dedupe(
                     group_id,
                 );
             }
-            singleflight::publish_bytes(&state.remote_inflight, &ck, resp.clone());
+            singleflight::publish_bytes(&state.remote_inflight, &sf_ck, resp.clone());
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(&ctx, state, elapsed);
             if ctx.client().is_some() {
@@ -783,7 +830,7 @@ async fn exchange_with_dedupe(
                 Err(_) => return Err(err),
             };
             let servfail = Bytes::from(servfail);
-            singleflight::publish_bytes(&state.remote_inflight, &ck, servfail.clone());
+            singleflight::publish_bytes(&state.remote_inflight, &sf_ck, servfail.clone());
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(&ctx, state, elapsed);
             if ctx.client().is_some() {

@@ -137,8 +137,18 @@ impl TcpMux {
                 let generation = self.generation.clone();
                 let write_conn = self.write_half.clone();
                 let max_resp = self.max_response_bytes;
+                let read_timeout = self.timeout;
                 tokio::spawn(async move {
-                    mux_reader_loop(read_half, pending, generation, my_gen, write_conn, max_resp).await;
+                    mux_reader_loop(
+                        read_half,
+                        pending,
+                        generation,
+                        my_gen,
+                        write_conn,
+                        max_resp,
+                        read_timeout,
+                    )
+                    .await;
                 });
 
                 Ok(())
@@ -230,7 +240,23 @@ async fn mux_reader_loop(
     my_gen: u64,
     write_conn: Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
     max_response_bytes: usize,
+    read_timeout: Duration,
 ) {
+    let disconnect = |write_conn: &Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
+                      pending: &Arc<InflightRegistry>,
+                      global_gen: &Arc<AtomicU64>,
+                      my_gen: u64| {
+        let write_conn = write_conn.clone();
+        let pending = pending.clone();
+        let global_gen = global_gen.clone();
+        async move {
+            if global_gen.load(Ordering::Relaxed) == my_gen {
+                *write_conn.lock().await = None;
+                pending.clear();
+            }
+        }
+    };
+
     let mut buf = BytesMut::with_capacity(4096);
     loop {
         // Exit if a newer connection has been established.
@@ -238,33 +264,36 @@ async fn mux_reader_loop(
             return;
         }
 
+        // Length prefix read with timeout. An upstream that sends the 2-byte header then
+        // stalls (half-frame deadlock) would otherwise hold the connection open indefinitely
+        // while all per-query timeouts fire but the connection is never torn down.
         let mut len_buf = [0u8; 2];
-        if reader.read_exact(&mut len_buf).await.is_err() {
-            if global_gen.load(Ordering::Relaxed) == my_gen {
-                // Clear write half and drain all pending (callers see channel-closed error).
-                *write_conn.lock().await = None;
-                pending.clear();
-            }
+        let len_ok = match tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await
+        {
+            Ok(Ok(_)) => true,
+            _ => false,
+        };
+        if !len_ok {
+            disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;
         }
 
         let resp_len = u16::from_be_bytes(len_buf) as usize;
         if resp_len < 12 || (max_response_bytes > 0 && resp_len > max_response_bytes) {
             // Malformed or oversized response; disconnect.
-            if global_gen.load(Ordering::Relaxed) == my_gen {
-                *write_conn.lock().await = None;
-                pending.clear();
-            }
+            disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;
         }
 
         buf.clear();
         buf.resize(resp_len, 0);
-        if reader.read_exact(&mut buf).await.is_err() {
-            if global_gen.load(Ordering::Relaxed) == my_gen {
-                *write_conn.lock().await = None;
-                pending.clear();
-            }
+        // Body read also guarded by the same timeout.
+        let body_ok = match tokio::time::timeout(read_timeout, reader.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => true,
+            _ => false,
+        };
+        if !body_ok {
+            disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;
         }
 

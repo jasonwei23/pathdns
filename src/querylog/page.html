@@ -334,6 +334,9 @@ tr:last-child td{border-bottom:none}
         <button class="chip chip-src" data-filter="source" data-val="upstream" onclick="setChip('source','upstream')">upstream</button>
         <button class="chip chip-src" data-filter="source" data-val="stale" onclick="setChip('source','stale')">stale</button>
         <button class="chip chip-src" data-filter="source" data-val="filtered" onclick="setChip('source','filtered')">filtered</button>
+        <button class="chip chip-src" data-filter="source" data-val="singleflight" onclick="setChip('source','singleflight')">singleflight</button>
+        <button class="chip chip-src" data-filter="source" data-val="rcode" onclick="setChip('source','rcode')">rcode</button>
+        <button class="chip chip-src" data-filter="source" data-val="overload" onclick="setChip('source','overload')">overload</button>
       </div>
 
       <!-- Archive file picker -->
@@ -842,7 +845,7 @@ function rcodeTag(code) {
 }
 
 function sourceTag(src) {
-  const map = {cache:'badge-cache',upstream:'badge-upstream',stale:'badge-stale',singleflight:'badge-sf',null:'badge-null',filtered:'badge-filtered',overload:'badge-overload'};
+  const map = {cache:'badge-cache',upstream:'badge-upstream',stale:'badge-stale',singleflight:'badge-sf',null:'badge-null',rcode:'badge-null',filtered:'badge-filtered',overload:'badge-overload'};
   return '<span class="badge ' + (map[src]||'badge-ok') + '">' + esc(src) + '</span>';
 }
 
