@@ -55,10 +55,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 
 /* Tables */
 .toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
-.toolbar input{flex:1;padding:7px 11px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;border-radius:7px;outline:none;transition:border-color .12s}
+.toolbar input{flex:1;padding:7px 11px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;border-radius:7px;outline:none;transition:border-color .12s;min-width:120px}
 .toolbar input:focus{border-color:var(--accent)}
 .toolbar input::placeholder{color:var(--text2)}
-.btn{padding:7px 14px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;font-size:13px;color:var(--text);border-radius:7px;transition:background .12s,border-color .12s}
+.btn{padding:7px 14px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;font-size:13px;color:var(--text);border-radius:7px;transition:background .12s,border-color .12s;white-space:nowrap}
 .btn:hover{background:var(--border)}
 .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 .btn-primary:hover{filter:brightness(1.1)}
@@ -101,6 +101,28 @@ tr:hover td{background:var(--surface2)}
 .tag-include{background:rgba(34,197,94,.12);color:var(--green)}
 .tag-exclude{background:rgba(239,68,68,.12);color:var(--red)}
 .tag-catchall{color:var(--text2);font-style:italic}
+
+/* Mode toggle (Live / Archive) */
+.mode-btns{display:flex;gap:0;border:1px solid var(--border);border-radius:7px;overflow:hidden;flex-shrink:0}
+.mode-btn{padding:6px 14px;background:var(--surface2);border:none;cursor:pointer;font-size:12px;color:var(--text2);transition:background .12s,color .12s;white-space:nowrap}
+.mode-btn:first-child{border-right:1px solid var(--border)}
+.mode-btn:hover{background:var(--border);color:var(--text)}
+.mode-btn.active{background:var(--accent-dim);color:var(--accent);font-weight:600}
+
+/* File picker */
+.file-picker{background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden}
+.file-picker-empty{padding:14px 16px;color:var(--text2);font-size:13px;text-align:center}
+.file-item{display:flex;align-items:center;gap:12px;padding:10px 14px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .1s;user-select:none}
+.file-item:last-child{border-bottom:none}
+.file-item:hover{background:rgba(99,102,241,.06)}
+.file-item.selected{background:var(--accent-dim)}
+.fi-dot{width:7px;height:7px;border-radius:50%;border:1.5px solid var(--text2);flex-shrink:0;transition:background .12s,border-color .12s}
+.file-item.selected .fi-dot{background:var(--accent);border-color:var(--accent)}
+.fi-info{flex:1;min-width:0}
+.fi-range{font-size:13px;color:var(--text)}
+.fi-name{font-size:11px;color:var(--text2);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fi-size{font-size:12px;color:var(--text2);white-space:nowrap;flex-shrink:0}
+.arch-count{font-size:11px;color:var(--text2);margin-bottom:8px}
 
 /* Auth overlay */
 #auth-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px)}
@@ -270,10 +292,20 @@ tr:hover td{background:var(--surface2)}
     <div class="view-title">Query Log</div>
     <div class="card">
       <div class="toolbar">
+        <div class="mode-btns">
+          <button class="mode-btn active" data-mode="live" onclick="switchMode('live')">Live</button>
+          <button class="mode-btn" data-mode="archive" onclick="switchMode('archive')">Archive</button>
+        </div>
         <input id="ql-filter" type="text" placeholder="Filter by domain…" oninput="filterChanged()">
-        <button class="btn btn-danger" onclick="clearLog()">Clear</button>
-        <label class="toggle-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
+        <button class="btn btn-danger" id="ql-clear-btn" onclick="clearLog()">Clear</button>
+        <label class="toggle-label" id="ql-auto-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
       </div>
+
+      <!-- Archive file picker (hidden in live mode) -->
+      <div id="file-picker" class="file-picker" style="display:none"></div>
+
+      <div id="arch-count" class="arch-count" style="display:none"></div>
+
       <div style="overflow-x:auto">
         <table id="ql-table">
           <thead><tr>
@@ -295,11 +327,25 @@ tr:hover td{background:var(--surface2)}
 <script>
 let TOKEN = sessionStorage.getItem('pathdns_token') || '';
 let currentView = 'dashboard';
-let qlEvents = [];
-let qlBeforeSeq = null;
 let autoRefreshTimer = null;
 let dashTimer = null;
 let filterTimer = null;
+
+// ── Query log mode state ──────────────────────────────────────────────────────
+
+let qlMode = 'live';
+
+// Live mode
+let qlEvents = [];
+let qlBeforeSeq = null;
+
+// Archive mode
+let archFiles = [];        // [{name, size_bytes, time: Date|null}] sorted newest-first
+let archFile = null;       // currently selected filename
+let archAllEvents = [];    // all events fetched from selected file
+let archShowCount = 200;   // how many to display
+
+// ── API helpers ───────────────────────────────────────────────────────────────
 
 function api(path, opts) {
   return fetch(path, {
@@ -331,6 +377,8 @@ document.getElementById('auth-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitToken();
 });
 
+// ── Navigation ────────────────────────────────────────────────────────────────
+
 function showView(v) {
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
@@ -343,10 +391,16 @@ function showView(v) {
   currentView = v;
   history.replaceState(null, '', v === 'dashboard' ? location.pathname : '#' + v);
   if (v === 'dashboard') loadDashboard();
-  else if (v === 'querylog') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
+  else if (v === 'querylog') {
+    if (qlMode === 'live') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
+    else if (qlMode === 'archive') {
+      if (archFiles.length === 0) loadArchiveFiles();
+      else if (archFile) renderArchiveView();
+    }
+  }
 }
 
-// ── Dashboard ──────────────────────────────────────────────────────────────
+// ── Dashboard ─────────────────────────────────────────────────────────────────
 
 let statsRangeSeconds = 3600;
 let groupsLoaded = false;
@@ -410,12 +464,10 @@ function renderGroups(groups) {
   groups.forEach((g, i) => {
     const tr = document.createElement('tr');
 
-    // Name cell with optional badge
     let namePart = '<strong>' + esc(g.name) + '</strong>';
     if (g.is_null) namePart += ' <span class="badge badge-null">null</span>';
     else if (!g.has_upstream) namePart += ' <span class="badge badge-filtered">no upstream</span>';
 
-    // Tags cell
     let tagsPart;
     if (!g.tags || g.tags.length === 0) {
       tagsPart = '<span class="tag-catchall">catch-all</span>';
@@ -430,7 +482,6 @@ function renderGroups(groups) {
       }).join('');
     }
 
-    // Filter qtype cell
     let qtypePart = '';
     if (g.filter_qtype && g.filter_qtype.length > 0) {
       qtypePart = g.filter_qtype.map(n => qtypeName(n)).join(', ');
@@ -438,7 +489,6 @@ function renderGroups(groups) {
       qtypePart = '<span style="color:var(--text2)">—</span>';
     }
 
-    // Upstream cell
     let upstreamPart = g.has_upstream
       ? '<span style="color:var(--green)">yes</span>'
       : '<span style="color:var(--text2)">—</span>';
@@ -533,7 +583,6 @@ function drawChart(data) {
   const max = Math.max(...data, 1);
   const n = data.length;
 
-  // Grid lines
   ctx.strokeStyle = '#2a2a35'; ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
     const y = pad.t + ch * (1 - i / 4);
@@ -542,7 +591,6 @@ function drawChart(data) {
     ctx.fillText(Math.round(max * i / 4), pad.l - 5, y + 4);
   }
 
-  // Gradient fill
   const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ch);
   grad.addColorStop(0, 'rgba(99,102,241,.35)');
   grad.addColorStop(1, 'rgba(99,102,241,.0)');
@@ -553,14 +601,12 @@ function drawChart(data) {
     const y = pad.t + ch * (1 - v / max);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   });
-  // Close path for fill
   const lastX = pad.l + cw * (n - 1) / (n - 1 || 1);
   ctx.lineTo(lastX, pad.t + ch);
   ctx.lineTo(pad.l, pad.t + ch);
   ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
 
-  // Line (re-draw on top)
   ctx.beginPath();
   data.forEach((v, i) => {
     const x = pad.l + cw * i / (n - 1 || 1);
@@ -569,7 +615,6 @@ function drawChart(data) {
   });
   ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 2; ctx.stroke();
 
-  // Time labels
   ctx.fillStyle = '#555'; ctx.font = '10px system-ui'; ctx.textAlign = 'center';
   const now = new Date();
   const step = Math.max(1, Math.floor(n / 6));
@@ -582,7 +627,43 @@ function drawChart(data) {
   }
 }
 
-// ── Query Log ──────────────────────────────────────────────────────────────
+// ── Query Log — mode switching ─────────────────────────────────────────────────
+
+function switchMode(mode) {
+  if (qlMode === mode) return;
+  qlMode = mode;
+
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+
+  const isArchive = mode === 'archive';
+  document.getElementById('file-picker').style.display = isArchive ? 'block' : 'none';
+  document.getElementById('ql-clear-btn').style.display = isArchive ? 'none' : '';
+  document.getElementById('ql-auto-label').style.display = isArchive ? 'none' : '';
+  document.getElementById('arch-count').style.display = isArchive ? 'block' : 'none';
+
+  if (isArchive) {
+    // Stop live auto-refresh
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+    document.getElementById('ql-auto').checked = false;
+
+    if (archFiles.length === 0) {
+      loadArchiveFiles();
+    } else {
+      renderFilePicker();
+      if (archFile) renderArchiveView();
+    }
+  } else {
+    // Switch back to live
+    document.getElementById('arch-count').textContent = '';
+    qlEvents = []; qlBeforeSeq = null;
+    loadQueryLog();
+  }
+}
+
+// ── Query Log — live mode ─────────────────────────────────────────────────────
 
 async function loadQueryLog() {
   const filter = document.getElementById('ql-filter').value.trim();
@@ -600,7 +681,7 @@ async function loadQueryLog() {
     qlEvents = qlEvents.concat(events);
   }
 
-  renderQueryLog();
+  renderQueryLog(qlEvents);
 
   const moreBtn = document.getElementById('ql-more');
   if (events.length >= 100) {
@@ -611,9 +692,144 @@ async function loadQueryLog() {
   }
 }
 
+// ── Query Log — archive mode ──────────────────────────────────────────────────
+
+// File name format: querylog-{unix_micros:020}.msgpack.gz
+function parseFileTime(name) {
+  const m = name.match(/querylog-(\d+)/);
+  if (!m) return null;
+  // 20-digit zero-padded microseconds; parseInt is safe up to ~9e15
+  const us = parseInt(m[1], 10);
+  if (!us || us < 1e12) return null;
+  return new Date(us / 1000); // micros → ms
+}
+
+function formatDateTime(date) {
+  if (!date) return '—';
+  const p = n => String(n).padStart(2, '0');
+  const now = new Date();
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const datePart = sameYear
+    ? p(date.getMonth() + 1) + '-' + p(date.getDate())
+    : date.getFullYear() + '-' + p(date.getMonth() + 1) + '-' + p(date.getDate());
+  return datePart + '  ' + p(date.getHours()) + ':' + p(date.getMinutes());
+}
+
+function fmtBytes(n) {
+  if (!n) return '—';
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+async function loadArchiveFiles() {
+  const picker = document.getElementById('file-picker');
+  picker.innerHTML = '<div class="file-picker-empty">Loading…</div>';
+
+  const r = await tryFetch('/api/querylog/files');
+  if (!r) { picker.innerHTML = '<div class="file-picker-empty">Failed to load files</div>'; return; }
+  const raw = await r.json();
+
+  // Parse timestamps, sort newest-first
+  archFiles = raw
+    .map(f => ({ name: f.name, size_bytes: f.size_bytes, time: parseFileTime(f.name) }))
+    .sort((a, b) => (b.time || 0) - (a.time || 0));
+
+  renderFilePicker();
+
+  // Auto-select newest file
+  if (archFiles.length > 0) {
+    selectArchiveFile(archFiles[0].name);
+  } else {
+    renderQueryLog([]);
+  }
+}
+
+function renderFilePicker() {
+  const picker = document.getElementById('file-picker');
+  if (!archFiles.length) {
+    picker.innerHTML = '<div class="file-picker-empty">No archived log files available</div>';
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  // Compute time ranges: file[i] covers file[i].time → file[i-1].time (or now for i=0)
+  archFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item' + (f.name === archFile ? ' selected' : '');
+    div.onclick = () => selectArchiveFile(f.name);
+
+    const startStr = formatDateTime(f.time);
+    const endTime  = i === 0 ? new Date() : archFiles[i - 1].time;
+    const endStr   = formatDateTime(endTime);
+    const rangeStr = f.time ? startStr + '  →  ' + endStr : f.name;
+
+    div.innerHTML =
+      '<div class="fi-dot"></div>' +
+      '<div class="fi-info">' +
+        '<div class="fi-range">' + esc(rangeStr) + '</div>' +
+        '<div class="fi-name">' + esc(f.name) + '</div>' +
+      '</div>' +
+      '<div class="fi-size">' + fmtBytes(f.size_bytes) + '</div>';
+    frag.appendChild(div);
+  });
+  picker.innerHTML = '';
+  picker.appendChild(frag);
+}
+
+function selectArchiveFile(name) {
+  if (archFile === name) return;
+  archFile = name;
+  archAllEvents = [];
+  archShowCount = 200;
+  renderFilePicker();
+  loadArchive();
+}
+
+async function loadArchive() {
+  if (!archFile) return;
+  const filter = document.getElementById('ql-filter').value.trim();
+  let url = '/api/querylog/history?file=' + encodeURIComponent(archFile) + '&limit=2000';
+  if (filter) url += '&q=' + encodeURIComponent(filter);
+
+  document.getElementById('ql-tbody').innerHTML =
+    '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Loading…</td></tr>';
+  document.getElementById('ql-more').style.display = 'none';
+  document.getElementById('arch-count').textContent = '';
+
+  const r = await tryFetch(url);
+  if (!r) {
+    document.getElementById('ql-tbody').innerHTML =
+      '<tr><td colspan="8" style="color:var(--red);text-align:center">Failed to load archive</td></tr>';
+    return;
+  }
+  archAllEvents = await r.json();
+  archShowCount = 200;
+  renderArchiveView();
+}
+
+function renderArchiveView() {
+  const shown = archAllEvents.slice(0, archShowCount);
+  renderQueryLog(shown);
+
+  const total = archAllEvents.length;
+  const countEl = document.getElementById('arch-count');
+  if (total === 0) {
+    countEl.textContent = filter ? 'No matching entries' : 'No entries in this file';
+  } else {
+    const shownN = Math.min(archShowCount, total);
+    countEl.textContent = 'Showing ' + shownN.toLocaleString() + ' of ' + total.toLocaleString() + ' entries';
+  }
+
+  const moreBtn = document.getElementById('ql-more');
+  moreBtn.style.display = archAllEvents.length > archShowCount ? 'inline-block' : 'none';
+}
+
+// ── Shared query log rendering ────────────────────────────────────────────────
+
 const RCODE_NAMES = {0:'NOERROR',1:'FORMERR',2:'SERVFAIL',3:'NXDOMAIN',4:'NOTIMP',5:'REFUSED',6:'YXDOMAIN',7:'YXRRSET',8:'NXRRSET',9:'NOTAUTH',10:'NOTZONE'};
-const RCODE_OK  = new Set([0]);
-const RCODE_WARN = new Set([3,5]);
+const RCODE_OK   = new Set([0]);
+const RCODE_WARN = new Set([3, 5]);
 
 function rcodeTag(code) {
   const name = RCODE_NAMES[code] || ('RCODE' + code);
@@ -621,18 +837,17 @@ function rcodeTag(code) {
   return '<span class="badge ' + cls + '">' + name + '</span>';
 }
 
-function renderQueryLog() {
+function renderQueryLog(events) {
   const tbody = document.getElementById('ql-tbody');
-  if (!qlEvents.length) {
+  if (!events || !events.length) {
     tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text2);text-align:center">No entries</td></tr>';
     return;
   }
   const frag = document.createDocumentFragment();
-  for (const ev of qlEvents) {
+  for (const ev of events) {
     const tr = document.createElement('tr');
     const t = new Date(ev.time);
     const timeStr = t.toLocaleTimeString();
-    const src = sourceTag(ev.source);
     tr.innerHTML =
       '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
       '<td>' + esc(ev.client) + '</td>' +
@@ -640,7 +855,7 @@ function renderQueryLog() {
       '<td>' + esc(ev.qtype_name) + '</td>' +
       '<td>' + rcodeTag(ev.rcode) + '</td>' +
       '<td>' + fmtRtt(ev.elapsed_us) + '</td>' +
-      '<td>' + src + '</td>' +
+      '<td>' + sourceTag(ev.source) + '</td>' +
       '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';
     frag.appendChild(tr);
   }
@@ -654,22 +869,33 @@ function sourceTag(src) {
   return '<span class="badge ' + cls + '">' + esc(src) + '</span>';
 }
 
+// ── Query log controls ────────────────────────────────────────────────────────
+
 function filterChanged() {
   clearTimeout(filterTimer);
   filterTimer = setTimeout(() => {
-    qlEvents = []; qlBeforeSeq = null;
-    loadQueryLog();
+    if (qlMode === 'live') {
+      qlEvents = []; qlBeforeSeq = null;
+      loadQueryLog();
+    } else {
+      if (archFile) loadArchive();
+    }
   }, 250);
 }
 
 function loadMore() {
-  loadQueryLog();
+  if (qlMode === 'archive') {
+    archShowCount += 200;
+    renderArchiveView();
+  } else {
+    loadQueryLog();
+  }
 }
 
 async function clearLog() {
   await tryFetch('/api/querylog', {method: 'DELETE'});
   qlEvents = []; qlBeforeSeq = null;
-  renderQueryLog();
+  renderQueryLog([]);
 }
 
 function toggleAuto() {
@@ -677,11 +903,13 @@ function toggleAuto() {
   clearInterval(autoRefreshTimer);
   autoRefreshTimer = null;
   if (on) {
-    autoRefreshTimer = setInterval(() => { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }, 5000);
+    autoRefreshTimer = setInterval(() => {
+      qlEvents = []; qlBeforeSeq = null; loadQueryLog();
+    }, 5000);
   }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmt(n) {
   if (n === undefined || n === null) return '0';
@@ -704,15 +932,14 @@ function esc(s) {
 
 function refreshAll() {
   if (currentView === 'dashboard') loadDashboard();
-  else if (currentView === 'querylog' && document.getElementById('ql-auto').checked) {
+  else if (currentView === 'querylog' && qlMode === 'live' && document.getElementById('ql-auto').checked) {
     qlEvents = []; qlBeforeSeq = null; loadQueryLog();
   }
 }
 
-// ── Init ───────────────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
 
 (async () => {
-  // Restore view from URL hash
   const hash = location.hash.replace('#', '');
   const initView = hash === 'querylog' ? 'querylog' : 'dashboard';
 
@@ -722,31 +949,9 @@ function refreshAll() {
   if (initView !== 'dashboard') {
     showView(initView);
   } else {
-    const s = await r.json();
-    document.getElementById('stat-total').textContent = fmt(s.queries_total);
-    document.getElementById('stat-qps-hint').textContent = s.qps_now + ' qps';
-    document.getElementById('stat-cache-rate').textContent = s.cache_hit_rate_pct.toFixed(1) + '%';
-    document.getElementById('stat-cache-hits').textContent = fmt(s.cache_hits) + ' hits';
-    document.getElementById('stat-rtt').textContent = fmtRtt(s.avg_resolution_us);
-    document.getElementById('stat-upstream').textContent = fmt(s.upstream_ok) + ' / ' + fmt(s.upstream_err);
-    document.getElementById('stat-drops').textContent = fmt(s.inflight_drops);
-    document.getElementById('stat-log-drops').textContent =
-      fmt(s.events_dropped_full + s.events_dropped_closed);
-    document.getElementById('stat-log-queue').textContent =
-      fmt(s.queue_depth) + ' queued; peak ' + fmt(s.queue_high_watermark);
-    document.getElementById('stat-sf').textContent = fmt(s.singleflight_hits);
-    document.getElementById('stat-stale').textContent = fmt(s.stale_served);
-    document.getElementById('stat-cache-refresh').textContent = fmt(s.cache_refresh_started);
-    const failEl = document.getElementById('stat-cache-refresh-fail');
-    failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
-    document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
-    loadAggregateStats();
-    loadChart();
-    loadDashUpstreams();
-    loadGroups();
+    await loadDashboard();
   }
 
-  // Auto-refresh dashboard every 5 s
   dashTimer = setInterval(() => {
     if (currentView === 'dashboard') loadDashboard();
   }, 5000);
