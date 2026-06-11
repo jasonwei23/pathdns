@@ -13,9 +13,12 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - Configurable fallback for unmatched queries: route to a group, race two groups, or return empty.
 - IP-based primary/secondary selection: race two upstreams and test response IPs against an ipset/nftset to pick the winner.
 - GeoSite domain classification using V2Ray/Xray `.dat` or `.json` files (full, suffix, keyword, regexp matchers). Only referenced tags are loaded.
-- Encrypted transports: `tls://` (DoT), `https://` (DoH/HTTP1.1), `quic://` (DoQ, RFC 9250), `h3://` (DoH/HTTP3).
+- Encrypted transports: `tls://` (DoT), `https://` (DoH, HTTP/2 via ALPN), `quic://` (DoQ, RFC 9250), `h3://` (DoH/HTTP3).
 - Persistent mux connections for TCP/TLS upstreams with automatic reconnect.
-- DNS cache with TTL patching, stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
+- DNS cache with per-RR independent TTL countdown, negative TTL capping (RFC 2308 §5), stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
+- EDNS-aware cache isolation: responses are keyed by EDNS variant (DO bit, EDNS version, ECS subnet) so DO=0 and DO=1 clients never share cache entries.
+- Upstream response size cap: configurable per-byte limit rejects oversized TCP/TLS frames before they reach the cache.
+- TCP connection limit and per-frame read timeouts guard against slowloris-style attacks.
 - Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
 - Graceful rate limiting: configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
 - Per-domain verdict cache for `fallback.default-group: none` routing decisions.
@@ -137,8 +140,12 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
 | `timeout-ms` | int (ms) | `3000` | Upstream query timeout. |
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
-| `upstream-udp-sockets` | int | CPU count | UDP socket pool size per upstream node. |
+| `upstream-udp-sockets` | int | `max(worker-threads, 32)` | UDP socket pool size per upstream node. Higher values improve source-port randomness (RFC 5452). |
+| `upstream-max-response-bytes` | int | `0` | Reject TCP/TLS upstream responses larger than this (bytes). `0` = no limit. |
 | `hedge-delay-ms` | int (ms) | `0` (disabled) | Fire a second upstream after N ms with no reply. |
+| `tcp-max-connections` | int | `1024` | Maximum concurrent inbound TCP client connections. `0` = unlimited. |
+| `tcp-read-timeout-ms` | int (ms) | `5000` | Timeout for reading the DNS message body after the 2-byte length prefix. `0` = disabled. |
+| `tcp-idle-timeout-ms` | int (ms) | `30000` | Timeout for waiting for the next request on an idle TCP connection. `0` = disabled. |
 | `querylog` | object | — | Query log / dashboard settings (see [Query Log](#query-log--dashboard)). |
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
 | `no-ipset-blacklist` | bool | `false` | Allow loopback/unspecified IPs in ipset add operations. |
@@ -292,8 +299,8 @@ Configures per-query event collection and the dashboard HTTP API. The section is
   "answer-ips": false,
   "file": {
     "dir":              "/var/lib/pathdns/querylog",
-    "max-mb":           100,
-    "max-segments":     10,
+    "max-mb":           8,
+    "max-segments":     3,
     "batch-size":       256,
     "flush-interval-ms": 500,
     "retention-days":   30,
@@ -310,8 +317,8 @@ Configures per-query event collection and the dashboard HTTP API. The section is
 | `channel` | int | `4096` | Bounded mpsc channel depth between the DNS hot path and the log worker. When full, new events are dropped (non-blocking) rather than stalling queries. |
 | `answer-ips` | bool | `false` | Extract A/AAAA answer IPs into detailed events. Disabled by default because it requires scanning each response. |
 | `file.dir` | string | `"./querylog"` | Directory for rotating MessagePack segments. Created if missing. |
-| `file.max-mb` | int (MB) | `100` | Rotate to a new segment when the current one reaches this size. |
-| `file.max-segments` | int | `10` | Keep at most this many compressed segments; oldest are pruned. |
+| `file.max-mb` | int (MB) | `8` | Rotate to a new segment when the current one reaches this size. |
+| `file.max-segments` | int | `3` | Keep at most this many compressed segments; oldest are pruned. |
 | `file.batch-size` | int | `256` | Maximum events to accumulate before one write call. Reduces syscall overhead at high query rates. |
 | `file.flush-interval-ms` | int (ms) | `500` | How often the background worker flushes its write buffer to the OS. |
 | `file.retention-days` | int | — | Delete compressed segments whose embedded timestamp is older than this many days. Applied in addition to `max-segments`. |
@@ -359,7 +366,7 @@ Each event is a JSON object:
 | `tcp://1.1.1.1` | TCP (persistent mux connection) |
 | `tls://1.1.1.1` | DNS-over-TLS (RFC 7858) |
 | `tls://1.1.1.1?sni=dns.example` | DoT with explicit SNI |
-| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/1.1) |
+| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/2 via ALPN, fallback to HTTP/1.1) |
 | `quic://dns.adguard.com` | DNS-over-QUIC (requires `--features doq`) |
 | `h3://dns.cloudflare.com/dns-query` | DoH over HTTP/3 (requires `--features h3`) |
 
@@ -563,7 +570,7 @@ curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:8080/api/stat
 
 **Singleflight:** Concurrent cache-miss queries for the same question share one upstream request via a `tokio::sync::watch` channel. Followers receive the leader's response with no additional upstream traffic.
 
-**Single-pass TTL scanner:** `effective_ttl_and_offsets` walks all DNS resource records once, collecting TTL patch offsets and extracting `min(SOA_TTL, SOA_MINIMUM)` for NODATA/NXDOMAIN caching in the same pass.
+**Single-pass TTL scanner:** `effective_ttl_and_offsets` walks all DNS resource records once, collecting `(offset, clamped_rr_ttl)` pairs and extracting `min(SOA_TTL, SOA_MINIMUM)` for NODATA/NXDOMAIN (capped at 10 800 s per RFC 2308 §5) in the same pass. At serve time each RR is patched to its own `original_ttl − elapsed` countdown rather than a shared minimum.
 
 ---
 
