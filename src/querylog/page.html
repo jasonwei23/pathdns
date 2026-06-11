@@ -98,8 +98,8 @@ tr:last-child td{border-bottom:none}
 .modal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 24px}
 .modal-item{display:flex;flex-direction:column;gap:3px}
 .modal-lbl{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.06em}
-.modal-val{font-size:13px;color:var(--text);font-family:ui-monospace,monospace;word-break:break-all}
-.modal-val.nil{color:var(--text2);font-family:inherit}
+.modal-val{font-size:13px;color:var(--text);word-break:break-all}
+.modal-val.nil{color:var(--text2)}
 
 /* Collapsible groups */
 .group-row{cursor:pointer;user-select:none}
@@ -297,9 +297,9 @@ tr:last-child td{border-bottom:none}
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th style="width:24px"></th><th>Group</th><th>Match Rules</th><th>OK</th><th>Errors</th><th>Avg RTT</th>
+            <th style="width:24px"></th><th>Group</th><th>Match Rules</th><th>OK</th><th>Errors</th><th>Timeouts</th><th>Cancelled</th><th>Active</th><th>Avg RTT</th>
           </tr></thead>
-          <tbody id="groups-tbody"><tr><td colspan="6" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
+          <tbody id="groups-tbody"><tr><td colspan="9" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -475,27 +475,36 @@ function toggleGroup(name) {
 function renderGroupsAndUpstreams(groups, upstreamGroups) {
   const tbody = document.getElementById('groups-tbody');
   if (!groups || !groups.length) {
-    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text2);text-align:center">No groups configured</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text2);text-align:center">No groups configured</td></tr>';
     return;
   }
   const upMap = {};
   if (upstreamGroups) {
     for (const ug of upstreamGroups) upMap[ug.group] = ug.nodes || [];
   }
+  const nil = '<span style="color:var(--text2)">—</span>';
   const frag = document.createDocumentFragment();
   for (const g of groups) {
     const nodes = upMap[g.name] || [];
     const isExpanded = expandedGroups.has(g.name);
-    let totalOk = 0, totalErr = 0, totalRttUs = 0, rttCount = 0;
+    let totalOk = 0, totalErr = 0, totalTimeout = 0, totalCancelled = 0, totalActive = 0, totalRttUs = 0, rttCount = 0;
     for (const n of nodes) {
-      totalOk  += n.queries_ok;
-      totalErr += n.queries_err + n.queries_timeout;
+      totalOk        += n.queries_ok;
+      totalErr       += n.queries_err;
+      totalTimeout   += n.queries_timeout;
+      totalCancelled += n.queries_cancelled;
+      totalActive    += Math.max(0, n.active_inflight);
       if (n.avg_rtt_us > 0) { totalRttUs += n.avg_rtt_us; rttCount++; }
     }
     const avgRtt = rttCount > 0 ? Math.round(totalRttUs / rttCount) : 0;
     let namePart = '<strong>' + esc(g.name) + '</strong>';
-    if (g.is_null) namePart += ' <span class="badge badge-null">null</span>';
-    else if (!g.has_upstream) namePart += ' <span class="badge badge-filtered">no upstream</span>';
+    if (g.fixed_rcode != null) {
+      const rcodeNames = {0:'NOERROR',1:'FORMERR',2:'SERVFAIL',3:'NXDOMAIN',4:'NOTIMP',5:'REFUSED'};
+      const rcodeName = rcodeNames[g.fixed_rcode] || ('RCODE' + g.fixed_rcode);
+      namePart += ' <span class="badge badge-null">' + rcodeName + '</span>';
+    } else if (!g.has_upstream) {
+      namePart += ' <span class="badge badge-filtered">no upstream</span>';
+    }
     let tagsPart = (!g.tags || !g.tags.length)
       ? '<span class="tag-catchall">catch-all</span>'
       : g.tags.map(t => {
@@ -511,24 +520,30 @@ function renderGroupsAndUpstreams(groups, upstreamGroups) {
     tr.innerHTML =
       '<td style="width:24px;text-align:center"><span class="group-toggle">' + toggleIcon + '</span></td>' +
       '<td>' + namePart + '</td>' +
-      '<td style="white-space:normal;max-width:260px">' + tagsPart + '</td>' +
-      '<td style="color:var(--green)">' + (nodes.length ? fmt(totalOk) : '<span style="color:var(--text2)">—</span>') + '</td>' +
-      '<td style="color:var(--red)">' + (nodes.length ? fmt(totalErr) : '<span style="color:var(--text2)">—</span>') + '</td>' +
-      '<td>' + (avgRtt > 0 ? fmtRtt(avgRtt) : '<span style="color:var(--text2)">—</span>') + '</td>';
+      '<td style="white-space:normal;max-width:240px">' + tagsPart + '</td>' +
+      '<td style="color:var(--green)">'  + (nodes.length ? fmt(totalOk)        : nil) + '</td>' +
+      '<td style="color:var(--red)">'    + (nodes.length ? fmt(totalErr)       : nil) + '</td>' +
+      '<td style="color:var(--amber)">'  + (nodes.length ? fmt(totalTimeout)   : nil) + '</td>' +
+      '<td>'                             + (nodes.length ? fmt(totalCancelled) : nil) + '</td>' +
+      '<td>'                             + (nodes.length ? fmt(totalActive)    : nil) + '</td>' +
+      '<td>' + (avgRtt > 0 ? fmtRtt(avgRtt) : nil) + '</td>';
     frag.appendChild(tr);
     if (isExpanded) {
       for (const n of nodes) {
-        const errTotal = n.queries_err + n.queries_timeout;
-        const total = n.queries_ok + errTotal;
-        const errRate = total > 0 ? errTotal / total : 0;
+        const errTotal = n.queries_err;
+        const total = n.queries_ok + errTotal + n.queries_timeout;
+        const errRate = total > 0 ? (errTotal + n.queries_timeout) / total : 0;
         const dotCls = total === 0 ? 'health-idle' : errRate < 0.05 ? 'health-good' : errRate < 0.2 ? 'health-warn' : 'health-bad';
         const utr = document.createElement('tr');
         utr.className = 'upstream-row';
         utr.innerHTML =
           '<td></td>' +
-          '<td colspan="2"><span class="health-dot ' + dotCls + '"></span><span style="font-family:ui-monospace,monospace;font-size:12px">' + esc(n.addr) + '</span></td>' +
-          '<td style="color:var(--green)">' + fmt(n.queries_ok) + '</td>' +
-          '<td style="color:var(--red)">' + fmt(errTotal) + '</td>' +
+          '<td colspan="2"><span class="health-dot ' + dotCls + '"></span>' + esc(n.addr) + '</td>' +
+          '<td style="color:var(--green)">'  + fmt(n.queries_ok)        + '</td>' +
+          '<td style="color:var(--red)">'    + fmt(n.queries_err)       + '</td>' +
+          '<td style="color:var(--amber)">'  + fmt(n.queries_timeout)   + '</td>' +
+          '<td>'                             + fmt(n.queries_cancelled)  + '</td>' +
+          '<td>'                             + Math.max(0, n.active_inflight) + '</td>' +
           '<td>' + fmtRtt(n.avg_rtt_us) + '</td>';
         frag.appendChild(utr);
       }

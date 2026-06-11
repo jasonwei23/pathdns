@@ -587,7 +587,7 @@ fn render_groups(state: &AppState) -> Vec<u8> {
                 "tags": tags,
                 "filter_qtype": filter_qtypes,
                 "has_upstream": g.upstream.is_some(),
-                "is_null": g.upstream.is_none() && g.name == "null",
+                "fixed_rcode": g.fixed_rcode,
             })
         })
         .collect();

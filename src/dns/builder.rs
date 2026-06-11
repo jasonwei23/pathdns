@@ -38,10 +38,17 @@ impl ResponseBuilder {
     }
 }
 
-/// NOERROR response with no answer records (used for null-group and qtype-filtered queries).
+/// NOERROR response with no answer records (used for RCODE://NOERROR groups).
 pub fn empty_reply(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
     let mut b = ResponseBuilder::from_query(query, question_end)?;
     b.set_ra();
+    Ok(b.finish())
+}
+
+/// Response with an arbitrary RCODE and no answer records.
+pub fn rcode_reply(query: &[u8], question_end: usize, rcode: u8) -> Result<Vec<u8>> {
+    let mut b = ResponseBuilder::from_query(query, question_end)?;
+    b.set_ra().set_rcode(rcode);
     Ok(b.finish())
 }
 

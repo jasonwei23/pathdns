@@ -77,6 +77,8 @@ pub struct CustomGroup {
     /// True when every upstream in this group strips ECS (mode is Strip or unset).
     /// Used to share a single cache entry across all clients rather than one per subnet.
     pub strip_ecs: bool,
+    /// Fixed RCODE to return immediately without querying any upstream.
+    pub fixed_rcode: Option<u8>,
 }
 
 impl CustomGroup {
@@ -102,7 +104,7 @@ impl AppState {
         // Build custom group pools.
         let mut groups = Vec::new();
         for spec in &cfg.groups {
-            let upstream = if spec.name == "null" {
+            let upstream = if spec.fixed_rcode.is_some() {
                 None
             } else {
                 Some(
@@ -127,6 +129,7 @@ impl AppState {
                 geosite_include: spec.geosite_include.clone(),
                 geosite_exclude: spec.geosite_exclude.clone(),
                 strip_ecs,
+                fixed_rcode: spec.fixed_rcode,
             });
         }
 
@@ -494,7 +497,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     if !state.cfg.bind.iter().any(|ep| ep.udp || ep.tcp) {
         return Err(anyhow!("at least one bind protocol is required"));
     }
-    crate::startup!("listening dns=[{}]", listeners_summary(&state.cfg));
+    crate::log_info!("listening dns=[{}]", listeners_summary(&state.cfg));
     let mut set = tokio::task::JoinSet::new();
     for &ep in &state.cfg.bind {
         if ep.udp {

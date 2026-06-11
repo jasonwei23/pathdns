@@ -67,8 +67,6 @@ pub enum UpstreamProto {
     Https,
     Quic,
     H3,
-    UdpIncoming,
-    TcpIncoming,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +100,9 @@ pub struct GroupSpec {
     pub add_ip: Option<String>,
     pub cache_policy: Option<GroupCachePolicy>,
     pub filter_qtype: Vec<u16>,
+    /// When set, queries matching this group return a fixed DNS RCODE immediately
+    /// without contacting any upstream. Set by `"upstream": ["RCODE://<name>"]`.
+    pub fixed_rcode: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,14 +768,33 @@ fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
             }
         }
     }
-    let upstream = if name == "null" {
-        Vec::new()
+    let urls = jg.upstream.as_deref().unwrap_or(&[]);
+    if urls.is_empty() {
+        return Err(anyhow!("group \"{name}\" requires an upstream"));
+    }
+    let rcode_count = urls
+        .iter()
+        .filter(|u| u.to_ascii_uppercase().starts_with("RCODE://"))
+        .count();
+    let normal_count = urls.len() - rcode_count;
+    if rcode_count > 0 && normal_count > 0 {
+        return Err(anyhow!(
+            "group \"{name}\": cannot mix RCODE:// with real upstreams"
+        ));
+    }
+    if rcode_count > 1 {
+        return Err(anyhow!(
+            "group \"{name}\": only one RCODE:// upstream is allowed"
+        ));
+    }
+    let (upstream, fixed_rcode) = if rcode_count == 1 {
+        let rcode_url = urls.iter().find(|u| u.to_ascii_uppercase().starts_with("RCODE://")).unwrap();
+        let rcode_name = rcode_url.split_once("://").unwrap().1;
+        let rcode = parse_rcode_name(rcode_name)
+            .with_context(|| format!("group \"{name}\": invalid RCODE upstream \"{rcode_url}\""))?;
+        (Vec::new(), Some(rcode))
     } else {
-        let urls = jg.upstream.as_deref().unwrap_or(&[]);
-        if urls.is_empty() {
-            return Err(anyhow!("group \"{name}\" requires an upstream"));
-        }
-        parse_upstreams(urls)?
+        (parse_upstreams(urls)?, None)
     };
     let cache_policy = parse_group_cache_policy(jg.cache)?;
     let filter_qtype = parse_group_filter_qtype(jg.filter_qtype)?;
@@ -786,6 +806,7 @@ fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
         add_ip: jg.add_ip.filter(|s| !s.is_empty()),
         cache_policy,
         filter_qtype,
+        fixed_rcode,
     })
 }
 
@@ -1073,10 +1094,7 @@ fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
 
     let Some((scheme, rest)) = raw.split_once("://") else {
         let addr = parse_addr_with_default_port(raw, 53)?;
-        return Ok(vec![
-            endpoint(UpstreamProto::UdpIncoming, addr, None, None, false, None),
-            endpoint(UpstreamProto::TcpIncoming, addr, None, None, false, None),
-        ]);
+        return Ok(vec![endpoint(UpstreamProto::Udp, addr, None, None, false, None)]);
     };
 
     let proto = parse_upstream_scheme(scheme)?;
@@ -1187,6 +1205,20 @@ fn parse_ecs_subnet(s: &str) -> Result<EcsSubnet> {
     }
 }
 
+fn parse_rcode_name(name: &str) -> Result<u8> {
+    match name.to_ascii_uppercase().as_str() {
+        "NOERROR" => Ok(0),
+        "FORMERR" => Ok(1),
+        "SERVFAIL" => Ok(2),
+        "NXDOMAIN" => Ok(3),
+        "NOTIMP" => Ok(4),
+        "REFUSED" => Ok(5),
+        other => other
+            .parse::<u8>()
+            .map_err(|_| anyhow!("unknown RCODE \"{other}\" — use NOERROR/NXDOMAIN/SERVFAIL/REFUSED or a number 0–15")),
+    }
+}
+
 fn parse_upstream_scheme(scheme: &str) -> Result<UpstreamProto> {
     match scheme.to_ascii_lowercase().as_str() {
         "udp" => Ok(UpstreamProto::Udp),
@@ -1246,9 +1278,9 @@ fn parse_addr_with_default_port(s: &str, default_port: u16) -> Result<SocketAddr
 }
 
 impl UpstreamProto {
-    fn default_port(self) -> u16 {
+    pub fn default_port(self) -> u16 {
         match self {
-            Self::Udp | Self::Tcp | Self::UdpIncoming | Self::TcpIncoming => 53,
+            Self::Udp | Self::Tcp => 53,
             Self::Tls | Self::Quic => 853,
             Self::Https | Self::H3 => 443,
         }

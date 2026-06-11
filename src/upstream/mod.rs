@@ -208,11 +208,24 @@ pub enum ClientProto {
 
 impl UpstreamProto {
     fn client_filter(self) -> Option<ClientProto> {
-        match self {
-            Self::Udp | Self::Tcp | Self::Tls | Self::Https | Self::Quic | Self::H3 => None,
-            Self::UdpIncoming => Some(ClientProto::Udp),
-            Self::TcpIncoming => Some(ClientProto::Tcp),
-        }
+        None
+    }
+}
+
+fn format_upstream_addr(ep: &UpstreamEndpoint) -> String {
+    let default_port = ep.proto.default_port();
+    let host = if ep.addr.port() == default_port {
+        ep.addr.ip().to_string()
+    } else {
+        ep.addr.to_string()
+    };
+    match ep.proto {
+        UpstreamProto::Udp => format!("udp://{host}"),
+        UpstreamProto::Tcp => format!("tcp://{host}"),
+        UpstreamProto::Tls => format!("tls://{host}"),
+        UpstreamProto::Https => format!("https://{host}{}", ep.path.as_deref().unwrap_or("/dns-query")),
+        UpstreamProto::Quic => format!("quic://{host}"),
+        UpstreamProto::H3 => format!("h3://{host}{}", ep.path.as_deref().unwrap_or("/dns-query")),
     }
 }
 
@@ -230,8 +243,6 @@ impl UpstreamPool {
         let mut https = 0usize;
         let mut quic = 0usize;
         let mut h3 = 0usize;
-        let mut udp_incoming = 0usize;
-        let mut tcp_incoming = 0usize;
         for (idx, endpoint) in addrs.iter().cloned().enumerate() {
             match endpoint.proto {
                 UpstreamProto::Udp => udp += 1,
@@ -240,31 +251,12 @@ impl UpstreamPool {
                 UpstreamProto::Https => https += 1,
                 UpstreamProto::Quic => quic += 1,
                 UpstreamProto::H3 => h3 += 1,
-                UpstreamProto::UdpIncoming => udp_incoming += 1,
-                UpstreamProto::TcpIncoming => tcp_incoming += 1,
             }
 
             let node_name = format!("{name}-{idx}");
-            let node_addr_display = match endpoint.proto {
-                UpstreamProto::Udp | UpstreamProto::UdpIncoming => endpoint.addr.to_string(),
-                UpstreamProto::Tcp | UpstreamProto::TcpIncoming => {
-                    format!("tcp://{}", endpoint.addr)
-                }
-                UpstreamProto::Tls => format!("tls://{}", endpoint.addr),
-                UpstreamProto::Https => format!(
-                    "https://{}{}",
-                    endpoint.addr,
-                    endpoint.path.as_deref().unwrap_or("/dns-query")
-                ),
-                UpstreamProto::Quic => format!("quic://{}", endpoint.addr),
-                UpstreamProto::H3 => format!(
-                    "h3://{}{}",
-                    endpoint.addr,
-                    endpoint.path.as_deref().unwrap_or("/dns-query")
-                ),
-            };
+            let node_addr_display = format_upstream_addr(&endpoint);
             let transport = match endpoint.proto {
-                UpstreamProto::Udp | UpstreamProto::UdpIncoming => {
+                UpstreamProto::Udp => {
                     let udp_upstream = UdpUpstream::create(
                         node_name,
                         endpoint.addr,
@@ -277,7 +269,7 @@ impl UpstreamPool {
                     .await?;
                     UpstreamTransport::Udp(udp_upstream)
                 }
-                UpstreamProto::Tcp | UpstreamProto::TcpIncoming => {
+                UpstreamProto::Tcp => {
                     UpstreamTransport::Tcp(Arc::new(TcpMux::new(
                         node_name,
                         endpoint.addr,
@@ -429,40 +421,20 @@ impl UpstreamPool {
             if h3 > 0 {
                 msg.push_str(&format!(" h3={h3}"));
             }
-            if udp_incoming > 0 {
-                msg.push_str(&format!(" udp_in={udp_incoming}"));
-            }
-            if tcp_incoming > 0 {
-                msg.push_str(&format!(" tcp_in={tcp_incoming}"));
-            }
-            if udp > 0 || udp_incoming > 0 {
+            if udp > 0 {
                 msg.push_str(&format!(" udp_pool={}", cfg.udp_pool_size));
             }
             crate::startup!("{msg}");
         }
         // Build a human-readable display string for the upstream addresses.
-        let addr_display: Arc<str> = {
-            let parts: Vec<String> = addrs
+        let addr_display: Arc<str> = Arc::from(
+            addrs
                 .iter()
-                .map(|ep| match ep.proto {
-                    UpstreamProto::Udp | UpstreamProto::UdpIncoming => ep.addr.to_string(),
-                    UpstreamProto::Tcp | UpstreamProto::TcpIncoming => format!("tcp://{}", ep.addr),
-                    UpstreamProto::Tls => format!("tls://{}", ep.addr),
-                    UpstreamProto::Https => format!(
-                        "https://{}{}",
-                        ep.addr,
-                        ep.path.as_deref().unwrap_or("/dns-query")
-                    ),
-                    UpstreamProto::Quic => format!("quic://{}", ep.addr),
-                    UpstreamProto::H3 => format!(
-                        "h3://{}{}",
-                        ep.addr,
-                        ep.path.as_deref().unwrap_or("/dns-query")
-                    ),
-                })
-                .collect();
-            Arc::from(parts.join(", ").as_str())
-        };
+                .map(format_upstream_addr)
+                .collect::<Vec<_>>()
+                .join(", ")
+                .as_str(),
+        );
 
         Ok(Self {
             nodes,

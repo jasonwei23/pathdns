@@ -102,7 +102,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         for &addr in &state.cfg.querylog.bind {
             let api_listener = crate::listener::bind_tcp_listener(addr)
                 .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
-            startup!("listening web=http://{addr}");
+            log_info!("listening web=http://{addr}");
             tokio::spawn(crate::querylog::api::serve(
                 api_listener,
                 state.cfg.querylog.token.clone(),
@@ -119,7 +119,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         for &addr in &state.cfg.querylog.bind {
             let api_listener = crate::listener::bind_tcp_listener(addr)
                 .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
-            startup!("listening web=http://{addr}");
+            log_info!("listening web=http://{addr}");
             tokio::spawn(crate::querylog::api::serve(
                 api_listener,
                 state.cfg.querylog.token.clone(),
