@@ -16,7 +16,8 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - Encrypted transports: `tls://` (DoT), `https://` (DoH, HTTP/2 via ALPN), `quic://` (DoQ, RFC 9250), `h3://` (DoH/HTTP3).
 - Persistent mux connections for TCP/TLS upstreams with automatic reconnect.
 - DNS cache with per-RR independent TTL countdown, negative TTL capping (RFC 2308 §5), stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
-- EDNS-aware cache isolation: responses are keyed by EDNS variant (DO bit, EDNS version, ECS subnet) so DO=0 and DO=1 clients never share cache entries.
+- EDNS-aware cache isolation: responses are keyed by EDNS variant (DO bit, EDNS version, ECS subnet) so DO=0 and DO=1 clients never share cache entries. When an upstream uses `ecs=strip`, all clients share one cache entry regardless of their ECS subnet (ECS-normalized cache key).
+- DNS 0x20 QNAME case randomization: outgoing queries apply random per-letter capitalisation to the QNAME and verify the server echoes the same case back, adding ~16 bits of entropy against cache-poisoning attacks.
 - Upstream response size cap: configurable per-byte limit rejects oversized TCP/TLS frames before they reach the cache.
 - TCP connection limit and per-frame read timeouts guard against slowloris-style attacks.
 - Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
@@ -374,7 +375,7 @@ Each event is a JSON object:
 
 | Parameter | Effect |
 |-----------|--------|
-| `?ecs=strip` | Remove EDNS Client Subnet before forwarding (default) |
+| `?ecs=strip` | Remove EDNS Client Subnet before forwarding (default). All clients share one cache entry regardless of their ECS subnet. |
 | `?ecs=forward` | Forward ECS unchanged |
 | `?ecs=1.2.3.0/24` | Replace ECS with a fixed subnet |
 
