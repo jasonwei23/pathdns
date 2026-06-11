@@ -269,13 +269,20 @@ fn load_geosite(cfg: &Config, needed_tags: &HashSet<String>) -> Result<Option<Ar
     Ok(Some(Arc::new(db)))
 }
 
-fn listeners_summary(cfg: &Config) -> &'static str {
-    match (cfg.listen_udp, cfg.listen_tcp) {
-        (true, true) => "udp,tcp",
-        (true, false) => "udp",
-        (false, true) => "tcp",
-        (false, false) => "none",
-    }
+fn listeners_summary(cfg: &Config) -> String {
+    cfg.bind
+        .iter()
+        .map(|ep| {
+            let proto = match (ep.udp, ep.tcp) {
+                (true, true) => "udp+tcp",
+                (true, false) => "udp",
+                (false, true) => "tcp",
+                (false, false) => "none",
+            };
+            format!("{proto}://{}", ep.addr)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn spawn_reload_watchers(state: Arc<AppState>) {
@@ -484,21 +491,19 @@ impl RefreshGate {
 
 #[cfg(unix)]
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
-    if !state.cfg.listen_udp && !state.cfg.listen_tcp {
+    if !state.cfg.bind.iter().any(|ep| ep.udp || ep.tcp) {
         return Err(anyhow!("at least one bind protocol is required"));
     }
-    let proto = listeners_summary(&state.cfg);
-    let addrs = state.cfg.bind.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
-    crate::startup!("listening dns=[{addrs}] proto={proto}");
+    crate::startup!("listening dns=[{}]", listeners_summary(&state.cfg));
     let mut set = tokio::task::JoinSet::new();
-    for &addr in &state.cfg.bind {
-        if state.cfg.listen_udp {
+    for &ep in &state.cfg.bind {
+        if ep.udp {
             let s = state.clone();
-            set.spawn(async move { listener::serve_udp(addr, s).await });
+            set.spawn(async move { listener::serve_udp(ep.addr, s).await });
         }
-        if state.cfg.listen_tcp {
+        if ep.tcp {
             let s = state.clone();
-            set.spawn(async move { listener::serve_tcp(addr, s).await });
+            set.spawn(async move { listener::serve_tcp(ep.addr, s).await });
         }
     }
     // Return as soon as any listener exits (error or unexpected shutdown).

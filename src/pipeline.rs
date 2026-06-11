@@ -183,7 +183,6 @@ pub(crate) fn try_fast_path(
                 source: if hit.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(hit.group_id, state),
                 answer_ips: smallvec::SmallVec::new(),
-                error: None,
             });
         }
         return FastPathOutcome::Response {
@@ -262,7 +261,6 @@ pub(crate) fn try_fast_path_into(
                 source: if meta.is_stale { "stale" } else { "cache" },
                 group: group_id_to_name(meta.group_id, state),
                 answer_ips: smallvec::SmallVec::new(),
-                error: None,
             });
         }
         let resp = send_buf.split().freeze();
@@ -353,7 +351,7 @@ async fn handle_packet_slow_with_info(
                             info,
                             origin: QueryOrigin::Client { peer, proto },
                         };
-                        emit_slow_event(&ctx, &state, resp, "overload", None, None, 0);
+                        emit_slow_event(&ctx, &state, resp, "overload", None, 0);
                     }
                     return Ok(servfail);
                 }
@@ -402,7 +400,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
                 .fetch_add(1, Ordering::Relaxed);
             let resp =
                 dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
-            emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
+            emit_slow_event(&ctx, state, &resp, "null", None, 0);
             return Ok(resp);
         }
     }
@@ -414,7 +412,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
             .null_responses
             .fetch_add(1, Ordering::Relaxed);
         let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
-        emit_slow_event(&ctx, state, &resp, "null", None, None, 0);
+        emit_slow_event(&ctx, state, &resp, "null", None, 0);
         return Ok(resp);
     };
 
@@ -523,7 +521,6 @@ async fn exchange_with_dedupe(
                     &resp,
                     "filtered",
                     Some(Arc::from(g.name.as_str())),
-                    None,
                     0,
                 );
             }
@@ -561,7 +558,6 @@ async fn exchange_with_dedupe(
                     &servfail,
                     "singleflight",
                     Some(Arc::from(target.group_name())),
-                    None,
                     elapsed,
                 );
                 return Ok(servfail);
@@ -576,7 +572,6 @@ async fn exchange_with_dedupe(
                     &servfail,
                     "singleflight",
                     Some(Arc::from(target.group_name())),
-                    None,
                     elapsed,
                 );
                 return Ok(servfail);
@@ -601,7 +596,6 @@ async fn exchange_with_dedupe(
             &resp,
             "singleflight",
             Some(Arc::from(target.group_name())),
-            None,
             elapsed,
         );
         return Ok(resp);
@@ -651,7 +645,6 @@ async fn exchange_with_dedupe(
                     &stale_pkt,
                     "stale",
                     Some(Arc::from(group_name)),
-                    None,
                     elapsed,
                 );
                 let refresh = CacheRefresh {
@@ -689,7 +682,6 @@ async fn exchange_with_dedupe(
                         &stale,
                         "stale",
                         Some(Arc::from(group_name)),
-                        None,
                         elapsed,
                     );
                     return Ok(stale);
@@ -749,7 +741,6 @@ async fn exchange_with_dedupe(
                 &resp,
                 "upstream",
                 Some(Arc::from(group_name)),
-                None,
                 elapsed,
             );
             Ok(resp)
@@ -773,7 +764,6 @@ async fn exchange_with_dedupe(
                         &stale,
                         "stale",
                         Some(Arc::from(group_name)),
-                        None,
                         elapsed,
                     );
                     return Ok(stale);
@@ -806,7 +796,6 @@ async fn exchange_with_dedupe(
                 &servfail,
                 "upstream",
                 Some(Arc::from(group_name)),
-                Some(Arc::from(err.to_string().as_str())),
                 elapsed,
             );
             Ok(servfail)
@@ -847,7 +836,6 @@ fn emit_slow_event(
     resp: &Bytes,
     source: &'static str,
     group: Option<Arc<str>>,
-    error: Option<Arc<str>>,
     elapsed_us: u64,
 ) {
     let Some((peer, _proto)) = ctx.client() else {
@@ -874,7 +862,6 @@ fn emit_slow_event(
         } else {
             smallvec::SmallVec::new()
         },
-        error,
     });
 }
 

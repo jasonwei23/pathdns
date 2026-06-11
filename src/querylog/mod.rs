@@ -63,7 +63,6 @@ pub struct QueryLogEvent {
     pub group: Option<Arc<str>>,
     #[serde(serialize_with = "ser_ip_list")]
     pub answer_ips: smallvec::SmallVec<[IpAddr; 4]>,
-    pub error: Option<Arc<str>>,
 }
 
 /// Owned counterpart of `QueryLogEvent` — used when decoding historical
@@ -82,7 +81,6 @@ pub struct DecodedEvent {
     pub source: String,
     pub group: Option<String>,
     pub answer_ips: Vec<String>,
-    pub error: Option<String>,
 }
 
 /// Return current Unix time as microseconds since epoch — cheap, no alloc.
@@ -351,7 +349,6 @@ mod tests {
             source: "cache",
             group: None,
             answer_ips: smallvec::SmallVec::new(),
-            error: None,
         }
     }
 

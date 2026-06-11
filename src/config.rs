@@ -183,11 +183,18 @@ pub struct QueryLogFileConfig {
     pub compress: bool,
 }
 
+/// One DNS listen address with its enabled protocols (from an optional
+/// `@udp`/`@tcp` suffix; both when no suffix is given).
+#[derive(Debug, Clone, Copy)]
+pub struct BindEndpoint {
+    pub addr: SocketAddr,
+    pub udp: bool,
+    pub tcp: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub bind: Vec<SocketAddr>,
-    pub listen_udp: bool,
-    pub listen_tcp: bool,
+    pub bind: Vec<BindEndpoint>,
     pub timeout: Duration,
     pub max_inflight: usize,
     /// 0 = hard-drop immediately; >0 = queue for up to this many ms before dropping.
@@ -258,7 +265,7 @@ impl Config {
     }
 
     pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
-        let (listen_udp, listen_tcp, bind_addrs) = parse_bind_config(json.bind)?;
+        let bind_addrs = parse_bind_config(json.bind)?;
 
         let worker_threads = json.worker_threads.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -389,8 +396,6 @@ impl Config {
 
         Ok(Self {
             bind: bind_addrs,
-            listen_udp,
-            listen_tcp,
             timeout: Duration::from_millis(json.timeout_ms.unwrap_or(3000)),
             max_inflight,
             inflight_queue_ms,
@@ -767,41 +772,49 @@ fn parse_groups(json_groups: Vec<JsonGroupEntry>) -> Result<Vec<GroupSpec>> {
     Ok(groups)
 }
 
-fn parse_bind_config(
-    value: Option<serde_json::Value>,
-) -> Result<(bool, bool, Vec<SocketAddr>)> {
+fn parse_bind_config(value: Option<serde_json::Value>) -> Result<Vec<BindEndpoint>> {
     match value {
         None => {
             let addr = parse_addr_with_default_port("127.0.0.1", 65353)?;
-            Ok((true, true, vec![addr]))
+            Ok(vec![BindEndpoint {
+                addr,
+                udp: true,
+                tcp: true,
+            }])
         }
-        Some(serde_json::Value::String(s)) => {
-            let (listen_udp, listen_tcp) = resolve_bind_proto(&s)?;
-            let addr_part = s.split_once('@').map_or(s.as_str(), |(a, _)| a);
-            let normalized = normalize_addr_with_default_port(addr_part, 65353);
-            let addr = parse_addr(&normalized)
-                .with_context(|| format!("invalid bind address: {addr_part}"))?;
-            Ok((listen_udp, listen_tcp, vec![addr]))
-        }
+        Some(serde_json::Value::String(s)) => Ok(vec![parse_bind_endpoint(&s)?]),
         Some(serde_json::Value::Array(arr)) => {
             if arr.is_empty() {
                 return Err(anyhow!("bind array must not be empty"));
             }
-            let mut addrs = Vec::with_capacity(arr.len());
+            let mut endpoints: Vec<BindEndpoint> = Vec::with_capacity(arr.len());
             for v in &arr {
                 let s = v
                     .as_str()
                     .ok_or_else(|| anyhow!("bind array elements must be strings"))?;
-                let addr_part = s.split_once('@').map_or(s, |(a, _)| a);
-                let normalized = normalize_addr_with_default_port(addr_part, 65353);
-                let addr = parse_addr(&normalized)
-                    .with_context(|| format!("invalid bind address: {addr_part}"))?;
-                addrs.push(addr);
+                let ep = parse_bind_endpoint(s)?;
+                // Duplicate addresses would silently double the SO_REUSEPORT
+                // shard count and split traffic unpredictably.
+                if endpoints.iter().any(|e| e.addr == ep.addr) {
+                    return Err(anyhow!("duplicate bind address: {}", ep.addr));
+                }
+                endpoints.push(ep);
             }
-            Ok((true, true, addrs))
+            Ok(endpoints)
         }
         _ => Err(anyhow!("bind must be a string or an array of strings")),
     }
+}
+
+/// Parse one bind entry: `addr[@udp|@tcp]`. The protocol suffix applies only
+/// to its own entry, so e.g. `["0.0.0.0:53@udp", "[::]:53"]` is valid.
+fn parse_bind_endpoint(raw: &str) -> Result<BindEndpoint> {
+    let (udp, tcp) = resolve_bind_proto(raw)?;
+    let addr_part = raw.split_once('@').map_or(raw, |(a, _)| a);
+    let normalized = normalize_addr_with_default_port(addr_part, 65353);
+    let addr = parse_addr(&normalized)
+        .with_context(|| format!("invalid bind address: {addr_part}"))?;
+    Ok(BindEndpoint { addr, udp, tcp })
 }
 
 fn resolve_bind_proto(raw: &str) -> Result<(bool, bool)> {
@@ -1256,6 +1269,39 @@ mod querylog_tests {
         );
         assert!(parse(
             r#"{"fallback":{"default-group":"null"},"querylog":{"file":{"max-segments":0}}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bind_string_with_proto_suffix() {
+        let cfg = parse(r#"{"fallback":{"default-group":"null"},"bind":"0.0.0.0:53@udp"}"#)
+            .unwrap();
+        assert_eq!(cfg.bind.len(), 1);
+        assert!(cfg.bind[0].udp);
+        assert!(!cfg.bind[0].tcp);
+    }
+
+    #[test]
+    fn bind_array_dual_stack_with_per_address_proto() {
+        let cfg = parse(
+            r#"{"fallback":{"default-group":"null"},
+                "bind":["0.0.0.0:53@udp", "[::]:53"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.bind.len(), 2);
+        assert!(cfg.bind[0].addr.is_ipv4());
+        assert!(cfg.bind[0].udp);
+        assert!(!cfg.bind[0].tcp, "@udp suffix in a bind array must disable tcp");
+        assert!(cfg.bind[1].addr.is_ipv6());
+        assert!(cfg.bind[1].udp);
+        assert!(cfg.bind[1].tcp);
+    }
+
+    #[test]
+    fn bind_array_rejects_invalid_proto_suffix() {
+        assert!(parse(
+            r#"{"fallback":{"default-group":"null"},"bind":["0.0.0.0:53@bogus"]}"#
         )
         .is_err());
     }

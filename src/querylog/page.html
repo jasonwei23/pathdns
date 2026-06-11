@@ -934,8 +934,6 @@ function renderQueryLog(events) {
       detailItem('Elapsed', fmtRtt(ev.elapsed_us)) +
       detailItem('Response', (ev.response_bytes||0) + ' bytes') +
       detailItem('Answer IPs', ips) +
-      detailItem('Upstream', ev.upstream) +
-      detailItem('Error', ev.error) +
       '</div></td>';
 
     tr.onclick = () => {

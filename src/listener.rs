@@ -282,6 +282,26 @@ fn create_reuse_port_socket(addr: SocketAddr, ty: libc::c_int) -> Result<libc::c
             return Err(err).with_context(|| format!("failed to set {name}"));
         }
     }
+    // Explicit IPV6_V6ONLY so behaviour does not depend on the system-wide
+    // net.ipv6.bindv6only sysctl: a v6 bind serves v6 only, and dual-stack is
+    // configured deliberately with `"bind": ["0.0.0.0:53", "[::]:53"]`.
+    // This also avoids an unpredictable v4-traffic split between a 0.0.0.0
+    // REUSEPORT group and a dual-stack [::] socket on the same port.
+    if addr.is_ipv6()
+        && unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&yes) as libc::socklen_t,
+            )
+        } < 0
+    {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err).context("failed to set IPV6_V6ONLY");
+    }
     Ok(fd)
 }
 

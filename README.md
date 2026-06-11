@@ -84,7 +84,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "group": [
     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"] },
     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
@@ -99,7 +99,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "group": [
     {
       "name": "domestic",
@@ -134,7 +134,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `bind` | string | `"127.0.0.1:65353"` | Listen address. Append `@udp` or `@tcp` to restrict protocol. |
+| `bind` | string or array | `"127.0.0.1:65353"` | Listen address(es). Append `@udp` or `@tcp` to restrict protocol per address. **IPv6 sockets are v6-only**: `"0.0.0.0:53"` does not accept IPv6 and `"[::]:53"` does not accept IPv4 — for dual-stack use `["0.0.0.0:53", "[::]:53"]`. |
 | `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
@@ -346,9 +346,7 @@ Each event is a JSON object:
   "response_bytes": 76,
   "source": "upstream",
   "group": "overseas",
-  "upstream": null,
-  "answer_ips": ["93.184.216.34"],
-  "error": null
+  "answer_ips": ["93.184.216.34"]
 }
 ```
 
@@ -433,7 +431,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     { "name": "domestic", "tag": ["cn"],           "upstream": ["223.5.5.5"] },
@@ -448,7 +446,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     {
@@ -479,7 +477,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     { "name": "null",     "tag": ["category-ads-all"] },

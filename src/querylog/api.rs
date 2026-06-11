@@ -455,7 +455,6 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
                 "source": ev.source,
                 "group": ev.group.as_deref(),
                 "answer_ips": answer_ips,
-                "error": ev.error.as_deref(),
             })
         })
         .collect();
@@ -482,7 +481,6 @@ fn render_history_events(events: &[super::DecodedEvent]) -> Vec<u8> {
                 "source": ev.source,
                 "group": ev.group,
                 "answer_ips": ev.answer_ips,
-                "error": ev.error,
             })
         })
         .collect();
