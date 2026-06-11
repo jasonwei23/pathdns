@@ -229,8 +229,13 @@ struct MsgpackFileState {
 impl MsgpackFileState {
     async fn open(cfg: &QueryLogFileConfig) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&cfg.dir).await?;
-        let name = segment_name();
-        let path = cfg.dir.join(&name);
+
+        // Reuse the most-recent plain segment if it is still below the size
+        // limit.  This avoids creating a new file on every restart, which
+        // would exhaust max_segments slots with empty / tiny files.
+        let reuse_path = find_resumable_segment(&cfg.dir, cfg.max_mb).await;
+        let path = reuse_path.unwrap_or_else(|| cfg.dir.join(segment_name()));
+
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -333,6 +338,30 @@ fn compress_to_gz(path: &Path) -> std::io::Result<()> {
 }
 
 // ── Segment naming ────────────────────────────────────────────────────────────
+
+/// Return the path of the most-recent plain `.msgpack` segment if it is still
+/// below the rotation threshold, so the worker can append to it on restart
+/// rather than creating a new file.
+async fn find_resumable_segment(dir: &Path, max_mb: u64) -> Option<PathBuf> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+    while let Some(e) = entries.next_entry().await.ok()? {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("querylog-") && name.ends_with(".msgpack") {
+            candidates.push(name);
+        }
+    }
+    // Lexicographic sort = chronological; take the newest.
+    candidates.sort();
+    let name = candidates.into_iter().next_back()?;
+    let path = dir.join(&name);
+    let size = tokio::fs::metadata(&path).await.ok()?.len();
+    if size < max_mb * 1_048_576 {
+        Some(path)
+    } else {
+        None
+    }
+}
 
 fn segment_name() -> String {
     let micros = SystemTime::now()
