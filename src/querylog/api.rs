@@ -294,7 +294,7 @@ async fn dispatch(
 
             match result {
                 Ok(Ok(events)) => {
-                    let body = serde_json::to_vec(&events).unwrap_or_default();
+                    let body = render_history_events(&events);
                     ("200 OK", body, "application/json")
                 }
                 _ => (
@@ -449,7 +449,6 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
                 "client_port": ev.client_port,
                 "qname": ev.qname.as_ref(),
                 "qtype": ev.qtype,
-                "qtype_name": super::qtype_name(ev.qtype),
                 "rcode": ev.rcode,
                 "elapsed_us": ev.elapsed_us,
                 "response_bytes": ev.response_bytes,
@@ -457,6 +456,33 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
                 "group": ev.group.as_deref(),
                 "answer_ips": answer_ips,
                 "error": ev.error.as_deref(),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&values).unwrap_or_default()
+}
+
+/// Render decoded history events using the same JSON shape as the live ring
+/// (notably `time` as RFC3339 rather than raw `unix_micros`) so the dashboard
+/// can render live and archive events through one code path.
+fn render_history_events(events: &[super::DecodedEvent]) -> Vec<u8> {
+    let values: Vec<_> = events
+        .iter()
+        .map(|ev| {
+            serde_json::json!({
+                "seq": ev.seq,
+                "time": micros_to_rfc3339(ev.unix_micros),
+                "client": ev.client,
+                "client_port": ev.client_port,
+                "qname": ev.qname,
+                "qtype": ev.qtype,
+                "rcode": ev.rcode,
+                "elapsed_us": ev.elapsed_us,
+                "response_bytes": ev.response_bytes,
+                "source": ev.source,
+                "group": ev.group,
+                "answer_ips": ev.answer_ips,
+                "error": ev.error,
             })
         })
         .collect();

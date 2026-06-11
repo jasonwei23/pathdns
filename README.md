@@ -341,7 +341,6 @@ Each event is a JSON object:
   "client_port": 51234,
   "qname": "example.com",
   "qtype": 1,
-  "qtype_name": "A",
   "rcode": 0,
   "elapsed_us": 1820,
   "response_bytes": 76,

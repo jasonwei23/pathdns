@@ -94,48 +94,6 @@ pub fn unix_micros_now() -> u64 {
         .as_micros() as u64
 }
 
-/// Map a DNS qtype number to a short human-readable name.
-pub fn qtype_name(qtype: u16) -> &'static str {
-    match qtype {
-        1 => "A",
-        2 => "NS",
-        5 => "CNAME",
-        6 => "SOA",
-        12 => "PTR",
-        15 => "MX",
-        16 => "TXT",
-        17 => "RP",
-        28 => "AAAA",
-        33 => "SRV",
-        35 => "NAPTR",
-        36 => "KX",
-        37 => "CERT",
-        39 => "DNAME",
-        43 => "DS",
-        44 => "SSHFP",
-        45 => "IPSECKEY",
-        46 => "RRSIG",
-        47 => "NSEC",
-        48 => "DNSKEY",
-        49 => "DHCID",
-        50 => "NSEC3",
-        51 => "NSEC3PARAM",
-        52 => "TLSA",
-        55 => "HIP",
-        59 => "CDS",
-        60 => "CDNSKEY",
-        61 => "OPENPGPKEY",
-        63 => "SMIMEA",
-        64 => "SVCB",
-        65 => "HTTPS",
-        99 => "SPF",
-        255 => "ANY",
-        256 => "URI",
-        257 => "CAA",
-        _ => "?",
-    }
-}
-
 // ── Counters ─────────────────────────────────────────────────────────────────
 
 /// Hot-path counters — always incremented, never blocked.
