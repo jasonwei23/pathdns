@@ -45,8 +45,6 @@
 //! }
 //! ```
 //!
-//! Legacy spellings `{"default-group": "<name>"}`, `{"default-group": "none", ...}`
-//! and `{"default-group": "null"}` remain accepted.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -121,17 +119,10 @@ pub(crate) struct JsonConfig {
 /// decided by ipset membership — if the primary's answer IPs are found in the
 /// configured ipset, the primary's answer is used, otherwise the secondary's.
 /// This is IP-policy routing, not a latency race, so at least one of
-/// `ipset-name4`/`ipset-name6` is required (except in the legacy
-/// `"default-group": "none"` spelling, which degrades to a pure race when no
-/// ipset is given).
+/// `ipset-name4`/`ipset-name6` is required.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonFallbackSection {
-    /// Legacy selector: `"none"` | `"null"` | a group name defined in `group`.
-    /// Optional — when omitted, a `primary`/`secondary`/`ipset-name*` set
-    /// selects ipset-test mode, and `"fallback": "<group>"` (string form)
-    /// routes to a group.
-    pub(crate) default_group: Option<String>,
     /// Ipset-test mode: group whose answer is preferred when its IPs are in the ipset.
     pub(crate) primary: Option<String>,
     /// Ipset-test mode: group whose answer is used when the primary's IPs are NOT in the ipset.

@@ -514,11 +514,8 @@ fn print_help() {
 ///   — **ipset-test mode**: both groups are queried concurrently (for latency),
 ///   but the upstream is *decided by ipset membership*: if the primary's answer
 ///   IPs are in the configured ipset, the primary's answer is used, otherwise
-///   the secondary's. This is IP-policy routing, not a latency race, so the new
-///   form requires at least one of `ipset-name4`/`ipset-name6`.
-/// - legacy object form with `"default-group": "<name>" | "none" | "null"`.
-///   Legacy `"none"` *without* ipset names degrades to a pure latency race
-///   (first non-SERVFAIL answer wins) and is kept only for compatibility.
+///   the secondary's. This is IP-policy routing, not a latency race, so at least
+///   one of `ipset-name4`/`ipset-name6` is required.
 fn parse_fallback_config(
     value: serde_json::Value,
     groups: &[GroupSpec],
@@ -541,76 +538,58 @@ fn parse_fallback_config(
         });
     }
 
+    // Object form: always ipset-test mode.
     let jf: crate::config_json::JsonFallbackSection = serde_json::from_value(value)
         .map_err(|e| anyhow!("invalid fallback section: {e}"))?;
 
-    let target = match jf.default_group.as_deref() {
-        Some("null") => FallbackTarget::Null,
-        // Ipset-test mode: a primary/secondary pair, or the legacy "none" selector.
-        Some("none") | None => {
-            // The new form omits "default-group" entirely.
-            let is_new_form = jf.default_group.is_none();
-            let primary = jf.primary.ok_or_else(|| {
-                anyhow!(
-                    "fallback: ipset-test mode requires \"primary\" \
-                     (to route to a single group use \"fallback\": \"<group>\")"
-                )
-            })?;
-            let secondary = jf
-                .secondary
-                .ok_or_else(|| anyhow!("fallback: ipset-test mode requires \"secondary\""))?;
-            if !group_exists(&primary) {
-                return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
-            }
-            if !group_exists(&secondary) {
-                return Err(anyhow!("fallback.secondary \"{secondary}\": no such group"));
-            }
-            if primary == secondary {
-                return Err(anyhow!(
-                    "fallback.primary and fallback.secondary must be different groups"
-                ));
-            }
-            let ipset = match (jf.ipset_name4, jf.ipset_name6) {
-                (None, None) => None,
-                (v4, v6) => {
-                    let pair = IpSetPair {
-                        v4: v4.filter(|s| !s.is_empty() && s != "null"),
-                        v6: v6.filter(|s| !s.is_empty() && s != "null"),
-                    };
-                    if pair.v4.is_none() && pair.v6.is_none() {
-                        None
-                    } else {
-                        Some(pair)
-                    }
-                }
+    let primary = jf.primary.ok_or_else(|| {
+        anyhow!(
+            "fallback: ipset-test mode requires \"primary\" \
+             (to route to a single group use \"fallback\": \"<group>\")"
+        )
+    })?;
+    let secondary = jf
+        .secondary
+        .ok_or_else(|| anyhow!("fallback: ipset-test mode requires \"secondary\""))?;
+    if !group_exists(&primary) {
+        return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
+    }
+    if !group_exists(&secondary) {
+        return Err(anyhow!("fallback.secondary \"{secondary}\": no such group"));
+    }
+    if primary == secondary {
+        return Err(anyhow!(
+            "fallback.primary and fallback.secondary must be different groups"
+        ));
+    }
+    let ipset = match (jf.ipset_name4, jf.ipset_name6) {
+        (None, None) => None,
+        (v4, v6) => {
+            let pair = IpSetPair {
+                v4: v4.filter(|s| !s.is_empty() && s != "null"),
+                v6: v6.filter(|s| !s.is_empty() && s != "null"),
             };
-            // The whole point of this mode is deciding the upstream by ipset
-            // membership of the primary's answer IPs. The new form therefore
-            // requires an ipset; only legacy "default-group": "none" may omit
-            // it (degrading to a pure latency race, kept for compatibility).
-            if is_new_form && ipset.is_none() {
-                return Err(anyhow!(
-                    "fallback: {{\"primary\", \"secondary\"}} requires \"ipset-name4\" \
-                     and/or \"ipset-name6\" — the primary's answer IPs are tested \
-                     against the ipset to decide which upstream's answer is used"
-                ));
+            if pair.v4.is_none() && pair.v6.is_none() {
+                None
+            } else {
+                Some(pair)
             }
-            FallbackTarget::None {
-                primary,
-                secondary,
-                ipset,
-            }
-        }
-        Some(name) => {
-            if !group_exists(name) {
-                return Err(anyhow!("fallback.default-group \"{name}\": no such group"));
-            }
-            FallbackTarget::Group(name.to_string())
         }
     };
+    if ipset.is_none() {
+        return Err(anyhow!(
+            "fallback: {{\"primary\", \"secondary\"}} requires \"ipset-name4\" \
+             and/or \"ipset-name6\" — the primary's answer IPs are tested \
+             against the ipset to decide which upstream's answer is used"
+        ));
+    }
 
     Ok(FallbackConfig {
-        target,
+        target: FallbackTarget::None {
+            primary,
+            secondary,
+            ipset,
+        },
         noip_as_primary_ip: jf.noip_as_primary_ip.unwrap_or(false),
     })
 }
@@ -1291,7 +1270,7 @@ mod querylog_tests {
 
     #[test]
     fn omitted_querylog_is_fully_disabled() {
-        let cfg = parse(r#"{"fallback":{"default-group":"null"}}"#).unwrap();
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
         assert!(!cfg.querylog.enabled);
         assert_eq!(cfg.querylog.memory, 0);
         assert!(cfg.querylog.bind.is_empty());
@@ -1300,7 +1279,7 @@ mod querylog_tests {
 
     #[test]
     fn present_querylog_uses_safe_defaults() {
-        let cfg = parse(r#"{"fallback":{"default-group":"null"},"querylog":{}}"#).unwrap();
+        let cfg = parse(r#"{"fallback":"null","querylog":{}}"#).unwrap();
         assert!(cfg.querylog.enabled);
         assert_eq!(cfg.querylog.memory, 1000);
         assert_eq!(cfg.querylog.channel, 4096);
@@ -1309,7 +1288,7 @@ mod querylog_tests {
 
     #[test]
     fn tcp_defaults_are_protective() {
-        let cfg = parse(r#"{"fallback":{"default-group":"null"}}"#).unwrap();
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
         assert_eq!(cfg.tcp_max_connections, 1024);
         assert_eq!(cfg.tcp_read_timeout_ms, 5000);
         assert_eq!(cfg.tcp_idle_timeout_ms, 30_000);
@@ -1318,7 +1297,7 @@ mod querylog_tests {
     #[test]
     fn tcp_zero_means_unlimited_or_disabled() {
         let cfg = parse(
-            r#"{"fallback":{"default-group":"null"},
+            r#"{"fallback":"null",
                 "tcp-max-connections":0,
                 "tcp-read-timeout-ms":0,
                 "tcp-idle-timeout-ms":0}"#,
@@ -1332,7 +1311,7 @@ mod querylog_tests {
     #[test]
     fn tcp_custom_values_are_accepted() {
         let cfg = parse(
-            r#"{"fallback":{"default-group":"null"},
+            r#"{"fallback":"null",
                 "tcp-max-connections":256,
                 "tcp-read-timeout-ms":2000,
                 "tcp-idle-timeout-ms":10000}"#,
@@ -1346,21 +1325,21 @@ mod querylog_tests {
     #[test]
     fn invalid_querylog_limits_are_rejected() {
         assert!(
-            parse(r#"{"fallback":{"default-group":"null"},"querylog":{"channel":0}}"#).is_err()
+            parse(r#"{"fallback":"null","querylog":{"channel":0}}"#).is_err()
         );
         assert!(
-            parse(r#"{"fallback":{"default-group":"null"},"querylog":{"file":{"max-mb":0}}}"#)
+            parse(r#"{"fallback":"null","querylog":{"file":{"max-mb":0}}}"#)
                 .is_err()
         );
         assert!(parse(
-            r#"{"fallback":{"default-group":"null"},"querylog":{"file":{"max-segments":0}}}"#
+            r#"{"fallback":"null","querylog":{"file":{"max-segments":0}}}"#
         )
         .is_err());
     }
 
     #[test]
     fn bind_string_with_proto_suffix() {
-        let cfg = parse(r#"{"fallback":{"default-group":"null"},"bind":"0.0.0.0:53@udp"}"#)
+        let cfg = parse(r#"{"fallback":"null","bind":"0.0.0.0:53@udp"}"#)
             .unwrap();
         assert_eq!(cfg.bind.len(), 1);
         assert!(cfg.bind[0].udp);
@@ -1370,7 +1349,7 @@ mod querylog_tests {
     #[test]
     fn bind_array_dual_stack_with_per_address_proto() {
         let cfg = parse(
-            r#"{"fallback":{"default-group":"null"},
+            r#"{"fallback":"null",
                 "bind":["0.0.0.0:53@udp", "[::]:53"]}"#,
         )
         .unwrap();
@@ -1386,7 +1365,7 @@ mod querylog_tests {
     #[test]
     fn bind_array_rejects_invalid_proto_suffix() {
         assert!(parse(
-            r#"{"fallback":{"default-group":"null"},"bind":["0.0.0.0:53@bogus"]}"#
+            r#"{"fallback":"null","bind":["0.0.0.0:53@bogus"]}"#
         )
         .is_err());
     }
@@ -1438,22 +1417,6 @@ mod querylog_tests {
                 "fallback":{"primary":"a","secondary":"b"}}"#,
         )
         .is_err());
-    }
-
-    #[test]
-    fn fallback_legacy_default_group_none_still_races_without_ipset() {
-        // Legacy "none" without ipset degrades to a latency race; kept for compat.
-        let cfg = parse(
-            r#"{"group":[
-                  {"name":"a","upstream":["1.1.1.1"]},
-                  {"name":"b","upstream":["8.8.8.8"]}],
-                "fallback":{"default-group":"none","primary":"a","secondary":"b"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            &cfg.fallback.target,
-            FallbackTarget::None { ipset: None, .. }
-        ));
     }
 
     #[test]

@@ -226,8 +226,6 @@ Route unmatched queries to the named group. `"fallback": "null"` returns empty r
 | `ipset-name6` | string | IPv6 ipset/nftset to test the primary's answer IPs against. |
 | `noip-as-primary-ip` | bool | Treat NODATA primary replies as if their IPs were in the set (default: `false`). |
 
-**Legacy form** (still accepted): `{"default-group": "<name>"}`, `{"default-group": "null"}`, and `{"default-group": "none", "primary": ..., "secondary": ...}` map to the forms above. Only the legacy `"none"` spelling may omit the ipset names, in which case it degrades to a pure latency race (first non-SERVFAIL answer wins).
-
 ### Cache
 
 ```json
