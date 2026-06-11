@@ -12,12 +12,12 @@ doq = ["dep:quinn"]
 h3 = ["doq", "dep:h3", "dep:h3-quinn", "dep:http"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
 anyhow = "1"
 bytes = "1"
 libc = "0.2"
 moka = { version = "0.12.12", features = ["sync"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 regex = "1"
 notify = "6"
@@ -29,6 +29,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 webpki-roots = "0.26"
 tikv-jemallocator = { version = "0.6", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2"] }
+rmp-serde = "1"
+flate2 = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"], optional = true }
 h3 = { version = "0.0", optional = true }
 h3-quinn = { version = "0.0", optional = true }

@@ -5,6 +5,7 @@
 
 use crate::server::{AppState, CustomGroup, ResolvedFallback};
 use crate::upstream::UpstreamPool;
+use std::sync::Arc;
 
 /// The upstream target selected for a query.
 #[derive(Clone, Copy)]
@@ -42,6 +43,25 @@ impl<'a> RouteTarget<'a> {
         match self {
             Self::Group(group) => group.upstream.as_ref(),
             Self::Race { .. } | Self::NoneIpSet { .. } => None,
+        }
+    }
+
+    /// Returns a human-readable display string for the upstream address(es), if any.
+    pub fn upstream_display(&self) -> Option<Arc<str>> {
+        match self {
+            Self::Group(group) => group.upstream.as_ref().map(|p| p.addr_display.clone()),
+            Self::Race { .. } | Self::NoneIpSet { .. } => None,
+        }
+    }
+
+    /// Returns true when every upstream in this target strips ECS, meaning all clients
+    /// can share a single cache entry keyed on the ECS-stripped variant.
+    pub fn strip_ecs(&self) -> bool {
+        match self {
+            Self::Group(g) => g.strip_ecs,
+            Self::Race { primary, secondary } | Self::NoneIpSet { primary, secondary } => {
+                primary.strip_ecs && secondary.strip_ecs
+            }
         }
     }
 }

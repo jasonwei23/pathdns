@@ -4,26 +4,31 @@
 //! It is parsed once at startup and consumed by `Config::from_json` in
 //! `config.rs`, which validates it and builds the `Config` struct.
 //!
-//! # Minimal example – default-group is a named group
+//! # Minimal example – fallback routes to a named group
 //!
 //! ```json
 //! {
-//!   "bind":          "0.0.0.0:53",
+//!   "bind":          ["0.0.0.0:53", "[::]:53"],
 //!   "geosite-file":  ["/etc/pathdns/geosite.dat"],
 //!   "group": [
 //!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"] },
 //!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
 //!   ],
-//!   "fallback": { "default-group": "domestic" },
+//!   "fallback": "domestic",
 //!   "cache": { "size": 10000 }
 //! }
 //! ```
 //!
-//! # Example – default-group "none" with primary/secondary and ipset
+//! # Example – ipset-test fallback (upstream decided by ipset membership)
+//!
+//! The primary's answer IPs are tested against the ipset: in the set → use the
+//! primary's answer; not in the set → use the secondary's. Both groups are
+//! queried concurrently only to hide latency — this is IP-policy routing, not
+//! a race, so `ipset-name4`/`ipset-name6` are required in this form.
 //!
 //! ```json
 //! {
-//!   "bind":         "0.0.0.0:53",
+//!   "bind":         ["0.0.0.0:53", "[::]:53"],
 //!   "geosite-file": ["/etc/pathdns/geosite.dat"],
 //!   "group": [
 //!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"],
@@ -31,7 +36,6 @@
 //!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
 //!   ],
 //!   "fallback": {
-//!     "default-group": "none",
 //!     "primary":       "domestic",
 //!     "secondary":     "overseas",
 //!     "ipset-name4":   "mainroute",
@@ -40,6 +44,7 @@
 //!   "cache": { "size": 10000 }
 //! }
 //! ```
+//!
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -64,20 +69,28 @@ pub(crate) struct JsonGroupCacheSection {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonConfig {
-    // Listener
-    pub(crate) bind: Option<String>,
+    // Listener — accepts a single address string or an array of address strings.
+    pub(crate) bind: Option<serde_json::Value>,
     pub(crate) worker_threads: Option<usize>,
-    pub(crate) verbose: Option<bool>,
-    pub(crate) metrics_addr: Option<String>,
+
+    // Query log / dashboard
+    pub(crate) querylog: Option<JsonQueryLogSection>,
 
     // Upstreams / transport
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) udp_buf_size: Option<usize>,
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
+    pub(crate) upstream_max_response_bytes: Option<usize>,
     pub(crate) max_inflight: Option<usize>,
     pub(crate) inflight_queue_ms: Option<u64>,
     pub(crate) hedge_delay_ms: Option<u64>,
+    /// Maximum concurrent TCP client connections. 0 = unlimited.
+    pub(crate) tcp_max_connections: Option<usize>,
+    /// Timeout (ms) for reading the DNS message body after the 2-byte length prefix. 0 = disabled.
+    pub(crate) tcp_read_timeout_ms: Option<u64>,
+    /// Timeout (ms) for receiving the next request on an idle TCP connection. 0 = disabled.
+    pub(crate) tcp_idle_timeout_ms: Option<u64>,
 
     // GeoSite
     pub(crate) geosite_file: Option<Vec<String>>,
@@ -96,21 +109,27 @@ pub(crate) struct JsonConfig {
     pub(crate) group: Option<Vec<JsonGroupEntry>>,
 
     /// Fallback routing when no group matches. Required.
-    pub(crate) fallback: Option<JsonFallbackSection>,
+    /// Either a string (group name, or `"null"` for empty responses) or an
+    /// object (see `JsonFallbackSection`).
+    pub(crate) fallback: Option<serde_json::Value>,
 }
 
+/// The object form of `fallback` configures **ipset-test mode**: both groups
+/// are queried concurrently (for latency), but the answer that is returned is
+/// decided by ipset membership — if the primary's answer IPs are found in the
+/// configured ipset, the primary's answer is used, otherwise the secondary's.
+/// This is IP-policy routing, not a latency race, so at least one of
+/// `ipset-name4`/`ipset-name6` is required.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonFallbackSection {
-    /// `"none"` | `"null"` | a group name defined in `group`.
-    pub(crate) default_group: String,
-    /// Required when `default-group` is `"none"`: primary upstream group name.
+    /// Ipset-test mode: group whose answer is preferred when its IPs are in the ipset.
     pub(crate) primary: Option<String>,
-    /// Required when `default-group` is `"none"`: secondary upstream group name.
+    /// Ipset-test mode: group whose answer is used when the primary's IPs are NOT in the ipset.
     pub(crate) secondary: Option<String>,
-    /// IPv4 nftset/ipset name for IP-based routing in `"none"` fallback.
+    /// IPv4 nftset/ipset name the primary's answer IPs are tested against.
     pub(crate) ipset_name4: Option<String>,
-    /// IPv6 nftset/ipset name for IP-based routing in `"none"` fallback.
+    /// IPv6 nftset/ipset name the primary's answer IPs are tested against.
     pub(crate) ipset_name6: Option<String>,
     /// Treat NODATA primary replies as primary IPs for routing decisions.
     pub(crate) noip_as_primary_ip: Option<bool>,
@@ -157,6 +176,38 @@ pub(crate) struct JsonGroupEntry {
     pub(crate) cache: Option<JsonGroupCacheSection>,
     /// Accept both integer and array of integers.
     pub(crate) filter_qtype: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct JsonQueryLogSection {
+    /// HTTP API listen address(es): a string or an array of strings
+    /// (e.g. `["0.0.0.0:8080", "[::]:8080"]` for dual-stack).
+    pub(crate) bind: Option<serde_json::Value>,
+    pub(crate) token: Option<String>,
+    /// In-memory ring capacity. 0 = disable event collection (counters still active).
+    pub(crate) memory: Option<usize>,
+    /// mpsc channel depth.
+    pub(crate) channel: Option<usize>,
+    /// Extract A/AAAA answer IPs into each event. Disabled by default.
+    pub(crate) answer_ips: Option<bool>,
+    pub(crate) file: Option<JsonQueryLogFile>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct JsonQueryLogFile {
+    pub(crate) dir: Option<String>,
+    pub(crate) max_mb: Option<u64>,
+    pub(crate) max_segments: Option<usize>,
+    /// Maximum events to accumulate before one write call (default 256).
+    pub(crate) batch_size: Option<usize>,
+    /// How often the worker flushes the OS buffer in ms (default 500).
+    pub(crate) flush_interval_ms: Option<u64>,
+    /// Delete compressed segments older than this many days.
+    pub(crate) retention_days: Option<u32>,
+    /// Gzip-compress segments after rotation (default true).
+    pub(crate) compress: Option<bool>,
 }
 
 /// Parse a JSON config file and return the `JsonConfig` struct.

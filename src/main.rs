@@ -13,9 +13,9 @@ mod ipset;
 #[cfg(unix)]
 mod listener;
 mod log;
-mod metrics;
 mod persist;
 mod pipeline;
+mod querylog;
 mod router;
 mod routing_index;
 mod server;
@@ -37,7 +37,6 @@ fn main() {
 
 fn run() -> Result<()> {
     let cfg = Config::parse_args()?;
-    log::configure(cfg.verbose);
     let worker_threads = cfg.worker_threads.max(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -50,17 +49,97 @@ fn run() -> Result<()> {
 }
 
 async fn async_main(cfg: Config) -> Result<()> {
-    let (app_state, refresh_rx) = server::AppState::new(cfg).await?;
+    // Build querylog handle before AppState so it can be threaded in.
+    let ql_cfg = crate::querylog::QueryLogConfig {
+        enabled: cfg.querylog.enabled,
+        memory: cfg.querylog.memory,
+        channel: cfg.querylog.channel,
+        answer_ips: cfg.querylog.answer_ips,
+        file: cfg
+            .querylog
+            .file
+            .as_ref()
+            .map(|f| crate::querylog::QueryLogFileConfig {
+                dir: f.dir.clone(),
+                max_mb: f.max_mb,
+                max_segments: f.max_segments,
+                batch_size: f.batch_size,
+                flush_interval_ms: f.flush_interval_ms,
+                retention_days: f.retention_days,
+                compress: f.compress,
+            }),
+    };
+    let (ql_handle, ql_worker, qps_ring, stats_ring, ql_shutdown) = crate::querylog::build(ql_cfg);
+
+    let (app_state, refresh_rx) = server::AppState::new(cfg, ql_handle.clone()).await?;
     let state = Arc::new(app_state);
+    if state
+        .cfg
+        .querylog
+        .bind
+        .iter()
+        .any(|addr| !addr.ip().is_loopback())
+        && state.cfg.querylog.token.is_none()
+    {
+        eprintln!("warn: web dashboard is exposed without authentication");
+    }
     pipeline::spawn_refresh_worker(state.clone(), refresh_rx);
     server::spawn_reload_watchers(state.clone());
 
-    if let Some(addr) = state.cfg.metrics_addr {
-        let s = state.clone();
-        tokio::spawn(async move {
-            metrics::serve_metrics(addr, s).await;
-        });
+    let mut ql_worker_task = None;
+    if let Some(ws) = ql_worker {
+        let ring = ws.ring.clone();
+        let api_ring = ring.clone();
+
+        ql_worker_task = Some(tokio::spawn(crate::querylog::worker::run(
+            ws.rx,
+            ws.ring,
+            ws.counters,
+            ws.file_cfg,
+            ws.shutdown,
+        )));
+
+        for &addr in &state.cfg.querylog.bind {
+            let api_listener = crate::listener::bind_tcp_listener(addr)
+                .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
+            startup!("listening web=http://{addr}");
+            tokio::spawn(crate::querylog::api::serve(
+                api_listener,
+                state.cfg.querylog.token.clone(),
+                api_ring.clone(),
+                qps_ring.clone(),
+                stats_ring.clone(),
+                ql_handle.clone(),
+                state.clone(),
+            ));
+        }
+    } else if !state.cfg.querylog.bind.is_empty() {
+        // No collection (memory=0) but still serve API for stats.
+        let api_ring = std::sync::Arc::new(crate::querylog::ring::EventRing::new(0));
+        for &addr in &state.cfg.querylog.bind {
+            let api_listener = crate::listener::bind_tcp_listener(addr)
+                .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
+            startup!("listening web=http://{addr}");
+            tokio::spawn(crate::querylog::api::serve(
+                api_listener,
+                state.cfg.querylog.token.clone(),
+                api_ring.clone(),
+                qps_ring.clone(),
+                stats_ring.clone(),
+                ql_handle.clone(),
+                state.clone(),
+            ));
+        }
     }
+
+    let qps_task = (!state.cfg.querylog.bind.is_empty()).then(|| {
+        tokio::spawn(crate::querylog::worker::run_qps_sampler(
+            qps_ring.clone(),
+            stats_ring.clone(),
+            ql_handle.counters.clone(),
+            ql_shutdown.subscribe(),
+        ))
+    });
 
     if state.cfg.cache_persist_interval > 0 {
         if let Some(path) = state.cfg.cache_persist_path.clone() {
@@ -74,15 +153,26 @@ async fn async_main(cfg: Config) -> Result<()> {
                 ticker.tick().await; // skip immediate first tick
                 loop {
                     ticker.tick().await;
-                    match s.cache.save_to_file(&path, fp) {
-                        Ok(n) => startup!("cache persist=saved entries={n}"),
-                        Err(e) => startup!("cache persist=save_failed error={e:#}"),
-                    }
-                    if s.verdict_cache.enabled() {
-                        match s.verdict_cache.save_to_file(&vpath, fp) {
-                            Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
-                            Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
+                    let save_state = s.clone();
+                    let save_path = path.clone();
+                    let save_vpath = vpath.clone();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        match save_state.cache.save_to_file(&save_path, fp) {
+                            Ok(n) => startup!("cache persist=saved entries={n}"),
+                            Err(e) => startup!("cache persist=save_failed error={e:#}"),
                         }
+                        if save_state.verdict_cache.enabled() {
+                            match save_state.verdict_cache.save_to_file(&save_vpath, fp) {
+                                Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
+                                Err(e) => {
+                                    startup!("verdict_cache persist=save_failed error={e:#}")
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    {
+                        crate::warn!("cache persist=task_failed error={e}");
                     }
                 }
             });
@@ -112,6 +202,24 @@ async fn async_main(cfg: Config) -> Result<()> {
             Ok(())
         }
     };
+
+    let _ = ql_shutdown.send(true);
+    if let Some(mut task) = ql_worker_task.take() {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+    if let Some(mut task) = qps_task {
+        if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
 
     if let Some(path) = &state.cfg.cache_persist_path {
         let fp = config::cache_fingerprint(&state.cfg);

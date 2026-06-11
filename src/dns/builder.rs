@@ -38,9 +38,11 @@ impl ResponseBuilder {
     }
 }
 
-/// NOERROR response with no answer records (used for qtype-filtered queries).
+/// NOERROR response with no answer records (used for null-group and qtype-filtered queries).
 pub fn empty_reply(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
-    Ok(ResponseBuilder::from_query(query, question_end)?.finish())
+    let mut b = ResponseBuilder::from_query(query, question_end)?;
+    b.set_ra();
+    Ok(b.finish())
 }
 
 /// SERVFAIL response: RCODE=2, RA=1.
@@ -48,4 +50,26 @@ pub fn servfail_reply(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
     let mut b = ResponseBuilder::from_query(query, question_end)?;
     b.set_ra().set_rcode(2);
     Ok(b.finish())
+}
+
+/// NOTIMP response for a QUERY-opcode packet (question section is echoed back).
+pub fn notimp_reply(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
+    let mut b = ResponseBuilder::from_query(query, question_end)?;
+    b.set_ra().set_rcode(4);
+    Ok(b.finish())
+}
+
+/// NOTIMP response for non-QUERY opcodes. Only the transaction ID and OPCODE
+/// are echoed; the question section is omitted because non-QUERY opcode formats
+/// are not guaranteed to follow RFC 1035 question layout.
+pub fn notimp_opcode_reply(query: &[u8]) -> Vec<u8> {
+    if query.len() < 12 {
+        return vec![];
+    }
+    let mut buf = [0u8; 12];
+    buf[0] = query[0];
+    buf[1] = query[1];
+    buf[2] = 0x80 | (query[2] & 0x79); // QR=1, OPCODE and RD copied, AA=0, TC=0
+    buf[3] = 0x84;                       // RA=1, RCODE=4 (NOTIMP)
+    buf.to_vec()
 }

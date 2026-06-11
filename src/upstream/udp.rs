@@ -7,8 +7,10 @@ use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
+
+const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
 pub(super) struct UdpUpstream {
     pub(super) name: String,
@@ -52,7 +54,6 @@ impl UdpUpstream {
             super::set_socket_buf_size(&socket, buf_size);
             sockets.push(Arc::new(socket));
         }
-        crate::verbose!("upstream name={name} proto=udp remote={remote} pool={pool_size}");
         let upstream = Arc::new(Self {
             name,
             remote,
@@ -67,7 +68,6 @@ impl UdpUpstream {
             tokio::spawn(async move {
                 let mut delay_ms = 50u64;
                 while let Err(err) = u.clone().recv_loop(i).await {
-                    crate::stats::inc_udp_recv_restart();
                     crate::log_error!(
                         "upstream name={} event=recv_loop_exit error={err:#} restarting_in={delay_ms}ms",
                         u.name
@@ -81,7 +81,6 @@ impl UdpUpstream {
     }
 
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
-        let started = Instant::now();
         let raw_packet = apply_ecs_mode(&req.packet, &self.ecs_mode);
         let mut packet = BytesMut::from(raw_packet.as_ref());
         let question = req.question.clone(); // keep a copy for TC-fallback validation
@@ -90,47 +89,43 @@ impl UdpUpstream {
                 .register(&self.name, req.client_id, req.question)?;
         dns::set_id(&mut packet, upstream_id)?;
 
+        // Apply 0x20 QNAME case mixing.
+        let q_end = 12 + question.len();
+        let seed_0x20 = upstream_id as u64
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_micros() as u64)
+                .unwrap_or(0));
+        dns::mix_qname_case(&mut packet, q_end, seed_0x20);
+
         let socket_idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
         let socket = &self.sockets[socket_idx];
 
         if let Err(err) = socket.send(&packet).await {
-            crate::verbose!(
-                "upstream name={} proto=udp remote={} event=send_failed elapsed_us={} error={err}",
-                self.name,
-                self.remote,
-                started.elapsed().as_micros()
-            );
             return Err(err.into());
         }
-        crate::verbose!(
-            "upstream name={} proto=udp remote={} event=send",
-            self.name,
-            self.remote
-        );
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(resp)) => {
+                // Verify 0x20 case echo before checking TC.
+                if let Some(resp_qend) = dns::question_end(&resp) {
+                    if !dns::verify_qname_case_echo(packet.as_ref(), q_end, &resp, resp_qend) {
+                        return Err(anyhow!(
+                            "upstream {}: 0x20 QNAME case mismatch (possible spoof)",
+                            self.name
+                        ));
+                    }
+                }
                 if dns::is_truncated(&resp) {
-                    crate::stats::inc_tc_fallback();
                     match tcp_exchange_packet(self.remote, &packet, self.timeout, &self.name).await
                     {
                         Ok(mut tcp_resp) => {
-                            super::validate_upstream_response(
-                                &tcp_resp,
-                                upstream_id,
-                                &question,
-                            )
-                            .map_err(|e| {
-                                anyhow!("upstream {}: TCP fallback {e}", self.name)
-                            })?;
+                            super::validate_upstream_response(&tcp_resp, upstream_id, &question)
+                                .map_err(|e| anyhow!("upstream {}: TCP fallback {e}", self.name))?;
                             dns::set_id(&mut tcp_resp, req.client_id)?;
                             return Ok(Bytes::from(tcp_resp));
                         }
                         Err(err) => {
-                            crate::verbose!(
-                                "upstream name={} event=tcp_fallback_failed error={err:#}",
-                                self.name
-                            );
                             return Err(err);
                         }
                     }
@@ -138,26 +133,18 @@ impl UdpUpstream {
                 Ok(resp)
             }
             Ok(Err(_closed)) => Err(anyhow!("upstream {} response channel closed", self.name)),
-            Err(_elapsed) => {
-                crate::verbose!(
-                    "upstream name={} proto=udp remote={} event=timeout elapsed_us={}",
-                    self.name,
-                    self.remote,
-                    started.elapsed().as_micros()
-                );
-                Err(anyhow!("upstream {} timeout: {}", self.name, self.remote))
-            }
+            Err(_elapsed) => Err(anyhow!("upstream {} timeout: {}", self.name, self.remote)),
         }
     }
 
     async fn recv_loop(self: Arc<Self>, socket_idx: usize) -> Result<()> {
         let socket = &self.sockets[socket_idx];
-        let mut buf = BytesMut::with_capacity(4096);
+        let mut buf = BytesMut::with_capacity(MAX_DNS_MESSAGE);
         let mut recv_count = 0u32;
         loop {
             buf.clear();
-            if buf.capacity() < 4096 {
-                buf.reserve(4096 - buf.capacity());
+            if buf.capacity() < MAX_DNS_MESSAGE {
+                buf.reserve(MAX_DNS_MESSAGE - buf.capacity());
             }
             let n = socket.recv_buf(&mut buf).await?;
             match self.inflight.complete(&mut buf, n) {
@@ -170,13 +157,7 @@ impl UdpUpstream {
                         tokio::task::yield_now().await;
                     }
                 }
-                Completion::Mismatch(id) => {
-                    crate::verbose!(
-                        "upstream name={} proto=udp remote={} event=question_mismatch id={id} — keeping inflight, dropping stale/spoofed response",
-                        self.name,
-                        self.remote
-                    );
-                }
+                Completion::Mismatch(_id) => {}
                 Completion::NoWaiter => {}
             }
         }

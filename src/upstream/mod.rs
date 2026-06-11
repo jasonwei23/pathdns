@@ -187,6 +187,10 @@ pub struct UpstreamPool {
     next: AtomicUsize,
     /// When `Some(δ)`, a second upstream is started after δ with no response.
     hedge_delay: Option<Duration>,
+    /// Human-readable string of upstream addresses (e.g. "119.29.29.29" or "tls://1.1.1.1, tcp://8.8.8.8").
+    pub addr_display: Arc<str>,
+    /// Optional querylog counters — used to increment hedged_queries when Phase 2 fires.
+    querylog_counters: Option<Arc<crate::querylog::QueryLogCounters>>,
 }
 
 pub(super) struct UpstreamRequest {
@@ -210,11 +214,15 @@ impl UpstreamProto {
             Self::TcpIncoming => Some(ClientProto::Tcp),
         }
     }
-
 }
 
 impl UpstreamPool {
-    pub async fn new(name: &str, addrs: &[UpstreamEndpoint], cfg: &UpstreamConfig) -> Result<Self> {
+    pub async fn new(
+        name: &str,
+        addrs: &[UpstreamEndpoint],
+        cfg: &UpstreamConfig,
+        querylog_counters: Option<Arc<crate::querylog::QueryLogCounters>>,
+    ) -> Result<Self> {
         let mut nodes = Vec::new();
         let mut udp = 0usize;
         let mut tcp = 0usize;
@@ -237,6 +245,24 @@ impl UpstreamPool {
             }
 
             let node_name = format!("{name}-{idx}");
+            let node_addr_display = match endpoint.proto {
+                UpstreamProto::Udp | UpstreamProto::UdpIncoming => endpoint.addr.to_string(),
+                UpstreamProto::Tcp | UpstreamProto::TcpIncoming => {
+                    format!("tcp://{}", endpoint.addr)
+                }
+                UpstreamProto::Tls => format!("tls://{}", endpoint.addr),
+                UpstreamProto::Https => format!(
+                    "https://{}{}",
+                    endpoint.addr,
+                    endpoint.path.as_deref().unwrap_or("/dns-query")
+                ),
+                UpstreamProto::Quic => format!("quic://{}", endpoint.addr),
+                UpstreamProto::H3 => format!(
+                    "h3://{}{}",
+                    endpoint.addr,
+                    endpoint.path.as_deref().unwrap_or("/dns-query")
+                ),
+            };
             let transport = match endpoint.proto {
                 UpstreamProto::Udp | UpstreamProto::UdpIncoming => {
                     let udp_upstream = UdpUpstream::create(
@@ -259,6 +285,7 @@ impl UpstreamPool {
                         MuxConnector::Tcp,
                         cfg.upstream_max_inflight,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_response_bytes,
                     )))
                 }
                 UpstreamProto::Tls => {
@@ -306,6 +333,7 @@ impl UpstreamPool {
                         },
                         cfg.upstream_max_inflight,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_response_bytes,
                     )))
                 }
                 UpstreamProto::Https => {
@@ -328,7 +356,7 @@ impl UpstreamPool {
                         path,
                         cfg.timeout,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
-                    )))
+                    )?))
                 }
                 UpstreamProto::Quic => {
                     let server_name = endpoint
@@ -378,6 +406,7 @@ impl UpstreamPool {
                 health: HealthStats::new(),
                 stats: NodeStats::new(),
                 last_selected: AtomicU64::new(0),
+                addr_display: node_addr_display,
             });
         }
         {
@@ -411,16 +440,36 @@ impl UpstreamPool {
             }
             crate::startup!("{msg}");
         }
-        crate::verbose!(
-            "upstream {} nodes={} timeout={}ms",
-            name,
-            nodes.len(),
-            cfg.timeout.as_millis()
-        );
+        // Build a human-readable display string for the upstream addresses.
+        let addr_display: Arc<str> = {
+            let parts: Vec<String> = addrs
+                .iter()
+                .map(|ep| match ep.proto {
+                    UpstreamProto::Udp | UpstreamProto::UdpIncoming => ep.addr.to_string(),
+                    UpstreamProto::Tcp | UpstreamProto::TcpIncoming => format!("tcp://{}", ep.addr),
+                    UpstreamProto::Tls => format!("tls://{}", ep.addr),
+                    UpstreamProto::Https => format!(
+                        "https://{}{}",
+                        ep.addr,
+                        ep.path.as_deref().unwrap_or("/dns-query")
+                    ),
+                    UpstreamProto::Quic => format!("quic://{}", ep.addr),
+                    UpstreamProto::H3 => format!(
+                        "h3://{}{}",
+                        ep.addr,
+                        ep.path.as_deref().unwrap_or("/dns-query")
+                    ),
+                })
+                .collect();
+            Arc::from(parts.join(", ").as_str())
+        };
+
         Ok(Self {
             nodes,
             next: AtomicUsize::new(0),
             hedge_delay: cfg.hedge_delay,
+            addr_display,
+            querylog_counters,
         })
     }
 
@@ -520,6 +569,17 @@ impl UpstreamPool {
         client_id: u16,
         client_proto: ClientProto,
     ) -> Result<Bytes> {
+        self.exchange_observed(packet, client_id, client_proto, true)
+            .await
+    }
+
+    pub async fn exchange_observed(
+        &self,
+        packet: Bytes,
+        client_id: u16,
+        client_proto: ClientProto,
+        count_hedge: bool,
+    ) -> Result<Bytes> {
         if self.nodes.is_empty() {
             return Err(anyhow!("empty upstream group"));
         }
@@ -534,10 +594,6 @@ impl UpstreamPool {
         };
 
         let Some(primary_idx) = self.select_primary_idx(raw, query_ix, now, client_proto) else {
-            crate::verbose!(
-                "upstream event=no_matching_transport client_proto={:?}",
-                client_proto
-            );
             return Err(anyhow!(
                 "empty upstream group for {:?} client transport",
                 client_proto
@@ -577,7 +633,11 @@ impl UpstreamPool {
         }
 
         // Phase 2: hedge timer fired; start a second upstream in parallel.
-        crate::stats::inc_hedged_queries();
+        if count_hedge {
+            if let Some(ctr) = &self.querylog_counters {
+                ctr.hedged_queries.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let Some(secondary_idx) = self.select_secondary_idx(primary_idx, client_proto) else {
             // Only one node available; just wait for primary.
             return primary_fut.await;
@@ -599,9 +659,6 @@ impl UpstreamPool {
                 } else {
                     // Primary errored; let secondary complete.
                     let secondary_result = secondary_fut.await;
-                    if secondary_result.is_ok() {
-                        crate::stats::inc_hedge_wins();
-                    }
                     secondary_result.or(result)
                 }
             }
@@ -609,7 +666,6 @@ impl UpstreamPool {
                 if result.is_ok() {
                     // Secondary succeeded first; cancel primary.
                     self.nodes[primary_idx].stats.record_cancelled();
-                    crate::stats::inc_hedge_wins();
                     result
                 } else {
                     // Secondary failed first; keep waiting for primary.
@@ -619,12 +675,12 @@ impl UpstreamPool {
         }
     }
 
-    /// Collect per-node stats snapshots for the metrics renderer.
+    /// Collect per-node stats snapshots for the dashboard.
     pub fn node_snapshots(&self, pool_name: &str) -> Vec<NodeStatsSnapshot> {
         self.nodes
             .iter()
             .enumerate()
-            .map(|(i, n)| n.stats.snapshot(&format!("{pool_name}-{i}")))
+            .map(|(i, n)| n.stats.snapshot(&format!("{pool_name}-{i}"), &n.addr_display))
             .collect()
     }
 }
@@ -649,6 +705,8 @@ struct UpstreamNode {
     /// Monotonic query index of the last time this node was selected (probe or normal).
     /// Initialized to 0; used by the probe scheduler to find the least-recently-used node.
     last_selected: AtomicU64,
+    /// Human-readable address string for this individual node (e.g. "tls://1.1.1.1:853").
+    addr_display: String,
 }
 
 /// RAII guard that decrements `active_inflight` on drop.
@@ -664,8 +722,7 @@ impl Drop for ActiveInflightGuard<'_> {
 
 impl UpstreamNode {
     fn enabled_for(&self, client_proto: ClientProto) -> bool {
-        self.client_filter
-            .is_none_or(|proto| proto == client_proto)
+        self.client_filter.is_none_or(|proto| proto == client_proto)
     }
 
     /// Selection score: EWMA RTT × (1 + active_inflight).
@@ -808,7 +865,15 @@ fn make_h3_transport(
         ecs_mode,
         max_inflight,
     )?)));
-    drop((name, remote, server_name, path, timeout, ecs_mode, max_inflight));
+    drop((
+        name,
+        remote,
+        server_name,
+        path,
+        timeout,
+        ecs_mode,
+        max_inflight,
+    ));
     Err(anyhow!(
         "h3:// upstream requires the 'h3' feature; recompile with: cargo build --features h3"
     ))
@@ -831,9 +896,7 @@ pub(super) fn validate_upstream_response(
         return Err(anyhow!("response ID mismatch"));
     }
     let resp_qend = dns::question_end(resp);
-    let resp_q = resp_qend
-        .and_then(|e| resp.get(12..e))
-        .unwrap_or(&[][..]);
+    let resp_q = resp_qend.and_then(|e| resp.get(12..e)).unwrap_or(&[][..]);
     if !dns::questions_match(resp_q, question) {
         return Err(anyhow!("response question mismatch"));
     }
@@ -850,7 +913,6 @@ pub(super) async fn tcp_exchange_packet(
     let fut = async {
         let mut stream = connect_tcp_nodelay(remote, timeout, name).await?;
         tcp_write_framed(&mut stream, packet, name).await?;
-        crate::verbose!("upstream name={name} proto=tcp remote={remote} event=send");
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;

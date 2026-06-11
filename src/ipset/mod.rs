@@ -24,18 +24,15 @@ use crate::config::IpSetConfig;
 #[cfg(target_os = "linux")]
 use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
+use client::NetfilterClient;
+#[cfg(target_os = "linux")]
+use config::SetPair;
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::sync::{mpsc, Mutex};
-#[cfg(target_os = "linux")]
-use std::time::Instant;
-
-#[cfg(target_os = "linux")]
-use client::NetfilterClient;
-#[cfg(target_os = "linux")]
-use config::SetPair;
 #[cfg(target_os = "linux")]
 use worker::{spawn_add_worker, AddJob};
 
@@ -98,9 +95,7 @@ impl IpSetManager {
         if self.test.is_none() {
             return TestVerdict::OtherCase;
         }
-        let start = Instant::now();
         if ips.is_empty() {
-            crate::verbose!("netlink op=test verdict=no_ip_found ips=0 elapsed_us=0");
             return TestVerdict::NoIpFound;
         }
 
@@ -130,12 +125,6 @@ impl IpSetManager {
             verdict = TestVerdict::OtherCase;
         }
 
-        crate::verbose!(
-            "netlink op=test verdict={} ips={} elapsed_us={}",
-            verdict.name(),
-            ips.len(),
-            start.elapsed().as_micros()
-        );
         verdict
     }
 
@@ -181,13 +170,7 @@ impl IpSetManager {
                 set: set.clone(),
                 ip: *ip,
             }) {
-                Ok(()) => {
-                    crate::verbose!(
-                        "netlink op=add_enqueue set={} ip={}",
-                        set.display_name(),
-                        ip
-                    );
-                }
+                Ok(()) => {}
                 Err(e) => {
                     let msg = if matches!(e, mpsc::TrySendError::Full(_)) {
                         "ipset/nftset add queue is full; falling back to sync add"
@@ -195,18 +178,10 @@ impl IpSetManager {
                         "ipset/nftset add worker exited; falling back to sync add"
                     };
                     self.warn_once("add", anyhow!("{msg}"));
-                    let start = Instant::now();
                     match self.client.lock() {
                         Ok(mut c) => {
                             if let Err(err) = c.add_many(set, &[*ip]) {
                                 self.warn_once("add", err);
-                            } else {
-                                crate::verbose!(
-                                    "netlink op=add_sync set={} ip={} elapsed_us={}",
-                                    set.display_name(),
-                                    ip,
-                                    start.elapsed().as_micros()
-                                );
                             }
                         }
                         Err(_) => {
@@ -245,17 +220,6 @@ impl IpSetManager {
         unreachable!()
     }
     pub fn add_group_ips(&self, _group: &str, _ips: &[std::net::IpAddr]) {}
-}
-
-impl TestVerdict {
-    fn name(self) -> &'static str {
-        match self {
-            Self::PrimaryIp => "primary_ip",
-            Self::SecondaryIp => "secondary_ip",
-            Self::NoIpFound => "no_ip_found",
-            Self::OtherCase => "other_case",
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]

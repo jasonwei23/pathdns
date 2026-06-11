@@ -13,17 +13,22 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - Configurable fallback for unmatched queries: route to a group, race two groups, or return empty.
 - IP-based primary/secondary selection: race two upstreams and test response IPs against an ipset/nftset to pick the winner.
 - GeoSite domain classification using V2Ray/Xray `.dat` or `.json` files (full, suffix, keyword, regexp matchers). Only referenced tags are loaded.
-- Encrypted transports: `tls://` (DoT), `https://` (DoH/HTTP1.1), `quic://` (DoQ, RFC 9250), `h3://` (DoH/HTTP3).
+- Encrypted transports: `tls://` (DoT), `https://` (DoH, HTTP/2 via ALPN), `quic://` (DoQ, RFC 9250), `h3://` (DoH/HTTP3).
 - Persistent mux connections for TCP/TLS upstreams with automatic reconnect.
-- DNS cache with TTL patching, stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
+- DNS cache with per-RR independent TTL countdown, negative TTL capping (RFC 2308 §5), stale-while-revalidate, optional background refresh, and optional disk persistence across restarts.
+- EDNS-aware cache isolation: responses are keyed by EDNS variant (DO bit, EDNS version, ECS subnet) so DO=0 and DO=1 clients never share cache entries. When an upstream uses `ecs=strip`, all clients share one cache entry regardless of their ECS subnet (ECS-normalized cache key).
+- DNS 0x20 QNAME case randomization: outgoing queries apply random per-letter capitalisation to the QNAME and verify the server echoes the same case back, adding ~16 bits of entropy against cache-poisoning attacks.
+- Upstream response size cap: configurable per-byte limit rejects oversized TCP/TLS frames before they reach the cache.
+- TCP connection limit and per-frame read timeouts guard against slowloris-style attacks.
 - Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
 - Graceful rate limiting: configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
-- Per-domain verdict cache for `fallback.default-group: none` routing decisions.
+- Per-domain verdict cache for racing-fallback routing decisions.
 - Query type filtering with optional group and GeoSite tag conditions.
 - Native Linux netlink backend for ipset/nftset test and add operations (no shell-out).
 - Per-upstream hedged requests: fire a second upstream after a configurable delay.
-- Prometheus metrics endpoint.
-- Silent in normal operation; `-v` enables full diagnostic logging.
+- Native query log subsystem: per-query structured events through a bounded non-blocking channel, in-memory ring buffer, optional rotating MessagePack files with gzip compression and age-based retention, and an authenticated HTTP API with a built-in dashboard.
+- Always-on lock-free counters with negligible hot-path overhead; detailed event collection is opt-in.
+- Operational statistics are exposed only through the built-in dashboard/API; there is no verbose per-query stderr mode or separate metrics endpoint.
 
 ---
 
@@ -59,13 +64,12 @@ Produces a static ELF binary (~1.5 MB).
 ## CLI
 
 ```
-pathdns -c <config.json> [-v] [-h]
+pathdns -c <config.json> [-h]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-c <FILE>` | Path to JSON config file (required) |
-| `-v` | Enable verbose/diagnostic logging |
 | `-h` | Print help and exit |
 
 All configuration is done via the JSON file. There are no other CLI flags.
@@ -80,13 +84,13 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "group": [
     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"] },
     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
   ],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000 }
 }
 ```
@@ -95,7 +99,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "group": [
     {
       "name": "domestic",
@@ -111,7 +115,6 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
   ],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "fallback": {
-    "default-group": "none",
     "primary":       "domestic",
     "secondary":     "overseas",
     "ipset-name4":   "mainroute",
@@ -130,23 +133,26 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `bind` | string | `"127.0.0.1:65353"` | Listen address. Append `@udp` or `@tcp` to restrict protocol. |
+| `bind` | string or array | `"127.0.0.1:65353"` | Listen address(es). Append `@udp` or `@tcp` to restrict protocol per address. **IPv6 sockets are v6-only**: `"0.0.0.0:53"` does not accept IPv6 and `"[::]:53"` does not accept IPv4 — for dual-stack use `["0.0.0.0:53", "[::]:53"]`. |
 | `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
-| `timeout-ms` | int (ms) | `5000` | Upstream query timeout. |
+| `timeout-ms` | int (ms) | `3000` | Upstream query timeout. |
 | `udp-buf-size` | int | `4096` | UDP receive buffer size per socket (bytes). |
-| `upstream-udp-sockets` | int | CPU count | UDP socket pool size per upstream node. |
+| `upstream-udp-sockets` | int | `max(worker-threads, 32)` | UDP socket pool size per upstream node. Higher values improve source-port randomness (RFC 5452). |
+| `upstream-max-response-bytes` | int | `0` | Reject TCP/TLS upstream responses larger than this (bytes). `0` = no limit. |
 | `hedge-delay-ms` | int (ms) | `0` (disabled) | Fire a second upstream after N ms with no reply. |
-| `verbose` | bool | `false` | Enable diagnostic logging (same as `-v`). |
-| `metrics-addr` | string | — | Prometheus scrape address (e.g. `"0.0.0.0:9153"`). |
+| `tcp-max-connections` | int | `1024` | Maximum concurrent inbound TCP client connections. `0` = unlimited. |
+| `tcp-read-timeout-ms` | int (ms) | `5000` | Timeout for reading the DNS message body after the 2-byte length prefix. `0` = disabled. |
+| `tcp-idle-timeout-ms` | int (ms) | `30000` | Timeout for waiting for the next request on an idle TCP connection. `0` = disabled. |
+| `querylog` | object | — | Query log / dashboard settings (see [Query Log](#query-log--dashboard)). |
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
 | `no-ipset-blacklist` | bool | `false` | Allow loopback/unspecified IPs in ipset add operations. |
 | `group` | array | — | Routing groups (see [Groups](#groups)). |
-| `fallback` | object | — | Fallback for unmatched queries (see [Fallback](#fallback)). Required. |
+| `fallback` | string or object | — | Fallback for unmatched queries (see [Fallback](#fallback)). Required. |
 | `cache` | object | — | DNS cache settings (see [Cache](#cache)). |
-| `verdict-cache` | object | — | Per-domain verdict cache for `none` fallback (see [Verdict Cache](#verdict-cache)). |
+| `verdict-cache` | object | — | Per-domain verdict cache for racing fallback (see [Verdict Cache](#verdict-cache)). |
 
 ### Groups
 
@@ -186,29 +192,39 @@ Groups are matched top-to-bottom. The first group whose GeoSite tags match the q
 
 ### Fallback
 
-Applied when no group matches a query.
+Applied when no group matches a query. Three forms:
 
 ```json
-"fallback": { "default-group": "domestic" }
+"fallback": "domestic"
 ```
+Route unmatched queries to the named group. `"fallback": "null"` returns empty responses instead.
 
-| `default-group` value | Behavior |
-|-----------------------|----------|
-| `"<group-name>"` | Route to the named group. |
-| `"none"` | Race `primary` and `secondary`; use ipset to pick the winner if configured, otherwise return the first response. |
-| `"null"` | Return an empty response. |
+```json
+"fallback": {
+  "primary":     "domestic",
+  "secondary":   "overseas",
+  "ipset-name4": "chnroute",
+  "ipset-name6": "chnroute6"
+}
+```
+**Ipset-test mode** — the upstream is decided by **ipset membership, not speed**:
 
-**Fields for `"none"` fallback:**
+1. `primary` and `secondary` are queried concurrently (concurrency only hides latency; it does not influence the decision).
+2. The primary's answer IPs are tested against `ipset-name4`/`ipset-name6`.
+3. IPs found in the set → the **primary's** answer is returned. Not in the set → the **secondary's** answer is returned.
+4. The verdict is cached per domain (see [Verdict Cache](#verdict-cache)), so subsequent queries go straight to the chosen group.
+
+`ipset-name4` and/or `ipset-name6` are therefore **required** in this form — without a set to test against, the mode has no decision mechanism. Non-A/AAAA queries (which carry no testable IPs) fall back to the first non-SERVFAIL answer.
+
+**Ipset-test mode fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `primary` | string | Primary group name (required when `default-group` is `"none"`). |
-| `secondary` | string | Secondary group name (required when `default-group` is `"none"`). |
-| `ipset-name4` | string | IPv4 ipset/nftset for testing primary response IPs. |
-| `ipset-name6` | string | IPv6 ipset/nftset for testing primary response IPs. |
-| `noip-as-primary-ip` | bool | Treat NODATA primary replies as primary IPs (default: `false`). |
-
-Without `ipset-name4`/`ipset-name6`, the `"none"` fallback races both upstreams and returns the first non-SERVFAIL response.
+| `primary` | string | Group preferred when its answer IPs are in the ipset (required). |
+| `secondary` | string | Group used when the primary's answer IPs are NOT in the ipset (required). |
+| `ipset-name4` | string | IPv4 ipset/nftset to test the primary's answer IPs against. At least one of the two set names is required. |
+| `ipset-name6` | string | IPv6 ipset/nftset to test the primary's answer IPs against. |
+| `noip-as-primary-ip` | bool | Treat NODATA primary replies as if their IPs were in the set (default: `false`). |
 
 ### Cache
 
@@ -269,7 +285,7 @@ Example: disable caching for the overseas group:
 
 ### Verdict Cache
 
-Caches primary/secondary routing decisions for the `"none"` fallback to avoid repeated ipset lookups.
+Caches primary/secondary routing decisions for the racing fallback to avoid repeated ipset lookups.
 
 ```json
 "verdict-cache": { "size": 4096, "ttl": 3600 }
@@ -279,6 +295,71 @@ Caches primary/secondary routing decisions for the `"none"` fallback to avoid re
 |-------|------|---------|-------------|
 | `size` | int | — | Capacity in entries (`0` disables). |
 | `ttl` | int (seconds) | `0` (no expiry) | Per-entry TTL. |
+
+### Query Log
+
+Configures per-query event collection and the dashboard HTTP API. The section is optional; omit it entirely to keep only the always-on lock-free counters.
+
+```json
+"querylog": {
+  "bind":    "0.0.0.0:8080",
+  "token":   "your-secret-token",
+  "memory":  1000,
+  "channel": 4096,
+  "answer-ips": false,
+  "file": {
+    "dir":              "/var/lib/pathdns/querylog",
+    "max-mb":           8,
+    "max-segments":     3,
+    "batch-size":       256,
+    "flush-interval-ms": 500,
+    "retention-days":   30,
+    "compress":         true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bind` | string or array | — | Listen address(es) for the dashboard + HTTP API. Like the DNS `bind`, IPv6 sockets are v6-only — for dual-stack use `["0.0.0.0:8080", "[::]:8080"]`. Omit to disable the API. |
+| `token` | string | — | Bearer token required on every API request (`Authorization: Bearer <token>`). When omitted, the API is unauthenticated — only safe on a trusted network. |
+| `memory` | int | `1000` | In-memory ring buffer capacity. `0` disables the ring; file collection can still remain active. |
+| `channel` | int | `4096` | Bounded mpsc channel depth between the DNS hot path and the log worker. When full, new events are dropped (non-blocking) rather than stalling queries. |
+| `answer-ips` | bool | `false` | Extract A/AAAA answer IPs into detailed events. Disabled by default because it requires scanning each response. |
+| `file.dir` | string | `"./querylog"` | Directory for rotating MessagePack segments. Created if missing. |
+| `file.max-mb` | int (MB) | `8` | Rotate to a new segment when the current one reaches this size. |
+| `file.max-segments` | int | `3` | Keep at most this many compressed segments; oldest are pruned. |
+| `file.batch-size` | int | `256` | Maximum events to accumulate before one write call. Reduces syscall overhead at high query rates. |
+| `file.flush-interval-ms` | int (ms) | `500` | How often the background worker flushes its write buffer to the OS. |
+| `file.retention-days` | int | — | Delete compressed segments whose embedded timestamp is older than this many days. Applied in addition to `max-segments`. |
+| `file.compress` | bool | `true` | Gzip-compress segments after rotation. Disabling saves CPU at the cost of larger on-disk files. |
+
+Omitting the entire `querylog` section fully disables detailed event collection. When the section is present, event collection is enabled when `memory > 0` or a `file` section is present. The hot path reserves capacity in a bounded channel before constructing an event; if the channel is full, the event is dropped and the DNS response is unaffected. Serialisation and batched file writes are handled by the background worker — the DNS hot path never performs I/O.
+
+**File format:** active segments are named `querylog-{timestamp}.msgpack` (a sequence of concatenated MessagePack maps, one per event). On rotation the segment is gzip-compressed to `querylog-{timestamp}.msgpack.gz` in a background thread-pool task so the worker never stalls.
+
+Dashboard counters count each successfully parsed client query once at ingress. Internal cache refreshes are tracked separately and do not affect client QPS, query totals, average resolution time, or detailed client events.
+
+Each event is a JSON object:
+
+```json
+{
+  "seq": 12345,
+  "time": "2026-06-10T08:21:33.123456Z",
+  "client": "192.168.1.50",
+  "client_port": 51234,
+  "qname": "example.com",
+  "qtype": 1,
+  "rcode": 0,
+  "elapsed_us": 1820,
+  "response_bytes": 76,
+  "source": "upstream",
+  "group": "overseas",
+  "answer_ips": ["93.184.216.34"]
+}
+```
+
+`source` is one of `cache`, `stale`, `upstream`, `singleflight`, `filtered`, `overload`, or `null`.
 
 ---
 
@@ -292,7 +373,7 @@ Caches primary/secondary routing decisions for the `"none"` fallback to avoid re
 | `tcp://1.1.1.1` | TCP (persistent mux connection) |
 | `tls://1.1.1.1` | DNS-over-TLS (RFC 7858) |
 | `tls://1.1.1.1?sni=dns.example` | DoT with explicit SNI |
-| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/1.1) |
+| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/2 via ALPN, fallback to HTTP/1.1) |
 | `quic://dns.adguard.com` | DNS-over-QUIC (requires `--features doq`) |
 | `h3://dns.cloudflare.com/dns-query` | DoH over HTTP/3 (requires `--features h3`) |
 
@@ -300,7 +381,7 @@ Caches primary/secondary routing decisions for the `"none"` fallback to avoid re
 
 | Parameter | Effect |
 |-----------|--------|
-| `?ecs=strip` | Remove EDNS Client Subnet before forwarding (default) |
+| `?ecs=strip` | Remove EDNS Client Subnet before forwarding (default). All clients share one cache entry regardless of their ECS subnet. |
 | `?ecs=forward` | Forward ECS unchanged |
 | `?ecs=1.2.3.0/24` | Replace ECS with a fixed subnet |
 
@@ -322,7 +403,7 @@ Common type numbers: `1` = A, `28` = AAAA, `65` = HTTPS.
 
 Uses native Linux netlink — no shell-out to `ipset` or `nft`.
 
-**Test sets** (for `"none"` fallback routing) are configured in `fallback.ipset-name4` / `fallback.ipset-name6`.
+**Test sets** (for racing fallback routing) are configured in `fallback.ipset-name4` / `fallback.ipset-name6`.
 
 **Add sets** (populate with resolved IPs) are configured per-group with `add-ip: "v4set,v6set"`.
 
@@ -359,13 +440,13 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     { "name": "domestic", "tag": ["cn"],           "upstream": ["223.5.5.5"] },
     { "name": "overseas", "tag": ["geolocation-!cn"], "upstream": ["tls://1.1.1.1"] }
   ],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000, "stale-expire-ttl": 86400, "refresh": 20 }
 }
 ```
@@ -374,7 +455,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     {
@@ -390,7 +471,6 @@ GeoSite files are watched for changes and hot-reloaded automatically.
     }
   ],
   "fallback": {
-    "default-group": "none",
     "primary":       "domestic",
     "secondary":     "overseas",
     "ipset-name4":   "chnroute",
@@ -405,14 +485,14 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 
 ```json
 {
-  "bind": "0.0.0.0:53",
+  "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
     { "name": "null",     "tag": ["category-ads-all"] },
     { "name": "domestic", "tag": ["cn"],               "upstream": ["223.5.5.5"] },
     { "name": "overseas", "tag": ["geolocation-!cn"],  "upstream": ["tls://1.1.1.1"] }
   ],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000 }
 }
 ```
@@ -427,7 +507,7 @@ Use `filter-qtype` inside the group definition:
   "group": [
     { "name": "default", "upstream": ["223.5.5.5"], "filter-qtype": 28 }
   ],
-  "fallback": { "default-group": "default" },
+  "fallback": "default",
   "cache": { "size": 10000 }
 }
 ```
@@ -442,7 +522,7 @@ Tags from multiple files are merged:
   "group": [
     { "name": "domestic", "tag": ["cn", "private"], "upstream": ["223.5.5.5"] }
   ],
-  "fallback": { "default-group": "domestic" }
+  "fallback": "domestic"
 }
 ```
 
@@ -453,29 +533,36 @@ Tags from multiple files are merged:
   "group": [
     { "name": "default", "upstream": ["https://8.8.8.8/dns-query?ecs=strip"] }
   ],
-  "fallback": { "default-group": "default" }
+  "fallback": "default"
 }
 ```
 
 ---
 
-## Prometheus Metrics
+## Query Log & Dashboard
 
-Enable with `"metrics-addr": "0.0.0.0:9153"`.
+Enable by adding a `querylog` section with a `bind` address (see [Query Log config](#query-log)). Browse to `http://<bind>/` for the built-in web dashboard, or query the JSON API directly.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `dns_queries_total{proto}` | counter | Queries received (udp/tcp) |
-| `dns_cache_lookups_total{result}` | counter | Cache hits / misses / stale |
-| `dns_cache_refresh_total{result}` | counter | Background refresh outcomes |
-| `dns_singleflight_hits_total` | counter | Deduplicated in-flight queries |
-| `dns_inflight_total{result}` | counter | Queries that hit `max-inflight`: `result="queued"` waited in queue; `result="dropped"` were shed with SERVFAIL |
-| `dns_queries_routed_total{target}` | counter | Routing decisions (none_race / null / group / aaaa_filtered) |
-| `dns_query_latency_seconds` | histogram | End-to-end slow-path latency |
-| `dns_upstream_queries_total{upstream,result}` | counter | Per-upstream ok/err counts |
-| `dns_upstream_rtt_seconds{upstream}` | histogram | Per-upstream RTT |
-| `dns_upstream_active_inflight{upstream}` | gauge | In-flight queries per upstream |
-| `dns_geosite_reloads_total{result}` | counter | GeoSite hot-reload outcomes |
+When a token is configured, the dashboard HTML remains publicly loadable so its sign-in form can be displayed. All `/api/*` requests require `Authorization: Bearer <token>`.
+
+| Method & path | Description |
+|---------------|-------------|
+| `GET /` | Single-page web dashboard: lifetime stat cards, a time-range selector (1 m / 5 m / 15 m / 1 h / 6 h / 24 h) showing windowed counters, a QPS chart, a routing groups table, a query log, and an upstream table. |
+| `GET /api/stats` | Snapshot of counters: total queries, cache-hit rate, current QPS, average RTT, upstream ok/err, inflight drops, ring length. |
+| `GET /api/stats/history?n=<N>` | Last `N` seconds of per-second QPS samples (max 3600). |
+| `GET /api/stats/aggregate?seconds=<N>` | Aggregated counters over the last N seconds (1–86400). Returns total queries, cache hits/rate, upstream ok/err, null responses, stale served, filtered. Used by the dashboard time-range selector. |
+| `GET /api/groups` | Routing groups in match order with their GeoSite tags (include/exclude), per-tag rule count, `filter-qtype`, and whether they have an upstream or are null groups. |
+| `GET /api/querylog?limit=<L>&before_seq=<S>&q=<filter>` | Recent events from the in-memory ring, newest first. `before_seq` paginates older entries; `q` filters by qname substring. |
+| `DELETE /api/querylog` | Clear the in-memory event ring. |
+| `GET /api/querylog/files` | JSON array of available compressed historical segments with their names and sizes (`[{"name":"querylog-…msgpack.gz","size_bytes":…}]`). Returns `[]` when file logging is disabled. |
+| `GET /api/querylog/history?file=<name>&limit=<L>&q=<filter>` | Decode a historical `.msgpack.gz` segment and return its events as JSON. `file` must be a name returned by `/api/querylog/files`; `limit` caps results (max 10 000); `q` filters by qname substring. Decoding runs in a background thread and does not block the DNS path. |
+| `GET /api/upstreams` | Per-upstream-node stats: ok/err/timeout counts, active inflight, RTT. |
+
+Example:
+
+```sh
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:8080/api/stats
+```
 
 ---
 
@@ -489,7 +576,7 @@ Enable with `"metrics-addr": "0.0.0.0:9153"`.
 
 **Singleflight:** Concurrent cache-miss queries for the same question share one upstream request via a `tokio::sync::watch` channel. Followers receive the leader's response with no additional upstream traffic.
 
-**Single-pass TTL scanner:** `effective_ttl_and_offsets` walks all DNS resource records once, collecting TTL patch offsets and extracting `min(SOA_TTL, SOA_MINIMUM)` for NODATA/NXDOMAIN caching in the same pass.
+**Single-pass TTL scanner:** `effective_ttl_and_offsets` walks all DNS resource records once, collecting `(offset, clamped_rr_ttl)` pairs and extracting `min(SOA_TTL, SOA_MINIMUM)` for NODATA/NXDOMAIN (capped at 10 800 s per RFC 2308 §5) in the same pass. At serve time each RR is patched to its own `original_ttl − elapsed` countdown rather than a shared minimum.
 
 ---
 

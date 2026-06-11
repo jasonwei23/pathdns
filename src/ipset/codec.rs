@@ -209,18 +209,33 @@ fn encode_nftset_add(
 
 /// Interpret a response to an ipset TEST command.
 /// Returns `true` when the IP is present in the set.
-pub(super) fn decode_ipset_test(msg_type: u16, data: &[u8]) -> bool {
+pub(super) fn decode_ipset_test(msg_type: u16, data: &[u8]) -> anyhow::Result<bool> {
     match nlmsg_errno(msg_type, data) {
-        Some(0) | None => true,
-        Some(code) if code.abs() == IPSET_ERR_EXIST => false,
-        Some(_) => false,
+        Some(0) => Ok(true),
+        Some(code) if code.abs() == IPSET_ERR_EXIST => Ok(false),
+        Some(code) => Err(anyhow::anyhow!("netlink ipset test error: {code}")),
+        None if msg_type != NLMSG_ERROR => Ok(true),
+        None => Err(anyhow::anyhow!("truncated netlink ipset test response")),
     }
 }
 
 /// Interpret a response to an nftset GET-ELEM command.
 /// Returns `true` when the element was found.
-pub(super) fn decode_nft_test(msg_type: u16) -> bool {
-    msg_type == nft_msg_type(NFT_MSG_NEWSETELEM)
+pub(super) fn decode_nft_test(msg_type: u16, data: &[u8]) -> anyhow::Result<bool> {
+    if msg_type == nft_msg_type(NFT_MSG_NEWSETELEM) {
+        return Ok(true);
+    }
+    match nlmsg_errno(msg_type, data) {
+        Some(code) if code.abs() == libc::ENOENT => Ok(false),
+        Some(0) => Ok(true),
+        Some(code) => Err(anyhow::anyhow!("netlink nftset test error: {code}")),
+        None if msg_type == NLMSG_ERROR => {
+            Err(anyhow::anyhow!("truncated netlink nftset test response"))
+        }
+        None => Err(anyhow::anyhow!(
+            "unexpected netlink nftset response type: {msg_type}"
+        )),
+    }
 }
 
 /// Check an ACK response, treating EEXIST / IPSET_ERR_EXIST as success.
@@ -385,5 +400,34 @@ impl NlBuilder {
         while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error_message(errno: i32) -> Vec<u8> {
+        let mut data = vec![0u8; 20];
+        data[16..20].copy_from_slice(&errno.to_ne_bytes());
+        data
+    }
+
+    #[test]
+    fn ipset_test_only_maps_not_present_to_false() {
+        assert!(!decode_ipset_test(NLMSG_ERROR, &error_message(-IPSET_ERR_EXIST)).unwrap());
+        assert!(decode_ipset_test(NLMSG_ERROR, &error_message(-libc::EPERM)).is_err());
+    }
+
+    #[test]
+    fn nft_test_only_maps_enoent_to_false() {
+        assert!(!decode_nft_test(NLMSG_ERROR, &error_message(-libc::ENOENT)).unwrap());
+        assert!(decode_nft_test(NLMSG_ERROR, &error_message(-libc::EPERM)).is_err());
+    }
+
+    #[test]
+    fn truncated_error_messages_are_rejected() {
+        assert!(decode_ipset_test(NLMSG_ERROR, &[0; 19]).is_err());
+        assert!(decode_nft_test(NLMSG_ERROR, &[0; 19]).is_err());
     }
 }

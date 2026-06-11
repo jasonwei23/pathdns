@@ -4,7 +4,7 @@
 //! Listener code owns sockets and framing; this module owns packet lifecycle after a DNS
 //! message has been received.
 
-use crate::cache::{cache_key, CacheKey, CacheRefresh};
+use crate::cache::{cache_key, cache_key_strip_ecs, CacheKey, CacheRefresh};
 use crate::dns;
 use crate::ipset::TestVerdict;
 use crate::router::RouteTarget;
@@ -14,24 +14,50 @@ use crate::{router, singleflight};
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Rate-limit state for upstream-failure warnings (shared across all targets).
 static UPSTREAM_FAIL_LAST_WARN: AtomicU64 = AtomicU64::new(0);
 
+/// Sentinel group_id for NoneIpSet ("none" fallback) cache entries.
+/// Cannot use u16::MAX (65535) because that is the existing "no group" sentinel.
+const GROUP_ID_NONE_FALLBACK: u16 = 65534;
+
 struct QueryContext {
     packet: Bytes,
     info: dns::QueryInfo,
-    peer: SocketAddr,
-    client_proto: ClientProto,
+    origin: QueryOrigin,
+}
+
+#[derive(Clone, Copy)]
+enum QueryOrigin {
+    Client {
+        peer: SocketAddr,
+        proto: ClientProto,
+    },
+    CacheRefresh,
 }
 
 impl QueryContext {
     /// Raw DNS question bytes (qname + qtype + qclass), used as the cache/singleflight key.
     fn question(&self) -> &[u8] {
         &self.packet[12..self.info.question_end]
+    }
+
+    fn client(&self) -> Option<(SocketAddr, ClientProto)> {
+        match self.origin {
+            QueryOrigin::Client { peer, proto } => Some((peer, proto)),
+            QueryOrigin::CacheRefresh => None,
+        }
+    }
+
+    fn proto(&self) -> ClientProto {
+        match self.origin {
+            QueryOrigin::Client { proto, .. } => proto,
+            QueryOrigin::CacheRefresh => ClientProto::Udp,
+        }
     }
 }
 
@@ -60,63 +86,110 @@ pub(crate) enum FastPathOutcome {
     Drop,
 }
 
+/// Decode a `group_id` stored in the cache into a display name.
+/// - `u16::MAX` (65535) → no group (legacy sentinel, treated as None)
+/// - `GROUP_ID_NONE_FALLBACK` (65534) → "none" (NoneIpSet route)
+/// - anything else → look up in `state.groups`
+fn group_id_to_name(group_id: u16, state: &AppState) -> Option<Arc<str>> {
+    if group_id == u16::MAX {
+        None
+    } else if group_id == GROUP_ID_NONE_FALLBACK {
+        Some(Arc::from("none"))
+    } else {
+        state
+            .groups
+            .get(group_id as usize)
+            .map(|g| Arc::from(g.name.as_str()))
+    }
+}
+
+#[inline]
+fn record_query_received(ql: &crate::querylog::QueryLogHandle, proto: ClientProto) {
+    ql.counters.queries_total.fetch_add(1, Ordering::Relaxed);
+    match proto {
+        ClientProto::Udp => ql.counters.queries_udp.fetch_add(1, Ordering::Relaxed),
+        ClientProto::Tcp => ql.counters.queries_tcp.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
 /// Synchronous fast path: parse header, apply qtype filter, look up the Moka cache.
 ///
 /// Returns immediately with a ready response for the overwhelming majority of queries (cache hits
 /// and filter hits) without allocating a Tokio task. Only cache misses need a spawned task.
 /// Called both from the UDP receive loop (inline, no spawn) and from `handle_packet` (for TCP
 /// and UDP misses that were spawned before this check could short-circuit them).
-pub(crate) fn try_fast_path(packet: &[u8], peer: SocketAddr, state: &AppState) -> FastPathOutcome {
-    // Only pay for Instant::now() when verbose logging is enabled.
-    let t0: Option<Instant> = crate::log::verbose_enabled().then(Instant::now);
+pub(crate) fn try_fast_path(
+    packet: &[u8],
+    peer: SocketAddr,
+    proto: ClientProto,
+    state: &AppState,
+) -> FastPathOutcome {
+    let t0 = state.querylog.collecting().then(Instant::now);
+
+    // Non-QUERY opcodes (STATUS, NOTIFY, UPDATE, …): return NOTIMP per RFC 1035.
+    if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        return FastPathOutcome::Response {
+            resp: Bytes::from(dns::notimp_opcode_reply(packet)),
+            refresh: None,
+        };
+    }
 
     let fast_info = match dns::parse_query_fast(packet) {
         Ok(info) => info,
-        Err(err) => {
-            crate::verbose!("dns event=parse_error from={peer} error={err:#}");
-            return FastPathOutcome::Drop;
-        }
+        Err(_) => return FastPathOutcome::Drop,
     };
+    record_query_received(&state.querylog, proto);
+
+    // Non-IN/non-ANY QCLASS: return NOTIMP per RFC 1035.
+    {
+        let i = fast_info.question_end.saturating_sub(2);
+        let qclass = u16::from_be_bytes([packet[i], packet[i + 1]]);
+        if qclass != 1 && qclass != 255 {
+            return FastPathOutcome::Response {
+                resp: Bytes::from(
+                    dns::notimp_reply(packet, fast_info.question_end).unwrap_or_default(),
+                ),
+                refresh: None,
+            };
+        }
+    }
 
     // Fast cache read: no qname allocation needed.
     if let Some(hit) = state
         .cache
-        .get(&packet[12..fast_info.question_end], fast_info.id)
+        .get_with_ecs_fallback(packet, fast_info.question_end, fast_info.id)
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
         if hit.is_stale && state.stale_client_timeout_ms > 0 {
             return FastPathOutcome::Miss { info: fast_info };
         }
+        let ql = &state.querylog;
+        ql.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         if hit.is_stale {
-            crate::stats::inc_cache_stale_refresh();
-        } else {
-            crate::stats::inc_cache_hits();
+            ql.counters.stale_served.fetch_add(1, Ordering::Relaxed);
         }
-        let group_name = if hit.group_id == u16::MAX {
-            "-".to_string()
-        } else {
-            state
-                .groups
-                .get(hit.group_id as usize)
-                .map(|g| g.name.as_str())
-                .unwrap_or("-")
-                .to_string()
-        };
-        crate::verbose!(
-            "dns event=reply id={} qtype={} source=cache group={} bytes={} elapsed_us={}",
-            fast_info.id,
-            fast_info.qtype,
-            group_name,
-            hit.packet.len(),
-            t0.map_or(0, |t| t.elapsed().as_micros() as u64)
-        );
+        if ql.collecting() {
+            ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
+                seq,
+                unix_micros: crate::querylog::unix_micros_now(),
+                client: peer.ip(),
+                client_port: peer.port(),
+                qname: hit.qname.clone(),
+                qtype: fast_info.qtype,
+                rcode: dns::rcode(&hit.packet),
+                elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
+                response_bytes: hit.packet.len() as u32,
+                source: if hit.is_stale { "stale" } else { "cache" },
+                group: group_id_to_name(hit.group_id, state),
+                answer_ips: smallvec::SmallVec::new(),
+            });
+        }
         return FastPathOutcome::Response {
             resp: hit.packet,
             refresh: hit.refresh,
         };
     }
-    crate::stats::inc_cache_misses();
 
     FastPathOutcome::Miss { info: fast_info }
 }
@@ -129,51 +202,67 @@ pub(crate) fn try_fast_path_into(
     state: &AppState,
     send_buf: &mut BytesMut,
 ) -> FastPathOutcome {
-    let t0: Option<Instant> = crate::log::verbose_enabled().then(Instant::now);
+    let t0 = state.querylog.collecting().then(Instant::now);
+
+    // Non-QUERY opcodes: return NOTIMP per RFC 1035.
+    if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        return FastPathOutcome::Response {
+            resp: Bytes::from(dns::notimp_opcode_reply(packet)),
+            refresh: None,
+        };
+    }
 
     let fast_info = match dns::parse_query_fast(packet) {
         Ok(info) => info,
-        Err(err) => {
-            crate::verbose!("dns event=parse_error from={peer} error={err:#}");
-            return FastPathOutcome::Drop;
-        }
+        Err(_) => return FastPathOutcome::Drop,
     };
+    record_query_received(&state.querylog, ClientProto::Udp);
+
+    // Non-IN/non-ANY QCLASS: return NOTIMP.
+    {
+        let i = fast_info.question_end.saturating_sub(2);
+        let qclass = u16::from_be_bytes([packet[i], packet[i + 1]]);
+        if qclass != 1 && qclass != 255 {
+            return FastPathOutcome::Response {
+                resp: Bytes::from(
+                    dns::notimp_reply(packet, fast_info.question_end).unwrap_or_default(),
+                ),
+                refresh: None,
+            };
+        }
+    }
 
     // Cache hit: write directly into the caller-provided send buffer.
-    if let Some(meta) =
-        state
-            .cache
-            .get_into(&packet[12..fast_info.question_end], fast_info.id, send_buf)
+    if let Some(meta) = state
+        .cache
+        .get_into_with_ecs_fallback(packet, fast_info.question_end, fast_info.id, send_buf)
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
         if meta.is_stale && state.stale_client_timeout_ms > 0 {
             return FastPathOutcome::Miss { info: fast_info };
         }
+        let ql = &state.querylog;
+        ql.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         if meta.is_stale {
-            crate::stats::inc_cache_stale_refresh();
-        } else {
-            crate::stats::inc_cache_hits();
+            ql.counters.stale_served.fetch_add(1, Ordering::Relaxed);
         }
-        let group_name = if meta.group_id == u16::MAX {
-            "-".to_string()
-        } else {
-            state
-                .groups
-                .get(meta.group_id as usize)
-                .map(|g| g.name.as_str())
-                .unwrap_or("-")
-                .to_string()
-        };
-        crate::verbose!(
-            "dns event=reply id={} qtype={} source=cache group={} bytes={} elapsed_us={}",
-            fast_info.id,
-            fast_info.qtype,
-            group_name,
-            send_buf.len(),
-            t0.map_or(0, |t| t.elapsed().as_micros() as u64)
-        );
-        // Freeze the send buffer content into Bytes for compatibility with FastPathOutcome.
+        if ql.collecting() {
+            ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
+                seq,
+                unix_micros: crate::querylog::unix_micros_now(),
+                client: peer.ip(),
+                client_port: peer.port(),
+                qname: meta.qname.clone(),
+                qtype: fast_info.qtype,
+                rcode: dns::rcode(send_buf),
+                elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
+                response_bytes: send_buf.len() as u32,
+                source: if meta.is_stale { "stale" } else { "cache" },
+                group: group_id_to_name(meta.group_id, state),
+                answer_ips: smallvec::SmallVec::new(),
+            });
+        }
         let resp = send_buf.split().freeze();
         return FastPathOutcome::Response {
             resp,
@@ -181,7 +270,6 @@ pub(crate) fn try_fast_path_into(
         };
     }
 
-    crate::stats::inc_cache_misses();
     FastPathOutcome::Miss { info: fast_info }
 }
 
@@ -191,7 +279,7 @@ pub(crate) async fn handle_packet_bytes(
     proto: ClientProto,
     state: Arc<AppState>,
 ) -> Result<Option<Bytes>> {
-    match try_fast_path(&packet, peer, &state) {
+    match try_fast_path(&packet, peer, proto, &state) {
         FastPathOutcome::Response { resp, refresh } => {
             if let Some(r) = refresh {
                 spawn_cache_refresh(r, &state);
@@ -216,10 +304,7 @@ pub(crate) async fn handle_packet_slow_preparsed(
 ) -> Result<Option<Bytes>> {
     let info = match dns::parse_query_from_fast(&packet, fast_info) {
         Ok(info) => info,
-        Err(err) => {
-            crate::verbose!("dns event=parse_error from={peer} error={err:#}");
-            return Ok(None);
-        }
+        Err(_) => return Ok(None),
     };
     handle_packet_slow_with_info(packet, peer, proto, state, info).await
 }
@@ -236,7 +321,11 @@ async fn handle_packet_slow_with_info(
         Err(_) => {
             // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
             let acquired = if state.cfg.inflight_queue_ms > 0 {
-                crate::stats::inc_inflight_queued();
+                state
+                    .querylog
+                    .counters
+                    .inflight_queued
+                    .fetch_add(1, Ordering::Relaxed);
                 let wait = Duration::from_millis(state.cfg.inflight_queue_ms);
                 tokio::time::timeout(wait, state.limit.clone().acquire_owned())
                     .await
@@ -248,17 +337,22 @@ async fn handle_packet_slow_with_info(
             match acquired {
                 Some(permit) => permit,
                 None => {
-                    crate::stats::inc_inflight_drops();
-                    crate::verbose!(
-                        "dns event=drop reason=max_inflight id={} qtype={} qname={} from={}",
-                        info.id,
-                        info.qtype,
-                        info.qname,
-                        peer
-                    );
+                    state
+                        .querylog
+                        .counters
+                        .inflight_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     let servfail = dns::servfail_reply(&packet, info.question_end)
                         .map(Bytes::from)
                         .ok();
+                    if let Some(resp) = &servfail {
+                        let ctx = QueryContext {
+                            packet,
+                            info,
+                            origin: QueryOrigin::Client { peer, proto },
+                        };
+                        emit_slow_event(&ctx, &state, resp, "overload", None, 0);
+                    }
                     return Ok(servfail);
                 }
             }
@@ -271,8 +365,7 @@ async fn handle_packet_slow_with_info(
             QueryContext {
                 packet,
                 info,
-                peer,
-                client_proto: proto,
+                origin: QueryOrigin::Client { peer, proto },
             },
             &state,
         )
@@ -293,53 +386,36 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
             .routing_index
             .route(&state.groups, &ctx.info.qname, geosite.as_deref())
     {
-        crate::verbose!(
-            "dns event=query id={} qtype={} qname={} group={} from={}",
-            ctx.info.id,
-            ctx.info.qtype,
-            ctx.info.qname,
-            group.name,
-            ctx.peer
-        );
         if let Some(target) = group.target() {
-            crate::stats::inc_routed_group();
             return exchange_with_dedupe(ctx, state, target).await;
         }
-        // Null group: apply qtype filter before returning empty.
-        if group.filter_qtype.contains(&ctx.info.qtype) {
-            crate::stats::inc_routed_aaaa_filtered();
-            return dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from);
+        // Null group: block when filter_qtype is empty (block all) or matches this qtype.
+        // When filter_qtype is non-empty but does not contain this qtype, fall through to
+        // global routing so only the listed types are suppressed.
+        if group.filter_qtype.is_empty() || group.filter_qtype.contains(&ctx.info.qtype) {
+            state
+                .querylog
+                .counters
+                .null_responses
+                .fetch_add(1, Ordering::Relaxed);
+            let resp =
+                dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
+            emit_slow_event(&ctx, state, &resp, "null", None, 0);
+            return Ok(resp);
         }
-        crate::stats::inc_routed_null();
-        return dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from);
     }
 
     let Some(target) = router::classify_target(state, ctx.info.qtype) else {
-        crate::verbose!(
-            "dns event=reply id={} qtype={} qname={} group=null from={}",
-            ctx.info.id,
-            ctx.info.qtype,
-            ctx.info.qname,
-            ctx.peer
-        );
-        crate::stats::inc_routed_null();
-        return dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from);
+        state
+            .querylog
+            .counters
+            .null_responses
+            .fetch_add(1, Ordering::Relaxed);
+        let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
+        emit_slow_event(&ctx, state, &resp, "null", None, 0);
+        return Ok(resp);
     };
-    crate::verbose!(
-        "dns event=query id={} qtype={} qname={} group={} from={}",
-        ctx.info.id,
-        ctx.info.qtype,
-        ctx.info.qname,
-        target.group_name(),
-        ctx.peer
-    );
 
-    match &target {
-        RouteTarget::Race { .. } | RouteTarget::NoneIpSet { .. } => {
-            crate::stats::inc_routed_none_race()
-        }
-        RouteTarget::Group(_) => crate::stats::inc_routed_group(),
-    }
     exchange_with_dedupe(ctx, state, target).await
 }
 
@@ -348,23 +424,32 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
 fn try_stale(
     state: &AppState,
     ck: &CacheKey,
-    question: &[u8],
+    query: &[u8],
     info: &dns::QueryInfo,
-    group_name: &str,
+    _group_name: &str,
     started: Instant,
-    reason: &str,
+    _reason: &str,
+    count_client_stats: bool,
 ) -> Option<Bytes> {
-    let stale = serve_stale(state, ck, question, info)?;
-    crate::verbose!(
-        "dns event=serve_stale id={} qtype={} qname={} target={} elapsed_us={} reason={}",
-        info.id,
-        info.qtype,
-        info.qname,
-        group_name,
-        started.elapsed().as_micros(),
-        reason
-    );
-    crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
+    let stale = serve_stale(state, ck, query, info)?;
+    if count_client_stats {
+        let elapsed = started.elapsed().as_micros() as u64;
+        state
+            .querylog
+            .counters
+            .rtt_sum_us
+            .fetch_add(elapsed, Ordering::Relaxed);
+        state
+            .querylog
+            .counters
+            .rtt_count
+            .fetch_add(1, Ordering::Relaxed);
+        state
+            .querylog
+            .counters
+            .stale_served
+            .fetch_add(1, Ordering::Relaxed);
+    }
     Some(stale)
 }
 
@@ -380,9 +465,10 @@ async fn do_upstream_exchange(
             race(
                 ctx.packet.clone(),
                 ctx.info.id,
-                ctx.client_proto,
+                ctx.proto(),
                 primary,
                 secondary,
+                ctx.client().is_some(),
             )
             .await
         }
@@ -390,10 +476,11 @@ async fn do_upstream_exchange(
             resolve_none_group_with_ipset(
                 ctx.packet.clone(),
                 &ctx.info,
-                ctx.client_proto,
+                ctx.proto(),
                 primary,
                 secondary,
                 state,
+                ctx.client().is_some(),
             )
             .await
         }
@@ -402,7 +489,12 @@ async fn do_upstream_exchange(
                 anyhow::bail!("route target requires an upstream");
             };
             upstream
-                .exchange(ctx.packet.clone(), ctx.info.id, ctx.client_proto)
+                .exchange_observed(
+                    ctx.packet.clone(),
+                    ctx.info.id,
+                    ctx.proto(),
+                    ctx.client().is_some(),
+                )
                 .await
         }
     }
@@ -416,38 +508,73 @@ async fn exchange_with_dedupe(
     // Apply qtype filter before any network activity.
     if let RouteTarget::Group(g) = &target {
         if g.filter_qtype.contains(&ctx.info.qtype) {
-            crate::stats::inc_routed_aaaa_filtered();
-            return dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from);
+            let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
+            if ctx.client().is_some() {
+                state
+                    .querylog
+                    .counters
+                    .filtered
+                    .fetch_add(1, Ordering::Relaxed);
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &resp,
+                    "filtered",
+                    Some(Arc::from(g.name.as_str())),
+                    0,
+                );
+            }
+            return Ok(resp);
         }
     }
     let started = Instant::now();
-    let ck = cache_key(ctx.question());
+    let ck = cache_key(&ctx.packet, ctx.info.question_end);
+    // Normalize cache key for strip-mode targets so all ECS clients share one entry.
+    let ck = if target.strip_ecs()
+        && dns::extract_variant(&ctx.packet, ctx.info.question_end)
+            .ecs_src
+            .is_some()
+    {
+        cache_key_strip_ecs(&ctx.packet, ctx.info.question_end)
+    } else {
+        ck
+    };
     let waiter = singleflight::register(&state.remote_inflight, ck)?;
 
     if let Some(mut rx) = waiter {
-        crate::stats::inc_singleflight_hits();
         // Bound the follower wait so a panicking leader never leaves clients hung forever.
         let deadline = state.cfg.timeout + Duration::from_secs(1);
+        let servfail = Bytes::from(
+            dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
+        );
         match tokio::time::timeout(deadline, rx.changed()).await {
             Err(_elapsed) => {
-                crate::verbose!(
-                    "dns event=singleflight_timeout id={} qtype={} qname={} from={}",
-                    ctx.info.id,
-                    ctx.info.qtype,
-                    ctx.info.qname,
-                    ctx.peer
+                let elapsed = started.elapsed().as_micros() as u64;
+                record_client_latency(&ctx, state, elapsed);
+                record_singleflight_hit(&ctx, state);
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &servfail,
+                    "singleflight",
+                    Some(Arc::from(target.group_name())),
+                    elapsed,
                 );
-                crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
-                return Ok(Bytes::from(
-                    dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
-                ));
+                return Ok(servfail);
             }
-            // Sender was dropped without publishing (leader panicked).
             Ok(Err(_closed)) => {
-                crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
-                return Ok(Bytes::from(
-                    dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
-                ));
+                let elapsed = started.elapsed().as_micros() as u64;
+                record_client_latency(&ctx, state, elapsed);
+                record_singleflight_hit(&ctx, state);
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &servfail,
+                    "singleflight",
+                    Some(Arc::from(target.group_name())),
+                    elapsed,
+                );
+                return Ok(servfail);
             }
             Ok(Ok(())) => {}
         }
@@ -456,17 +583,21 @@ async fn exchange_with_dedupe(
         };
         let mut resp = BytesMut::from(resp.as_ref());
         dns::set_id(&mut resp, ctx.info.id)?;
+        if resp.len() >= ctx.info.question_end {
+            resp[12..ctx.info.question_end].copy_from_slice(ctx.question());
+        }
         let resp = resp.freeze();
-        crate::verbose!(
-            "dns event=reply id={} qtype={} qname={} target={} source=singleflight bytes={} elapsed_us={}",
-            ctx.info.id,
-            ctx.info.qtype,
-            ctx.info.qname,
-            target.group_name(),
-            resp.len(),
-            started.elapsed().as_micros()
+        let elapsed = started.elapsed().as_micros() as u64;
+        record_client_latency(&ctx, state, elapsed);
+        record_singleflight_hit(&ctx, state);
+        emit_slow_event(
+            &ctx,
+            state,
+            &resp,
+            "singleflight",
+            Some(Arc::from(target.group_name())),
+            elapsed,
         );
-        crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
         return Ok(resp);
     }
     // If the leader task is cancelled while awaiting upstream I/O, Drop removes
@@ -482,7 +613,7 @@ async fn exchange_with_dedupe(
     let stale_fallback: Option<Bytes> = if state.stale_client_timeout_ms > 0 && !skip_cache {
         state
             .cache
-            .get_stale(&query_for_cache[12..ctx.info.question_end], ctx.info.id)
+            .get_stale(&query_for_cache, ctx.info.question_end, ctx.info.id)
             .filter(|h| h.is_stale)
             .map(|h| h.packet)
     } else {
@@ -495,25 +626,27 @@ async fn exchange_with_dedupe(
         let timeout_ms = state.stale_client_timeout_ms;
         let upstream_fut = do_upstream_exchange(&ctx, state, &target);
         match tokio::time::timeout(Duration::from_millis(timeout_ms), upstream_fut).await {
-            Ok(upstream_result) => {
-                // Upstream won within timeout; proceed normally with upstream_result.
-                upstream_result
-            }
+            Ok(upstream_result) => upstream_result,
             Err(_timeout) => {
                 // Timeout fired first; serve stale to the client and spawn a background refresh.
-                crate::stats::inc_cache_stale_client_timeout();
-                crate::verbose!(
-                    "dns event=serve_stale_timeout id={} qtype={} qname={} target={} elapsed_us={}",
-                    ctx.info.id,
-                    ctx.info.qtype,
-                    ctx.info.qname,
-                    group_name,
-                    started.elapsed().as_micros()
-                );
-                crate::stats::inc_cache_stale_refresh();
                 singleflight::publish_bytes(&state.remote_inflight, &ck, stale_pkt.clone());
-                crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
-                // Detach: spawn a background refresh task (same pattern as do_cache_refresh).
+                let elapsed = started.elapsed().as_micros() as u64;
+                record_client_latency(&ctx, state, elapsed);
+                if ctx.client().is_some() {
+                    state
+                        .querylog
+                        .counters
+                        .stale_served
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &stale_pkt,
+                    "stale",
+                    Some(Arc::from(group_name)),
+                    elapsed,
+                );
                 let refresh = CacheRefresh {
                     key: ck,
                     query: query_for_cache.clone(),
@@ -535,12 +668,22 @@ async fn exchange_with_dedupe(
                 if let Some(stale) = try_stale(
                     state,
                     &ck,
-                    &query_for_cache[12..ctx.info.question_end],
+                    &query_for_cache,
                     &ctx.info,
                     group_name,
                     started,
                     "servfail",
+                    ctx.client().is_some(),
                 ) {
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    emit_slow_event(
+                        &ctx,
+                        state,
+                        &stale,
+                        "stale",
+                        Some(Arc::from(group_name)),
+                        elapsed,
+                    );
                     return Ok(stale);
                 }
             }
@@ -557,15 +700,25 @@ async fn exchange_with_dedupe(
                             .unwrap_or(u16::MAX);
                         (g.cache_policy, gid)
                     }
-                    // Race/none targets carry no group policy; use the global defaults.
-                    _ => (state.cache.resolve_policy(None), u16::MAX),
+                    // NoneIpSet ("none" fallback): use sentinel 65534 so cache hits show group "none".
+                    _ => (state.cache.resolve_policy(None), GROUP_ID_NONE_FALLBACK),
                 };
+                let stripped_query: Option<bytes::Bytes> = if target.strip_ecs()
+                    && dns::extract_variant(&ctx.packet, ctx.info.question_end)
+                        .ecs_src
+                        .is_some()
+                {
+                    dns::strip_edns_ecs(&query_for_cache).map(bytes::Bytes::from)
+                } else {
+                    None
+                };
+                let cache_query: &[u8] = stripped_query.as_deref().unwrap_or(&query_for_cache);
                 state.cache.add(
                     crate::cache::CacheInsert {
                         key: ck,
                         qname: ctx.info.qname.clone(),
                         question_end: ctx.info.question_end,
-                        query: &query_for_cache,
+                        query: cache_query,
                         packet: resp.as_ref(),
                     },
                     &cache_policy,
@@ -573,16 +726,23 @@ async fn exchange_with_dedupe(
                 );
             }
             singleflight::publish_bytes(&state.remote_inflight, &ck, resp.clone());
-            crate::verbose!(
-                "dns event=reply id={} qtype={} qname={} target={} source=upstream bytes={} elapsed_us={}",
-                ctx.info.id,
-                ctx.info.qtype,
-                ctx.info.qname,
-                group_name,
-                resp.len(),
-                started.elapsed().as_micros()
+            let elapsed = started.elapsed().as_micros() as u64;
+            record_client_latency(&ctx, state, elapsed);
+            if ctx.client().is_some() {
+                state
+                    .querylog
+                    .counters
+                    .upstream_ok
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            emit_slow_event(
+                &ctx,
+                state,
+                &resp,
+                "upstream",
+                Some(Arc::from(group_name)),
+                elapsed,
             );
-            crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
             Ok(resp)
         }
         Err(err) => {
@@ -590,55 +750,131 @@ async fn exchange_with_dedupe(
                 if let Some(stale) = try_stale(
                     state,
                     &ck,
-                    &query_for_cache[12..ctx.info.question_end],
+                    &query_for_cache,
                     &ctx.info,
                     group_name,
                     started,
                     "upstream_error",
+                    ctx.client().is_some(),
                 ) {
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    emit_slow_event(
+                        &ctx,
+                        state,
+                        &stale,
+                        "stale",
+                        Some(Arc::from(group_name)),
+                        elapsed,
+                    );
                     return Ok(stale);
                 }
             }
-            // Rate-limited warn so repeated failures don't flood logs.
             crate::warn_rate_limited!(
                 &UPSTREAM_FAIL_LAST_WARN,
                 10,
                 "dns event=upstream_failed target={} error={err:#}",
                 group_name
             );
-            crate::verbose!(
-                "dns event=upstream_failed id={} qtype={} qname={} target={} elapsed_us={} error={err:#}",
-                ctx.info.id,
-                ctx.info.qtype,
-                ctx.info.qname,
-                group_name,
-                started.elapsed().as_micros()
-            );
-            // Synthesize SERVFAIL so the client always gets a DNS response.
-            // Publish to singleflight waiters so they share the same fallback.
             let servfail = match dns::servfail_reply(&query_for_cache, ctx.info.question_end) {
                 Ok(pkt) => pkt,
-                Err(_) => {
-                    // Packet is malformed; fall back to propagating the error.
-                    return Err(err);
-                }
+                Err(_) => return Err(err),
             };
             let servfail = Bytes::from(servfail);
             singleflight::publish_bytes(&state.remote_inflight, &ck, servfail.clone());
-            crate::stats::record_query_latency(started.elapsed().as_micros() as u64);
+            let elapsed = started.elapsed().as_micros() as u64;
+            record_client_latency(&ctx, state, elapsed);
+            if ctx.client().is_some() {
+                state
+                    .querylog
+                    .counters
+                    .upstream_err
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            emit_slow_event(
+                &ctx,
+                state,
+                &servfail,
+                "upstream",
+                Some(Arc::from(group_name)),
+                elapsed,
+            );
             Ok(servfail)
         }
     }
 }
 
+#[inline]
+fn record_client_latency(ctx: &QueryContext, state: &AppState, elapsed_us: u64) {
+    if ctx.client().is_none() {
+        return;
+    }
+    state
+        .querylog
+        .counters
+        .rtt_sum_us
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    state
+        .querylog
+        .counters
+        .rtt_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_singleflight_hit(ctx: &QueryContext, state: &AppState) {
+    if ctx.client().is_some() {
+        state
+            .querylog
+            .counters
+            .singleflight_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn emit_slow_event(
+    ctx: &QueryContext,
+    state: &AppState,
+    resp: &Bytes,
+    source: &'static str,
+    group: Option<Arc<str>>,
+    elapsed_us: u64,
+) {
+    let Some((peer, _proto)) = ctx.client() else {
+        return;
+    };
+    let ql = &state.querylog;
+    if !ql.collecting() {
+        return;
+    }
+    ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
+        seq,
+        unix_micros: crate::querylog::unix_micros_now(),
+        client: peer.ip(),
+        client_port: peer.port(),
+        qname: ctx.info.qname.clone(),
+        qtype: ctx.info.qtype,
+        rcode: dns::rcode(resp),
+        elapsed_us,
+        response_bytes: resp.len() as u32,
+        source,
+        group,
+        answer_ips: if ql.collect_answer_ips() && matches!(ctx.info.qtype, 1 | 28) {
+            dns::answer_ips(resp, ctx.info.question_end)
+        } else {
+            smallvec::SmallVec::new()
+        },
+    });
+}
+
 fn serve_stale(
     state: &AppState,
     key: &CacheKey,
-    question: &[u8],
+    query: &[u8],
     info: &dns::QueryInfo,
 ) -> Option<Bytes> {
-    let stale = state.cache.get_stale(question, info.id)?.packet;
-    crate::stats::inc_cache_stale_error();
+    let stale = state
+        .cache
+        .get_stale(query, info.question_end, info.id)?
+        .packet;
     singleflight::publish_bytes(&state.remote_inflight, key, stale.clone());
     Some(stale)
 }
@@ -655,6 +891,7 @@ async fn race(
     client_proto: ClientProto,
     primary: &CustomGroup,
     secondary: &CustomGroup,
+    count_hedge: bool,
 ) -> Result<Bytes> {
     let primary_upstream = primary
         .upstream
@@ -664,8 +901,10 @@ async fn race(
         .upstream
         .as_ref()
         .ok_or_else(|| anyhow!("fallback secondary group has no upstream"))?;
-    let primary_fut = primary_upstream.exchange(packet.clone(), client_id, client_proto);
-    let secondary_fut = secondary_upstream.exchange(packet, client_id, client_proto);
+    let primary_fut =
+        primary_upstream.exchange_observed(packet.clone(), client_id, client_proto, count_hedge);
+    let secondary_fut =
+        secondary_upstream.exchange_observed(packet, client_id, client_proto, count_hedge);
     tokio::pin!(primary_fut);
     tokio::pin!(secondary_fut);
     tokio::select! {
@@ -707,9 +946,18 @@ async fn resolve_none_group_with_ipset(
     primary: &crate::server::CustomGroup,
     secondary: &crate::server::CustomGroup,
     state: &Arc<AppState>,
+    count_hedge: bool,
 ) -> Result<Bytes> {
     let Some(ipset) = &state.ipset else {
-        return race(packet, info.id, client_proto, primary, secondary).await;
+        return race(
+            packet,
+            info.id,
+            client_proto,
+            primary,
+            secondary,
+            count_hedge,
+        )
+        .await;
     };
     let primary_upstream = primary
         .upstream
@@ -721,22 +969,13 @@ async fn resolve_none_group_with_ipset(
         .ok_or_else(|| anyhow!("fallback secondary group has no upstream"))?;
 
     if let Some(is_primary_domain) = state.verdict_cache.get(&info.qname) {
-        crate::verbose!(
-            "dns event=verdict_cache qname={} verdict={}",
-            info.qname,
-            if is_primary_domain {
-                "primary"
-            } else {
-                "secondary"
-            }
-        );
         return if is_primary_domain {
             primary_upstream
-                .exchange(packet, info.id, client_proto)
+                .exchange_observed(packet, info.id, client_proto, count_hedge)
                 .await
         } else {
             secondary_upstream
-                .exchange(packet, info.id, client_proto)
+                .exchange_observed(packet, info.id, client_proto, count_hedge)
                 .await
         };
     }
@@ -744,20 +983,17 @@ async fn resolve_none_group_with_ipset(
     let primary_packet = packet.clone();
     let secondary_packet = packet;
     let (primary_resp, secondary_resp) = tokio::join!(
-        primary_upstream.exchange(primary_packet, info.id, client_proto),
-        secondary_upstream.exchange(secondary_packet, info.id, client_proto)
+        primary_upstream.exchange_observed(primary_packet, info.id, client_proto, count_hedge),
+        secondary_upstream.exchange_observed(secondary_packet, info.id, client_proto, count_hedge)
     );
 
     match primary_resp {
         Ok(resp) => {
             let ips = dns::answer_ips(&resp, info.question_end);
-            let verdict = ipset.test_response(&ips);
-            crate::verbose!(
-                "dns event=none_group_verdict qname={} ips={} verdict={:?}",
-                info.qname,
-                ips.len(),
-                verdict
-            );
+            let ipset = ipset.clone();
+            let verdict = tokio::task::spawn_blocking(move || ipset.test_response(&ips))
+                .await
+                .map_err(|e| anyhow!("ipset test task failed: {e}"))?;
             let noip_as_primary = state.cfg.fallback.noip_as_primary_ip;
             match verdict {
                 TestVerdict::PrimaryIp => {
@@ -809,7 +1045,6 @@ fn maybe_add_response_ips(
 /// (the stale entry will be re-served on the next hit).
 pub(crate) fn spawn_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) {
     if !state.refresh_gate.begin(&refresh.key) {
-        crate::stats::inc_cache_refresh_skipped();
         return;
     }
     let key = refresh.key;
@@ -827,7 +1062,11 @@ pub fn spawn_refresh_worker(
 ) {
     tokio::spawn(async move {
         while let Some(refresh) = rx.recv().await {
-            crate::stats::inc_cache_refresh_started();
+            state
+                .querylog
+                .counters
+                .cache_refresh_started
+                .fetch_add(1, Ordering::Relaxed);
             do_cache_refresh(refresh, &state).await;
         }
     });
@@ -845,33 +1084,41 @@ async fn do_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) {
         qtype: refresh.qtype,
         question_end: refresh.question_end,
     };
-    crate::verbose!(
-        "dns event=cache_refresh_start qname={} qtype={}",
-        refresh.qname,
-        refresh.qtype
-    );
     let Some(target) = router::choose_refresh_target(state, &refresh.qname, refresh.qtype) else {
         state.refresh_gate.end(&refresh.key);
         return;
     };
-    if let Err(err) = exchange_with_dedupe(
+    let result = exchange_with_dedupe(
         QueryContext {
             packet: refresh.query,
             info,
-            peer: SocketAddr::from(([0, 0, 0, 0], 0)),
-            client_proto: ClientProto::Udp,
+            origin: QueryOrigin::CacheRefresh,
         },
         state,
         target,
     )
-    .await
-    {
-        crate::stats::inc_cache_refresh_failed();
-        crate::verbose!(
-            "dns event=cache_refresh_error qname={} error={:#}",
-            refresh.qname,
-            err
-        );
+    .await;
+    if result.is_err() {
+        state
+            .querylog
+            .counters
+            .cache_refresh_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
     state.refresh_gate.end(&refresh.key);
+}
+
+#[cfg(test)]
+mod querylog_tests {
+    use super::*;
+
+    #[test]
+    fn received_queries_are_counted_once_by_protocol() {
+        let ql = crate::querylog::QueryLogHandle::disabled();
+        record_query_received(&ql, ClientProto::Udp);
+        record_query_received(&ql, ClientProto::Tcp);
+        assert_eq!(ql.counters.queries_total.load(Ordering::Relaxed), 2);
+        assert_eq!(ql.counters.queries_udp.load(Ordering::Relaxed), 1);
+        assert_eq!(ql.counters.queries_tcp.load(Ordering::Relaxed), 1);
+    }
 }

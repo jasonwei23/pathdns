@@ -6,14 +6,12 @@
 //! for each unique set.  The worker owns its own `NetfilterClient`
 //! (separate from the one held by `IpSetManager` for sync fallback).
 
+use super::client::NetfilterClient;
+use super::config::SetName;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
-
-use super::client::NetfilterClient;
-use super::config::SetName;
 
 pub(super) const ADD_QUEUE_SIZE: usize = 16384;
 pub(super) const ADD_BATCH_SIZE: usize = 64;
@@ -55,7 +53,6 @@ fn run_add_worker(rx: mpsc::Receiver<AddJob>) {
         batch.sort_by(|a, b| a.set.cmp(&b.set).then_with(|| a.ip.cmp(&b.ip)));
         dedup_jobs(&mut batch);
 
-        let start = Instant::now();
         let mut first_err: Option<String> = None;
 
         // Process each contiguous run of jobs for the same set together.
@@ -77,12 +74,6 @@ fn run_add_worker(rx: mpsc::Receiver<AddJob>) {
             if warned.insert(key.clone()) {
                 crate::log_error!("netlink op=add_batch status=failed error={key}");
             }
-        } else {
-            crate::verbose!(
-                "netlink op=add_batch jobs={} elapsed_us={}",
-                batch.len(),
-                start.elapsed().as_micros()
-            );
         }
         batch.clear();
     }

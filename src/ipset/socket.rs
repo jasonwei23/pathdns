@@ -39,21 +39,30 @@ impl NetlinkSocket {
             tv_sec: 0,
             tv_usec: 50_000,
         };
-        unsafe {
+        if unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
                 &timeout as *const _ as *const libc::c_void,
                 mem::size_of_val(&timeout) as libc::socklen_t,
-            );
+            )
+        } < 0
+        {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err).context("failed to set netlink receive timeout");
         }
 
         // Bind so the kernel assigns a port ID (nl_pid).
         let mut sa: libc::sockaddr_nl = unsafe { mem::zeroed() };
         sa.nl_family = libc::AF_NETLINK as u16;
         let sa_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, sa_len) };
+        if unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, sa_len) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err).context("failed to bind netlink socket");
+        }
 
         Ok(Self {
             fd,
@@ -115,7 +124,18 @@ impl NetlinkSocket {
                 let msg_type = u16::from_ne_bytes(buf[pos + 4..pos + 6].try_into().unwrap());
                 let msg_seq = u32::from_ne_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
 
-                let data_end = buf.len().min(pos + msg_len);
+                let Some(data_end) = pos.checked_add(msg_len) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "netlink message length overflow",
+                    ));
+                };
+                if data_end > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated netlink message",
+                    ));
+                }
 
                 if msg_seq == seq {
                     return Ok(RecvMsg {

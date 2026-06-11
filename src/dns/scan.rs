@@ -61,13 +61,24 @@ pub fn answer_ips(packet: &[u8], question_end: usize) -> SmallVec<[IpAddr; 4]> {
     ips
 }
 
+/// Compute the effective cache TTL and per-RR TTL offsets for a DNS response.
+///
+/// Returns `(entry_ttl, offset_ttl_pairs)` where:
+/// - `entry_ttl`: minimum clamped TTL across answer-section RRs (or the SOA-derived value for
+///   NODATA/NXDOMAIN); governs when the cache entry expires.
+/// - `offset_ttl_pairs`: `(byte_offset_of_ttl_field, clamped_rr_ttl)` for every non-OPT RR in
+///   all sections.  At serve time each RR is patched to `clamped_rr_ttl - elapsed` so that
+///   clients receive an accurate countdown rather than the uniform minimum.
+///
+/// `min_ttl`/`max_ttl` are applied per-RR; `nodata_ttl` is the fallback when no SOA is present.
+/// Negative (NXDOMAIN/NODATA) TTLs are additionally capped at 10800 s per RFC 2308 §5.
 pub fn effective_ttl_and_offsets(
     packet: &[u8],
     question_end: usize,
     nodata_ttl: u32,
     min_ttl: u32,
     max_ttl: u32,
-) -> Option<(u32, SmallVec<[usize; 8]>)> {
+) -> Option<(u32, SmallVec<[(usize, u32); 8]>)> {
     if !is_good_reply(packet) {
         return None;
     }
@@ -75,40 +86,52 @@ pub fn effective_ttl_and_offsets(
     let an = u16::from_be_bytes([packet[6], packet[7]]) as usize;
     let ns = u16::from_be_bytes([packet[8], packet[9]]) as usize;
     let ar = u16::from_be_bytes([packet[10], packet[11]]) as usize;
-    // Single pass: collect TTL offsets and, when the answer section is empty,
-    // the SOA TTL from the authority section (RFC 2308).
-    let (offsets, an_offsets, soa_ttl) =
+    let (offset_ttl_pairs, an_offsets, soa_ttl) =
         ttl_offsets_and_soa(packet, question_end, an, ns, ar)?;
 
-    // NODATA / NXDOMAIN (no answer records): RFC 2308 mandates min(SOA_TTL, SOA_MINIMUM).
-    let raw_ttl = if an == 0 {
-        soa_ttl.unwrap_or(nodata_ttl)
-    } else {
-        // Use only answer-section offsets; authority/additional may carry glue with lower TTLs.
-        let mut min_seen = u32::MAX;
-        for &off in &offsets[..an_offsets] {
-            if off + 4 <= packet.len() {
-                let t = u32::from_be_bytes(packet[off..off + 4].try_into().ok()?);
-                min_seen = min_seen.min(t);
-            }
-        }
-        if min_seen == u32::MAX {
-            nodata_ttl
-        } else {
-            min_seen
-        }
+    // Apply per-RR min/max clamping.
+    let clamp = |raw: u32| -> u32 {
+        let v = raw.max(min_ttl);
+        if max_ttl > 0 { v.min(max_ttl) } else { v }
     };
 
-    let mut ttl = raw_ttl.max(min_ttl);
-    if max_ttl > 0 {
-        ttl = ttl.min(max_ttl);
+    if an == 0 {
+        // NODATA / NXDOMAIN: RFC 2308 §5 mandates min(SOA_TTL, SOA_MINIMUM), capped at 10800 s.
+        let soa = soa_ttl.unwrap_or(nodata_ttl).min(10800);
+        let effective = clamp(soa);
+        // All RRs in the authority/additional sections share the SOA-derived TTL.
+        let offsets = offset_ttl_pairs.iter().map(|&(off, _)| (off, effective)).collect();
+        Some((effective, offsets))
+    } else {
+        // Positive response: clamp each RR independently.
+        let offsets: SmallVec<[(usize, u32); 8]> =
+            offset_ttl_pairs.iter().map(|&(off, raw)| (off, clamp(raw))).collect();
+        // Entry lifetime is driven by the minimum of the answer-section TTLs.
+        let entry_ttl = offsets[..an_offsets]
+            .iter()
+            .map(|&(_, t)| t)
+            .min()
+            .unwrap_or(nodata_ttl);
+        Some((entry_ttl, offsets))
     }
-    Some((ttl, offsets))
 }
 
-pub fn patch_ttls_at(packet: &mut [u8], offsets: &[usize], ttl: u32) {
+/// Patch each RR's TTL field to `original_clamped_ttl − elapsed_secs` (per-RR countdown).
+/// Used for fresh cache entries so clients see an accurate remaining-lifetime for every RR.
+pub fn patch_ttls_at(packet: &mut [u8], offsets: &[(usize, u32)], elapsed: u32) {
+    for &(offset, original_ttl) in offsets {
+        let remaining = original_ttl.saturating_sub(elapsed);
+        if offset + 4 <= packet.len() {
+            packet[offset..offset + 4].copy_from_slice(&remaining.to_be_bytes());
+        }
+    }
+}
+
+/// Patch all RR TTL fields to the same uniform value.
+/// Used for stale entries (where `ttl` is the stale-advertised value) and synthetic responses.
+pub fn patch_ttls_uniform(packet: &mut [u8], offsets: &[(usize, u32)], ttl: u32) {
     let ttl_bytes = ttl.to_be_bytes();
-    for &offset in offsets {
+    for &(offset, _) in offsets {
         if offset + 4 <= packet.len() {
             packet[offset..offset + 4].copy_from_slice(&ttl_bytes);
         }
@@ -118,8 +141,8 @@ pub fn patch_ttls_at(packet: &mut [u8], offsets: &[usize], ttl: u32) {
 /// Single pass over all RR sections.
 /// Returns `None` if any RR is malformed or truncated (so callers reject the whole response).
 /// On success returns:
-/// - `offsets`: TTL byte positions for all non-OPT records (all sections, used for patching).
-/// - `an_offsets`: how many of those offsets belong to the answer section.
+/// - `offset_ttl_pairs`: `(ttl_byte_offset, raw_rr_ttl)` for all non-OPT records (all sections).
+/// - `an_offsets`: how many of those pairs belong to the answer section.
 /// - `soa_ttl`: when the authority section has a SOA, `min(SOA_TTL, SOA_MINIMUM)` per RFC 2308.
 fn ttl_offsets_and_soa(
     packet: &[u8],
@@ -127,9 +150,9 @@ fn ttl_offsets_and_soa(
     an: usize,
     ns: usize,
     ar: usize,
-) -> Option<(SmallVec<[usize; 8]>, usize, Option<u32>)> {
+) -> Option<(SmallVec<[(usize, u32); 8]>, usize, Option<u32>)> {
     let total = an + ns + ar;
-    let mut offsets: SmallVec<[usize; 8]> = SmallVec::new();
+    let mut offsets: SmallVec<[(usize, u32); 8]> = SmallVec::new();
     let mut an_offsets = 0usize;
     let mut soa_ttl: Option<u32> = None;
 
@@ -145,6 +168,12 @@ fn ttl_offsets_and_soa(
             return None;
         }
         let rr_type = u16::from_be_bytes([packet[fixed], packet[fixed + 1]]);
+        let rr_ttl = u32::from_be_bytes([
+            packet[fixed + 4],
+            packet[fixed + 5],
+            packet[fixed + 6],
+            packet[fixed + 7],
+        ]);
         let rdlen = u16::from_be_bytes([packet[fixed + 8], packet[fixed + 9]]) as usize;
         let rdata = fixed + 10;
         let rdata_end = rdata + rdlen;
@@ -154,7 +183,7 @@ fn ttl_offsets_and_soa(
 
         // OPT (type 41): its TTL field encodes EDNS version + extended RCODE, not a real TTL.
         if rr_type != 41 {
-            offsets.push(fixed + 4);
+            offsets.push((fixed + 4, rr_ttl));
             if i < an {
                 an_offsets += 1;
             }
@@ -162,13 +191,6 @@ fn ttl_offsets_and_soa(
 
         // SOA in the authority section: extract min(rr_ttl, MINIMUM) for RFC 2308 NODATA/NXDOMAIN.
         if rr_type == 6 && soa_ttl.is_none() && i >= an && i < an + ns {
-            let rr_ttl = u32::from_be_bytes([
-                packet[fixed + 4],
-                packet[fixed + 5],
-                packet[fixed + 6],
-                packet[fixed + 7],
-            ]);
-            // SOA RDATA: MNAME + RNAME + serial(4) + refresh(4) + retry(4) + expire(4) + minimum(4)
             if let Some(minimum) = extract_soa_minimum(packet, rdata, rdata_end) {
                 soa_ttl = Some(rr_ttl.min(minimum));
             }

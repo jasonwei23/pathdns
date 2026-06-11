@@ -55,6 +55,8 @@ pub struct UpstreamConfig {
     pub udp_buf_size: usize,
     pub upstream_max_inflight: usize,
     pub hedge_delay: Option<Duration>,
+    /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
+    pub upstream_max_response_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,18 +148,60 @@ pub struct FallbackConfig {
     pub noip_as_primary_ip: bool,
 }
 
+/// Configuration for the query log subsystem.
+#[derive(Debug, Clone)]
+pub struct QueryLogConfig {
+    /// Whether the querylog section was present in the configuration.
+    pub enabled: bool,
+    /// HTTP API bind addresses. Empty = no HTTP listener.
+    /// Multiple addresses allow dual-stack: `["0.0.0.0:8080", "[::]:8080"]`.
+    pub bind: Vec<SocketAddr>,
+    /// Bearer token for API auth. `None` = no auth required.
+    pub token: Option<String>,
+    /// Ring buffer capacity. 0 = event collection disabled (counters only).
+    pub memory: usize,
+    /// mpsc channel capacity.
+    pub channel: usize,
+    /// Extract A/AAAA answer IPs into detailed events.
+    pub answer_ips: bool,
+    pub file: Option<QueryLogFileConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryLogFileConfig {
+    pub dir: PathBuf,
+    /// Rotate when the active segment exceeds this size in MiB.
+    pub max_mb: u64,
+    /// Maximum number of completed (compressed) segments to retain.
+    pub max_segments: usize,
+    /// Maximum events to accumulate before one write call.
+    pub batch_size: usize,
+    /// How often the worker flushes its OS buffer (milliseconds).
+    pub flush_interval_ms: u64,
+    /// Delete compressed segments older than this many days. `None` = no age limit.
+    pub retention_days: Option<u32>,
+    /// Gzip-compress segments after rotation.
+    pub compress: bool,
+}
+
+/// One DNS listen address with its enabled protocols (from an optional
+/// `@udp`/`@tcp` suffix; both when no suffix is given).
+#[derive(Debug, Clone, Copy)]
+pub struct BindEndpoint {
+    pub addr: SocketAddr,
+    pub udp: bool,
+    pub tcp: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub bind: SocketAddr,
-    pub listen_udp: bool,
-    pub listen_tcp: bool,
+    pub bind: Vec<BindEndpoint>,
     pub timeout: Duration,
     pub max_inflight: usize,
     /// 0 = hard-drop immediately; >0 = queue for up to this many ms before dropping.
     pub inflight_queue_ms: u64,
     pub worker_threads: usize,
     pub fallback: FallbackConfig,
-    pub verbose: bool,
     pub cache_size: usize,
     pub cache_stale_expire_ttl: u64,
     pub cache_stale_ttl: u32,
@@ -172,13 +216,21 @@ pub struct Config {
     pub cache_persist_interval: u64,
     pub udp_buf_size: usize,
     pub udp_pool_size: usize,
-    pub metrics_addr: Option<SocketAddr>,
+    /// Maximum concurrent TCP client connections. 0 = unlimited.
+    pub tcp_max_connections: usize,
+    /// Timeout for reading the DNS message body. 0 = disabled.
+    pub tcp_read_timeout_ms: u64,
+    /// Timeout for waiting for the next request on an idle TCP connection. 0 = disabled.
+    pub tcp_idle_timeout_ms: u64,
+    pub querylog: QueryLogConfig,
     pub groups: Vec<GroupSpec>,
     pub ipset: Option<IpSetConfig>,
     pub verdict_cache: Option<VerdictCacheConfig>,
     pub geosite_files: Vec<PathBuf>,
     pub upstream_max_inflight: usize,
     pub hedge_delay: Option<Duration>,
+    /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
+    pub upstream_max_response_bytes: usize,
 }
 
 impl Config {
@@ -203,23 +255,18 @@ impl Config {
             udp_buf_size: self.udp_buf_size,
             upstream_max_inflight: self.upstream_max_inflight,
             hedge_delay: self.hedge_delay,
+            upstream_max_response_bytes: self.upstream_max_response_bytes,
         }
     }
 
     pub fn parse_args() -> Result<Self> {
-        let (config_path, verbose) = parse_cli()?;
+        let config_path = parse_cli()?;
         let json = crate::config_json::load_json_config(&config_path)?;
-        Self::from_json(json, verbose)
+        Self::from_json(json)
     }
 
-    pub(crate) fn from_json(json: JsonConfig, cli_verbose: bool) -> Result<Self> {
-        let bind_raw = json.bind.as_deref().unwrap_or("127.0.0.1:65353");
-        let (listen_udp, listen_tcp) = resolve_bind_proto(bind_raw)?;
-        let bind_addr = {
-            let addr_part = bind_raw.split_once('@').map_or(bind_raw, |(a, _)| a);
-            let normalized = normalize_addr_with_default_port(addr_part, 65353);
-            parse_addr(&normalized).with_context(|| format!("invalid bind address: {addr_part}"))?
-        };
+    pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
+        let bind_addrs = parse_bind_config(json.bind)?;
 
         let worker_threads = json.worker_threads.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -274,18 +321,95 @@ impl Config {
         }
 
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
-        let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads).max(1);
+        let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads.max(32)).max(1);
+
+        // Parse querylog section.
+        let querylog = if let Some(ql) = json.querylog {
+            let bind = ql
+                .bind
+                .map(|v| parse_addr_list(v, "querylog.bind"))
+                .transpose()?
+                .unwrap_or_default();
+            if ql
+                .token
+                .as_deref()
+                .is_some_and(|token| token.trim().is_empty())
+            {
+                return Err(anyhow!("querylog.token must not be empty"));
+            }
+            let channel = ql.channel.unwrap_or(4096);
+            if channel == 0 {
+                return Err(anyhow!("querylog.channel must be at least 1"));
+            }
+            if channel > 1_000_000 {
+                return Err(anyhow!("querylog.channel must not exceed 1000000"));
+            }
+            let memory = ql.memory.unwrap_or(1000);
+            if memory > 10_000_000 {
+                return Err(anyhow!("querylog.memory must not exceed 10000000"));
+            }
+            let file = if let Some(f) = ql.file {
+                let dir = PathBuf::from(f.dir.unwrap_or_else(|| "./querylog".to_string()));
+                let max_mb = f.max_mb.unwrap_or(8);
+                let max_segments = f.max_segments.unwrap_or(3);
+                if max_mb == 0 {
+                    return Err(anyhow!("querylog.file.max-mb must be at least 1"));
+                }
+                if max_segments == 0 {
+                    return Err(anyhow!("querylog.file.max-segments must be at least 1"));
+                }
+                let batch_size = f.batch_size.unwrap_or(256).max(1);
+                let flush_interval_ms = f.flush_interval_ms.unwrap_or(500).max(50);
+                let retention_days = f.retention_days;
+                let compress = f.compress.unwrap_or(true);
+                Some(QueryLogFileConfig {
+                    dir,
+                    max_mb,
+                    max_segments,
+                    batch_size,
+                    flush_interval_ms,
+                    retention_days,
+                    compress,
+                })
+            } else {
+                None
+            };
+            QueryLogConfig {
+                enabled: true,
+                bind,
+                token: ql.token,
+                memory,
+                channel,
+                answer_ips: ql.answer_ips.unwrap_or(false),
+                file,
+            }
+        } else {
+            QueryLogConfig {
+                enabled: false,
+                bind: Vec::new(),
+                token: None,
+                memory: 0,
+                channel: 4096,
+                answer_ips: false,
+                file: None,
+            }
+        };
+
+        let tcp_max_connections = json.tcp_max_connections.unwrap_or(1024);
+        let tcp_read_timeout_ms = json.tcp_read_timeout_ms.unwrap_or(5000);
+        let tcp_idle_timeout_ms = json.tcp_idle_timeout_ms.unwrap_or(30_000);
 
         Ok(Self {
-            bind: bind_addr,
-            listen_udp,
-            listen_tcp,
-            timeout: Duration::from_millis(json.timeout_ms.unwrap_or(5000)),
+            bind: bind_addrs,
+            timeout: Duration::from_millis(json.timeout_ms.unwrap_or(3000)),
             max_inflight,
             inflight_queue_ms,
             worker_threads,
             fallback,
-            verbose: json.verbose.unwrap_or(false) || cli_verbose,
+            querylog,
+            tcp_max_connections,
+            tcp_read_timeout_ms,
+            tcp_idle_timeout_ms,
             cache_size: json.cache.as_ref().and_then(|c| c.size).unwrap_or(10000),
             cache_stale_expire_ttl: json
                 .cache
@@ -321,7 +445,6 @@ impl Config {
                 .unwrap_or(0),
             udp_buf_size,
             udp_pool_size,
-            metrics_addr: json.metrics_addr.as_deref().map(parse_addr).transpose()?,
             groups,
             ipset,
             verdict_cache,
@@ -333,16 +456,16 @@ impl Config {
                 .collect(),
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
+            upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
         })
     }
 }
 
 // ── CLI parsing ─────────────────────────────────────────────────────────────
 
-fn parse_cli() -> Result<(PathBuf, bool)> {
+fn parse_cli() -> Result<PathBuf> {
     let args: Vec<String> = std::env::args().collect();
     let mut config: Option<PathBuf> = None;
-    let mut verbose = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -353,7 +476,6 @@ fn parse_cli() -> Result<(PathBuf, bool)> {
                     .ok_or_else(|| anyhow!("-c requires a config file path"))?;
                 config = Some(PathBuf::from(path));
             }
-            "-v" => verbose = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -366,7 +488,7 @@ fn parse_cli() -> Result<(PathBuf, bool)> {
     }
     let config = config
         .ok_or_else(|| anyhow!("Error: configuration file not specified.\nUse -h for help."))?;
-    Ok((config, verbose))
+    Ok(config)
 }
 
 fn print_help() {
@@ -375,7 +497,6 @@ fn print_help() {
          \n\
          Options:\n\
            -c <config.json>   Load configuration file (required)\n\
-           -v                 Enable verbose output\n\
            -h                 Show this help message\n\
          \n\
          All configuration is read from the JSON file specified with -c."
@@ -384,62 +505,91 @@ fn print_help() {
 
 // ── Config parsing helpers ───────────────────────────────────────────────────
 
+/// Parse the `fallback` config value.
+///
+/// Accepted forms:
+/// - `"fallback": "<group>"` — route unmatched queries to a named group
+/// - `"fallback": "null"` — return empty responses
+/// - `"fallback": { "primary": ..., "secondary": ..., "ipset-name4"/"ipset-name6": ... }`
+///   — **ipset-test mode**: both groups are queried concurrently (for latency),
+///   but the upstream is *decided by ipset membership*: if the primary's answer
+///   IPs are in the configured ipset, the primary's answer is used, otherwise
+///   the secondary's. This is IP-policy routing, not a latency race, so at least
+///   one of `ipset-name4`/`ipset-name6` is required.
 fn parse_fallback_config(
-    jf: crate::config_json::JsonFallbackSection,
+    value: serde_json::Value,
     groups: &[GroupSpec],
 ) -> Result<FallbackConfig> {
     let group_exists = |name: &str| groups.iter().any(|g| g.name == name);
 
-    let target = match jf.default_group.as_str() {
-        "null" => FallbackTarget::Null,
-        "none" => {
-            let primary = jf
-                .primary
-                .ok_or_else(|| anyhow!("fallback: default-group \"none\" requires \"primary\""))?;
-            let secondary = jf.secondary.ok_or_else(|| {
-                anyhow!("fallback: default-group \"none\" requires \"secondary\"")
-            })?;
-            if !group_exists(&primary) {
-                return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
-            }
-            if !group_exists(&secondary) {
-                return Err(anyhow!("fallback.secondary \"{secondary}\": no such group"));
-            }
-            if primary == secondary {
-                return Err(anyhow!(
-                    "fallback.primary and fallback.secondary must be different groups"
-                ));
-            }
-            let ipset = match (jf.ipset_name4, jf.ipset_name6) {
-                (None, None) => None,
-                (v4, v6) => {
-                    let pair = IpSetPair {
-                        v4: v4.filter(|s| !s.is_empty() && s != "null"),
-                        v6: v6.filter(|s| !s.is_empty() && s != "null"),
-                    };
-                    if pair.v4.is_none() && pair.v6.is_none() {
-                        None
-                    } else {
-                        Some(pair)
-                    }
-                }
-            };
-            FallbackTarget::None {
-                primary,
-                secondary,
-                ipset,
-            }
-        }
-        name => {
+    // String shorthand: a group name, or "null" for empty responses.
+    if let serde_json::Value::String(name) = &value {
+        let target = if name == "null" {
+            FallbackTarget::Null
+        } else {
             if !group_exists(name) {
-                return Err(anyhow!("fallback.default-group \"{name}\": no such group"));
+                return Err(anyhow!("fallback \"{name}\": no such group"));
             }
-            FallbackTarget::Group(name.to_string())
+            FallbackTarget::Group(name.clone())
+        };
+        return Ok(FallbackConfig {
+            target,
+            noip_as_primary_ip: false,
+        });
+    }
+
+    // Object form: always ipset-test mode.
+    let jf: crate::config_json::JsonFallbackSection = serde_json::from_value(value)
+        .map_err(|e| anyhow!("invalid fallback section: {e}"))?;
+
+    let primary = jf.primary.ok_or_else(|| {
+        anyhow!(
+            "fallback: ipset-test mode requires \"primary\" \
+             (to route to a single group use \"fallback\": \"<group>\")"
+        )
+    })?;
+    let secondary = jf
+        .secondary
+        .ok_or_else(|| anyhow!("fallback: ipset-test mode requires \"secondary\""))?;
+    if !group_exists(&primary) {
+        return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
+    }
+    if !group_exists(&secondary) {
+        return Err(anyhow!("fallback.secondary \"{secondary}\": no such group"));
+    }
+    if primary == secondary {
+        return Err(anyhow!(
+            "fallback.primary and fallback.secondary must be different groups"
+        ));
+    }
+    let ipset = match (jf.ipset_name4, jf.ipset_name6) {
+        (None, None) => None,
+        (v4, v6) => {
+            let pair = IpSetPair {
+                v4: v4.filter(|s| !s.is_empty() && s != "null"),
+                v6: v6.filter(|s| !s.is_empty() && s != "null"),
+            };
+            if pair.v4.is_none() && pair.v6.is_none() {
+                None
+            } else {
+                Some(pair)
+            }
         }
     };
+    if ipset.is_none() {
+        return Err(anyhow!(
+            "fallback: {{\"primary\", \"secondary\"}} requires \"ipset-name4\" \
+             and/or \"ipset-name6\" — the primary's answer IPs are tested \
+             against the ipset to decide which upstream's answer is used"
+        ));
+    }
 
     Ok(FallbackConfig {
-        target,
+        target: FallbackTarget::None {
+            primary,
+            secondary,
+            ipset,
+        },
         noip_as_primary_ip: jf.noip_as_primary_ip.unwrap_or(false),
     })
 }
@@ -654,6 +804,81 @@ fn parse_groups(json_groups: Vec<JsonGroupEntry>) -> Result<Vec<GroupSpec>> {
     }
 
     Ok(groups)
+}
+
+fn parse_bind_config(value: Option<serde_json::Value>) -> Result<Vec<BindEndpoint>> {
+    match value {
+        None => {
+            let addr = parse_addr_with_default_port("127.0.0.1", 65353)?;
+            Ok(vec![BindEndpoint {
+                addr,
+                udp: true,
+                tcp: true,
+            }])
+        }
+        Some(serde_json::Value::String(s)) => Ok(vec![parse_bind_endpoint(&s)?]),
+        Some(serde_json::Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Err(anyhow!("bind array must not be empty"));
+            }
+            let mut endpoints: Vec<BindEndpoint> = Vec::with_capacity(arr.len());
+            for v in &arr {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| anyhow!("bind array elements must be strings"))?;
+                let ep = parse_bind_endpoint(s)?;
+                // Duplicate addresses would silently double the SO_REUSEPORT
+                // shard count and split traffic unpredictably.
+                if endpoints.iter().any(|e| e.addr == ep.addr) {
+                    return Err(anyhow!("duplicate bind address: {}", ep.addr));
+                }
+                endpoints.push(ep);
+            }
+            Ok(endpoints)
+        }
+        _ => Err(anyhow!("bind must be a string or an array of strings")),
+    }
+}
+
+/// Parse a JSON string-or-array of socket addresses, rejecting duplicates.
+/// Used for listen addresses that have no protocol suffix (e.g. `querylog.bind`).
+fn parse_addr_list(value: serde_json::Value, what: &str) -> Result<Vec<SocketAddr>> {
+    let strings: Vec<String> = match value {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return Err(anyhow!("{what} array must not be empty"));
+            }
+            arr.iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!("{what} array elements must be strings"))
+                })
+                .collect::<Result<_>>()?
+        }
+        _ => return Err(anyhow!("{what} must be a string or an array of strings")),
+    };
+    let mut out = Vec::with_capacity(strings.len());
+    for s in &strings {
+        let addr = parse_addr(s).with_context(|| format!("invalid {what} address: {s}"))?;
+        if out.contains(&addr) {
+            return Err(anyhow!("duplicate {what} address: {addr}"));
+        }
+        out.push(addr);
+    }
+    Ok(out)
+}
+
+/// Parse one bind entry: `addr[@udp|@tcp]`. The protocol suffix applies only
+/// to its own entry, so e.g. `["0.0.0.0:53@udp", "[::]:53"]` is valid.
+fn parse_bind_endpoint(raw: &str) -> Result<BindEndpoint> {
+    let (udp, tcp) = resolve_bind_proto(raw)?;
+    let addr_part = raw.split_once('@').map_or(raw, |(a, _)| a);
+    let normalized = normalize_addr_with_default_port(addr_part, 65353);
+    let addr = parse_addr(&normalized)
+        .with_context(|| format!("invalid bind address: {addr_part}"))?;
+    Ok(BindEndpoint { addr, udp, tcp })
 }
 
 fn resolve_bind_proto(raw: &str) -> Result<(bool, bool)> {
@@ -1031,5 +1256,192 @@ impl UpstreamProto {
 
     fn uses_tls_name(self) -> bool {
         matches!(self, Self::Tls | Self::Https | Self::Quic | Self::H3)
+    }
+}
+
+#[cfg(test)]
+mod querylog_tests {
+    use super::*;
+
+    fn parse(input: &str) -> Result<Config> {
+        let json: JsonConfig = serde_json::from_str(input)?;
+        Config::from_json(json)
+    }
+
+    #[test]
+    fn omitted_querylog_is_fully_disabled() {
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
+        assert!(!cfg.querylog.enabled);
+        assert_eq!(cfg.querylog.memory, 0);
+        assert!(cfg.querylog.bind.is_empty());
+        assert!(cfg.querylog.file.is_none());
+    }
+
+    #[test]
+    fn present_querylog_uses_safe_defaults() {
+        let cfg = parse(r#"{"fallback":"null","querylog":{}}"#).unwrap();
+        assert!(cfg.querylog.enabled);
+        assert_eq!(cfg.querylog.memory, 1000);
+        assert_eq!(cfg.querylog.channel, 4096);
+        assert!(!cfg.querylog.answer_ips);
+    }
+
+    #[test]
+    fn tcp_defaults_are_protective() {
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
+        assert_eq!(cfg.tcp_max_connections, 1024);
+        assert_eq!(cfg.tcp_read_timeout_ms, 5000);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn tcp_zero_means_unlimited_or_disabled() {
+        let cfg = parse(
+            r#"{"fallback":"null",
+                "tcp-max-connections":0,
+                "tcp-read-timeout-ms":0,
+                "tcp-idle-timeout-ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_max_connections, 0);
+        assert_eq!(cfg.tcp_read_timeout_ms, 0);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 0);
+    }
+
+    #[test]
+    fn tcp_custom_values_are_accepted() {
+        let cfg = parse(
+            r#"{"fallback":"null",
+                "tcp-max-connections":256,
+                "tcp-read-timeout-ms":2000,
+                "tcp-idle-timeout-ms":10000}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_max_connections, 256);
+        assert_eq!(cfg.tcp_read_timeout_ms, 2000);
+        assert_eq!(cfg.tcp_idle_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn invalid_querylog_limits_are_rejected() {
+        assert!(
+            parse(r#"{"fallback":"null","querylog":{"channel":0}}"#).is_err()
+        );
+        assert!(
+            parse(r#"{"fallback":"null","querylog":{"file":{"max-mb":0}}}"#)
+                .is_err()
+        );
+        assert!(parse(
+            r#"{"fallback":"null","querylog":{"file":{"max-segments":0}}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bind_string_with_proto_suffix() {
+        let cfg = parse(r#"{"fallback":"null","bind":"0.0.0.0:53@udp"}"#)
+            .unwrap();
+        assert_eq!(cfg.bind.len(), 1);
+        assert!(cfg.bind[0].udp);
+        assert!(!cfg.bind[0].tcp);
+    }
+
+    #[test]
+    fn bind_array_dual_stack_with_per_address_proto() {
+        let cfg = parse(
+            r#"{"fallback":"null",
+                "bind":["0.0.0.0:53@udp", "[::]:53"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.bind.len(), 2);
+        assert!(cfg.bind[0].addr.is_ipv4());
+        assert!(cfg.bind[0].udp);
+        assert!(!cfg.bind[0].tcp, "@udp suffix in a bind array must disable tcp");
+        assert!(cfg.bind[1].addr.is_ipv6());
+        assert!(cfg.bind[1].udp);
+        assert!(cfg.bind[1].tcp);
+    }
+
+    #[test]
+    fn bind_array_rejects_invalid_proto_suffix() {
+        assert!(parse(
+            r#"{"fallback":"null","bind":["0.0.0.0:53@bogus"]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fallback_string_shorthand_null() {
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
+        assert!(matches!(cfg.fallback.target, FallbackTarget::Null));
+    }
+
+    #[test]
+    fn fallback_string_shorthand_group() {
+        let cfg = parse(
+            r#"{"group":[{"name":"a","upstream":["1.1.1.1"]}],"fallback":"a"}"#,
+        )
+        .unwrap();
+        assert!(matches!(&cfg.fallback.target, FallbackTarget::Group(g) if g == "a"));
+    }
+
+    #[test]
+    fn fallback_string_unknown_group_rejected() {
+        assert!(parse(r#"{"fallback":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn fallback_ipset_test_mode_without_default_group() {
+        let cfg = parse(
+            r#"{"group":[
+                  {"name":"a","upstream":["1.1.1.1"]},
+                  {"name":"b","upstream":["8.8.8.8"]}],
+                "fallback":{"primary":"a","secondary":"b",
+                            "ipset-name4":"chnroute","ipset-name6":"chnroute6"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &cfg.fallback.target,
+            FallbackTarget::None { primary, secondary, ipset: Some(_) }
+                if primary == "a" && secondary == "b"
+        ));
+    }
+
+    #[test]
+    fn fallback_new_form_requires_ipset() {
+        // Without ipset names the decision mechanism is gone — must be rejected.
+        assert!(parse(
+            r#"{"group":[
+                  {"name":"a","upstream":["1.1.1.1"]},
+                  {"name":"b","upstream":["8.8.8.8"]}],
+                "fallback":{"primary":"a","secondary":"b"}}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fallback_empty_object_rejected() {
+        assert!(parse(r#"{"fallback":{}}"#).is_err());
+    }
+
+    #[test]
+    fn querylog_bind_accepts_dual_stack_array() {
+        let cfg = parse(
+            r#"{"fallback":"null",
+                "querylog":{"bind":["127.0.0.1:8080","[::1]:8080"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.querylog.bind.len(), 2);
+        assert!(cfg.querylog.bind[0].is_ipv4());
+        assert!(cfg.querylog.bind[1].is_ipv6());
+    }
+
+    #[test]
+    fn querylog_bind_rejects_duplicates() {
+        assert!(parse(
+            r#"{"fallback":"null",
+                "querylog":{"bind":["127.0.0.1:8080","127.0.0.1:8080"]}}"#
+        )
+        .is_err());
     }
 }
