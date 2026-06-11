@@ -1112,20 +1112,29 @@ pub(crate) fn spawn_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) 
     }
 }
 
-/// Spawn the single background cache refresh worker.
+/// Spawn the background cache refresh worker pool.
+/// Refreshes are processed concurrently up to `MAX_CONCURRENT_REFRESHES` at a time,
+/// so a burst of expiring entries cannot make any single domain wait behind a long queue.
 /// Call this once after `AppState` is wrapped in an `Arc`.
 pub fn spawn_refresh_worker(
     state: Arc<AppState>,
     mut rx: tokio::sync::mpsc::Receiver<CacheRefresh>,
 ) {
+    const MAX_CONCURRENT_REFRESHES: usize = 8;
     tokio::spawn(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES));
         while let Some(refresh) = rx.recv().await {
             state
                 .querylog
                 .counters
                 .cache_refresh_started
                 .fetch_add(1, Ordering::Relaxed);
-            do_cache_refresh(refresh, &state).await;
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                do_cache_refresh(refresh, &state).await;
+            });
         }
     });
 }
