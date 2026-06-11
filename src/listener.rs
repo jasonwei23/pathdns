@@ -14,6 +14,7 @@ use crate::pipeline::{
     handle_packet_bytes, handle_packet_slow_preparsed, spawn_cache_refresh, try_fast_path_into,
     FastPathOutcome,
 };
+use crate::dns;
 use crate::server::AppState;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};
 use anyhow::{anyhow, Context, Result};
@@ -112,6 +113,24 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
             }
             FastPathOutcome::Drop => {}
             FastPathOutcome::Miss { info } => {
+                // Acquire the inflight semaphore permit BEFORE spawning to bound the number
+                // of in-flight tasks. Without this, a UDP flood creates unlimited waiting
+                // tasks that consume memory even while the semaphore is saturated.
+                let permit = match state.limit.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Semaphore full: reply with SERVFAIL immediately, do not spawn.
+                        state
+                            .querylog
+                            .counters
+                            .inflight_drops
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(sf) = dns::servfail_reply(&recv_buf, info.question_end) {
+                            let _ = socket.try_send_to(&sf, peer);
+                        }
+                        continue;
+                    }
+                };
                 // Cache miss: upstream resolution is async I/O, spawn a task for it.
                 // Materialize the packet only for the async slow path; cache/filter hits
                 // are answered directly from the reusable BytesMut receive buffer.
@@ -124,8 +143,15 @@ async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Resul
                     // Clone is O(1) (Bytes refcount bump); needed to enforce UDP size after
                     // handle_packet_slow_preparsed takes ownership of `packet`.
                     let query = packet.clone();
-                    match handle_packet_slow_preparsed(packet, peer, ClientProto::Udp, state, info)
-                        .await
+                    match handle_packet_slow_preparsed(
+                        packet,
+                        peer,
+                        ClientProto::Udp,
+                        state,
+                        info,
+                        Some(permit),
+                    )
+                    .await
                     {
                         Ok(Some(resp)) => {
                             let resp = crate::dns::maybe_truncate_for_udp(resp, &query);

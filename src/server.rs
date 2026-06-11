@@ -59,6 +59,9 @@ pub struct AppState {
     pub fallback: ResolvedFallback,
     pub stale_client_timeout_ms: u64,
     pub querylog: crate::querylog::QueryLogHandle,
+    /// Incremented on every GeoSite hot-reload. Used to prevent stale upstream responses
+    /// (resolved under the old routing) from being inserted into the freshly-cleared cache.
+    pub routing_generation: AtomicU64,
 }
 
 pub struct RefreshGate {
@@ -194,6 +197,7 @@ impl AppState {
                 fallback,
                 stale_client_timeout_ms,
                 querylog,
+                routing_generation: AtomicU64::new(0),
             },
             refresh_rx,
         ))
@@ -368,6 +372,9 @@ fn reload_geosite(state: &AppState, needed_tags: &HashSet<String>) -> Result<()>
     let db = load_geosite(&state.cfg, needed_tags)?;
     state.geosite.store(db);
     state.routing_index.invalidate();
+    // Increment generation before clearing the cache so in-flight queries that recorded
+    // the old generation will skip the cache write and not re-pollute the fresh cache.
+    state.routing_generation.fetch_add(1, Ordering::Release);
     state.cache.invalidate_all();
     crate::startup!(
         "reload event=geosite status=ok files={} tags={}",
