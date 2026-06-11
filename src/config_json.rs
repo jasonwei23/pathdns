@@ -4,26 +4,26 @@
 //! It is parsed once at startup and consumed by `Config::from_json` in
 //! `config.rs`, which validates it and builds the `Config` struct.
 //!
-//! # Minimal example – default-group is a named group
+//! # Minimal example – fallback routes to a named group
 //!
 //! ```json
 //! {
-//!   "bind":          "0.0.0.0:53",
+//!   "bind":          ["0.0.0.0:53", "[::]:53"],
 //!   "geosite-file":  ["/etc/pathdns/geosite.dat"],
 //!   "group": [
 //!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"] },
 //!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
 //!   ],
-//!   "fallback": { "default-group": "domestic" },
+//!   "fallback": "domestic",
 //!   "cache": { "size": 10000 }
 //! }
 //! ```
 //!
-//! # Example – default-group "none" with primary/secondary and ipset
+//! # Example – racing fallback (primary/secondary with ipset test)
 //!
 //! ```json
 //! {
-//!   "bind":         "0.0.0.0:53",
+//!   "bind":         ["0.0.0.0:53", "[::]:53"],
 //!   "geosite-file": ["/etc/pathdns/geosite.dat"],
 //!   "group": [
 //!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"],
@@ -31,7 +31,6 @@
 //!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
 //!   ],
 //!   "fallback": {
-//!     "default-group": "none",
 //!     "primary":       "domestic",
 //!     "secondary":     "overseas",
 //!     "ipset-name4":   "mainroute",
@@ -40,6 +39,9 @@
 //!   "cache": { "size": 10000 }
 //! }
 //! ```
+//!
+//! Legacy spellings `{"default-group": "<name>"}`, `{"default-group": "none", ...}`
+//! and `{"default-group": "null"}` remain accepted.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -104,17 +106,21 @@ pub(crate) struct JsonConfig {
     pub(crate) group: Option<Vec<JsonGroupEntry>>,
 
     /// Fallback routing when no group matches. Required.
-    pub(crate) fallback: Option<JsonFallbackSection>,
+    /// Either a string (group name, or `"null"` for empty responses) or an
+    /// object (see `JsonFallbackSection`).
+    pub(crate) fallback: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonFallbackSection {
-    /// `"none"` | `"null"` | a group name defined in `group`.
-    pub(crate) default_group: String,
-    /// Required when `default-group` is `"none"`: primary upstream group name.
+    /// Legacy selector: `"none"` | `"null"` | a group name defined in `group`.
+    /// Optional — when omitted, a `primary`/`secondary` pair selects racing
+    /// mode, and `"fallback": "<group>"` (string form) routes to a group.
+    pub(crate) default_group: Option<String>,
+    /// Racing mode: primary upstream group name.
     pub(crate) primary: Option<String>,
-    /// Required when `default-group` is `"none"`: secondary upstream group name.
+    /// Racing mode: secondary upstream group name.
     pub(crate) secondary: Option<String>,
     /// IPv4 nftset/ipset name for IP-based routing in `"none"` fallback.
     pub(crate) ipset_name4: Option<String>,
@@ -170,7 +176,9 @@ pub(crate) struct JsonGroupEntry {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonQueryLogSection {
-    pub(crate) bind: Option<String>,
+    /// HTTP API listen address(es): a string or an array of strings
+    /// (e.g. `["0.0.0.0:8080", "[::]:8080"]` for dual-stack).
+    pub(crate) bind: Option<serde_json::Value>,
     pub(crate) token: Option<String>,
     /// In-memory ring capacity. 0 = disable event collection (counters still active).
     pub(crate) memory: Option<usize>,

@@ -153,8 +153,9 @@ pub struct FallbackConfig {
 pub struct QueryLogConfig {
     /// Whether the querylog section was present in the configuration.
     pub enabled: bool,
-    /// HTTP API bind address. `None` = no HTTP listener.
-    pub bind: Option<SocketAddr>,
+    /// HTTP API bind addresses. Empty = no HTTP listener.
+    /// Multiple addresses allow dual-stack: `["0.0.0.0:8080", "[::]:8080"]`.
+    pub bind: Vec<SocketAddr>,
     /// Bearer token for API auth. `None` = no auth required.
     pub token: Option<String>,
     /// Ring buffer capacity. 0 = event collection disabled (counters only).
@@ -324,7 +325,11 @@ impl Config {
 
         // Parse querylog section.
         let querylog = if let Some(ql) = json.querylog {
-            let bind = ql.bind.as_deref().map(parse_addr).transpose()?;
+            let bind = ql
+                .bind
+                .map(|v| parse_addr_list(v, "querylog.bind"))
+                .transpose()?
+                .unwrap_or_default();
             if ql
                 .token
                 .as_deref()
@@ -381,7 +386,7 @@ impl Config {
         } else {
             QueryLogConfig {
                 enabled: false,
-                bind: None,
+                bind: Vec::new(),
                 token: None,
                 memory: 0,
                 channel: 4096,
@@ -500,21 +505,52 @@ fn print_help() {
 
 // ── Config parsing helpers ───────────────────────────────────────────────────
 
+/// Parse the `fallback` config value.
+///
+/// Accepted forms:
+/// - `"fallback": "<group>"` — route unmatched queries to a named group
+/// - `"fallback": "null"` — return empty responses
+/// - `"fallback": { "primary": "...", "secondary": "...", ... }` — race two
+///   groups, optionally picking the winner via ipset test
+/// - legacy object form with `"default-group": "<name>" | "none" | "null"`
 fn parse_fallback_config(
-    jf: crate::config_json::JsonFallbackSection,
+    value: serde_json::Value,
     groups: &[GroupSpec],
 ) -> Result<FallbackConfig> {
     let group_exists = |name: &str| groups.iter().any(|g| g.name == name);
 
-    let target = match jf.default_group.as_str() {
-        "null" => FallbackTarget::Null,
-        "none" => {
-            let primary = jf
-                .primary
-                .ok_or_else(|| anyhow!("fallback: default-group \"none\" requires \"primary\""))?;
-            let secondary = jf.secondary.ok_or_else(|| {
-                anyhow!("fallback: default-group \"none\" requires \"secondary\"")
+    // String shorthand: a group name, or "null" for empty responses.
+    if let serde_json::Value::String(name) = &value {
+        let target = if name == "null" {
+            FallbackTarget::Null
+        } else {
+            if !group_exists(name) {
+                return Err(anyhow!("fallback \"{name}\": no such group"));
+            }
+            FallbackTarget::Group(name.clone())
+        };
+        return Ok(FallbackConfig {
+            target,
+            noip_as_primary_ip: false,
+        });
+    }
+
+    let jf: crate::config_json::JsonFallbackSection = serde_json::from_value(value)
+        .map_err(|e| anyhow!("invalid fallback section: {e}"))?;
+
+    let target = match jf.default_group.as_deref() {
+        Some("null") => FallbackTarget::Null,
+        // Racing mode: a primary/secondary pair, or the legacy "none" selector.
+        Some("none") | None => {
+            let primary = jf.primary.ok_or_else(|| {
+                anyhow!(
+                    "fallback: racing mode requires \"primary\" \
+                     (to route to a single group use \"fallback\": \"<group>\")"
+                )
             })?;
+            let secondary = jf
+                .secondary
+                .ok_or_else(|| anyhow!("fallback: racing mode requires \"secondary\""))?;
             if !group_exists(&primary) {
                 return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
             }
@@ -546,7 +582,7 @@ fn parse_fallback_config(
                 ipset,
             }
         }
-        name => {
+        Some(name) => {
             if !group_exists(name) {
                 return Err(anyhow!("fallback.default-group \"{name}\": no such group"));
             }
@@ -804,6 +840,36 @@ fn parse_bind_config(value: Option<serde_json::Value>) -> Result<Vec<BindEndpoin
         }
         _ => Err(anyhow!("bind must be a string or an array of strings")),
     }
+}
+
+/// Parse a JSON string-or-array of socket addresses, rejecting duplicates.
+/// Used for listen addresses that have no protocol suffix (e.g. `querylog.bind`).
+fn parse_addr_list(value: serde_json::Value, what: &str) -> Result<Vec<SocketAddr>> {
+    let strings: Vec<String> = match value {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return Err(anyhow!("{what} array must not be empty"));
+            }
+            arr.iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!("{what} array elements must be strings"))
+                })
+                .collect::<Result<_>>()?
+        }
+        _ => return Err(anyhow!("{what} must be a string or an array of strings")),
+    };
+    let mut out = Vec::with_capacity(strings.len());
+    for s in &strings {
+        let addr = parse_addr(s).with_context(|| format!("invalid {what} address: {s}"))?;
+        if out.contains(&addr) {
+            return Err(anyhow!("duplicate {what} address: {addr}"));
+        }
+        out.push(addr);
+    }
+    Ok(out)
 }
 
 /// Parse one bind entry: `addr[@udp|@tcp]`. The protocol suffix applies only
@@ -1209,7 +1275,7 @@ mod querylog_tests {
         let cfg = parse(r#"{"fallback":{"default-group":"null"}}"#).unwrap();
         assert!(!cfg.querylog.enabled);
         assert_eq!(cfg.querylog.memory, 0);
-        assert!(cfg.querylog.bind.is_none());
+        assert!(cfg.querylog.bind.is_empty());
         assert!(cfg.querylog.file.is_none());
     }
 
@@ -1302,6 +1368,79 @@ mod querylog_tests {
     fn bind_array_rejects_invalid_proto_suffix() {
         assert!(parse(
             r#"{"fallback":{"default-group":"null"},"bind":["0.0.0.0:53@bogus"]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fallback_string_shorthand_null() {
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
+        assert!(matches!(cfg.fallback.target, FallbackTarget::Null));
+    }
+
+    #[test]
+    fn fallback_string_shorthand_group() {
+        let cfg = parse(
+            r#"{"group":[{"name":"a","upstream":["1.1.1.1"]}],"fallback":"a"}"#,
+        )
+        .unwrap();
+        assert!(matches!(&cfg.fallback.target, FallbackTarget::Group(g) if g == "a"));
+    }
+
+    #[test]
+    fn fallback_string_unknown_group_rejected() {
+        assert!(parse(r#"{"fallback":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn fallback_racing_without_default_group() {
+        let cfg = parse(
+            r#"{"group":[
+                  {"name":"a","upstream":["1.1.1.1"]},
+                  {"name":"b","upstream":["8.8.8.8"]}],
+                "fallback":{"primary":"a","secondary":"b"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &cfg.fallback.target,
+            FallbackTarget::None { primary, secondary, .. } if primary == "a" && secondary == "b"
+        ));
+    }
+
+    #[test]
+    fn fallback_legacy_default_group_none_still_works() {
+        let cfg = parse(
+            r#"{"group":[
+                  {"name":"a","upstream":["1.1.1.1"]},
+                  {"name":"b","upstream":["8.8.8.8"]}],
+                "fallback":{"default-group":"none","primary":"a","secondary":"b"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&cfg.fallback.target, FallbackTarget::None { .. }));
+    }
+
+    #[test]
+    fn fallback_empty_object_rejected() {
+        assert!(parse(r#"{"fallback":{}}"#).is_err());
+    }
+
+    #[test]
+    fn querylog_bind_accepts_dual_stack_array() {
+        let cfg = parse(
+            r#"{"fallback":"null",
+                "querylog":{"bind":["127.0.0.1:8080","[::1]:8080"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.querylog.bind.len(), 2);
+        assert!(cfg.querylog.bind[0].is_ipv4());
+        assert!(cfg.querylog.bind[1].is_ipv6());
+    }
+
+    #[test]
+    fn querylog_bind_rejects_duplicates() {
+        assert!(parse(
+            r#"{"fallback":"null",
+                "querylog":{"bind":["127.0.0.1:8080","127.0.0.1:8080"]}}"#
         )
         .is_err());
     }

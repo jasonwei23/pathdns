@@ -22,7 +22,7 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - TCP connection limit and per-frame read timeouts guard against slowloris-style attacks.
 - Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
 - Graceful rate limiting: configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
-- Per-domain verdict cache for `fallback.default-group: none` routing decisions.
+- Per-domain verdict cache for racing-fallback routing decisions.
 - Query type filtering with optional group and GeoSite tag conditions.
 - Native Linux netlink backend for ipset/nftset test and add operations (no shell-out).
 - Per-upstream hedged requests: fire a second upstream after a configurable delay.
@@ -90,7 +90,7 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
   ],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000 }
 }
 ```
@@ -115,7 +115,6 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
   ],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "fallback": {
-    "default-group": "none",
     "primary":       "domestic",
     "secondary":     "overseas",
     "ipset-name4":   "mainroute",
@@ -151,9 +150,9 @@ PathDNS reads a JSON file passed with `-c`. Unknown top-level keys cause a start
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
 | `no-ipset-blacklist` | bool | `false` | Allow loopback/unspecified IPs in ipset add operations. |
 | `group` | array | — | Routing groups (see [Groups](#groups)). |
-| `fallback` | object | — | Fallback for unmatched queries (see [Fallback](#fallback)). Required. |
+| `fallback` | string or object | — | Fallback for unmatched queries (see [Fallback](#fallback)). Required. |
 | `cache` | object | — | DNS cache settings (see [Cache](#cache)). |
-| `verdict-cache` | object | — | Per-domain verdict cache for `none` fallback (see [Verdict Cache](#verdict-cache)). |
+| `verdict-cache` | object | — | Per-domain verdict cache for racing fallback (see [Verdict Cache](#verdict-cache)). |
 
 ### Groups
 
@@ -193,29 +192,34 @@ Groups are matched top-to-bottom. The first group whose GeoSite tags match the q
 
 ### Fallback
 
-Applied when no group matches a query.
+Applied when no group matches a query. Three forms:
 
 ```json
-"fallback": { "default-group": "domestic" }
+"fallback": "domestic"
 ```
+Route unmatched queries to the named group. `"fallback": "null"` returns empty responses instead.
 
-| `default-group` value | Behavior |
-|-----------------------|----------|
-| `"<group-name>"` | Route to the named group. |
-| `"none"` | Race `primary` and `secondary`; use ipset to pick the winner if configured, otherwise return the first response. |
-| `"null"` | Return an empty response. |
+```json
+"fallback": {
+  "primary":     "domestic",
+  "secondary":   "overseas",
+  "ipset-name4": "chnroute",
+  "ipset-name6": "chnroute6"
+}
+```
+Racing mode: query `primary` and `secondary` concurrently. With `ipset-name4`/`ipset-name6` configured, the primary response's IPs are tested against the ipset to pick the winner; without them, the first non-SERVFAIL response wins.
 
-**Fields for `"none"` fallback:**
+**Racing mode fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `primary` | string | Primary group name (required when `default-group` is `"none"`). |
-| `secondary` | string | Secondary group name (required when `default-group` is `"none"`). |
+| `primary` | string | Primary group name (required). |
+| `secondary` | string | Secondary group name (required). |
 | `ipset-name4` | string | IPv4 ipset/nftset for testing primary response IPs. |
 | `ipset-name6` | string | IPv6 ipset/nftset for testing primary response IPs. |
 | `noip-as-primary-ip` | bool | Treat NODATA primary replies as primary IPs (default: `false`). |
 
-Without `ipset-name4`/`ipset-name6`, the `"none"` fallback races both upstreams and returns the first non-SERVFAIL response.
+**Legacy form** (still accepted): `{"default-group": "<name>"}`, `{"default-group": "null"}`, and `{"default-group": "none", "primary": ..., "secondary": ...}` map to the forms above.
 
 ### Cache
 
@@ -276,7 +280,7 @@ Example: disable caching for the overseas group:
 
 ### Verdict Cache
 
-Caches primary/secondary routing decisions for the `"none"` fallback to avoid repeated ipset lookups.
+Caches primary/secondary routing decisions for the racing fallback to avoid repeated ipset lookups.
 
 ```json
 "verdict-cache": { "size": 4096, "ttl": 3600 }
@@ -312,7 +316,7 @@ Configures per-query event collection and the dashboard HTTP API. The section is
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `bind` | string | — | Listen address for the dashboard + HTTP API (e.g. `"0.0.0.0:8080"`). Omit to disable the API. |
+| `bind` | string or array | — | Listen address(es) for the dashboard + HTTP API. Like the DNS `bind`, IPv6 sockets are v6-only — for dual-stack use `["0.0.0.0:8080", "[::]:8080"]`. Omit to disable the API. |
 | `token` | string | — | Bearer token required on every API request (`Authorization: Bearer <token>`). When omitted, the API is unauthenticated — only safe on a trusted network. |
 | `memory` | int | `1000` | In-memory ring buffer capacity. `0` disables the ring; file collection can still remain active. |
 | `channel` | int | `4096` | Bounded mpsc channel depth between the DNS hot path and the log worker. When full, new events are dropped (non-blocking) rather than stalling queries. |
@@ -394,7 +398,7 @@ Common type numbers: `1` = A, `28` = AAAA, `65` = HTTPS.
 
 Uses native Linux netlink — no shell-out to `ipset` or `nft`.
 
-**Test sets** (for `"none"` fallback routing) are configured in `fallback.ipset-name4` / `fallback.ipset-name6`.
+**Test sets** (for racing fallback routing) are configured in `fallback.ipset-name4` / `fallback.ipset-name6`.
 
 **Add sets** (populate with resolved IPs) are configured per-group with `add-ip: "v4set,v6set"`.
 
@@ -437,7 +441,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
     { "name": "domestic", "tag": ["cn"],           "upstream": ["223.5.5.5"] },
     { "name": "overseas", "tag": ["geolocation-!cn"], "upstream": ["tls://1.1.1.1"] }
   ],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000, "stale-expire-ttl": 86400, "refresh": 20 }
 }
 ```
@@ -462,7 +466,6 @@ GeoSite files are watched for changes and hot-reloaded automatically.
     }
   ],
   "fallback": {
-    "default-group": "none",
     "primary":       "domestic",
     "secondary":     "overseas",
     "ipset-name4":   "chnroute",
@@ -484,7 +487,7 @@ GeoSite files are watched for changes and hot-reloaded automatically.
     { "name": "domestic", "tag": ["cn"],               "upstream": ["223.5.5.5"] },
     { "name": "overseas", "tag": ["geolocation-!cn"],  "upstream": ["tls://1.1.1.1"] }
   ],
-  "fallback": { "default-group": "domestic" },
+  "fallback": "domestic",
   "cache": { "size": 10000 }
 }
 ```
@@ -499,7 +502,7 @@ Use `filter-qtype` inside the group definition:
   "group": [
     { "name": "default", "upstream": ["223.5.5.5"], "filter-qtype": 28 }
   ],
-  "fallback": { "default-group": "default" },
+  "fallback": "default",
   "cache": { "size": 10000 }
 }
 ```
@@ -514,7 +517,7 @@ Tags from multiple files are merged:
   "group": [
     { "name": "domestic", "tag": ["cn", "private"], "upstream": ["223.5.5.5"] }
   ],
-  "fallback": { "default-group": "domestic" }
+  "fallback": "domestic"
 }
 ```
 
@@ -525,7 +528,7 @@ Tags from multiple files are merged:
   "group": [
     { "name": "default", "upstream": ["https://8.8.8.8/dns-query?ecs=strip"] }
   ],
-  "fallback": { "default-group": "default" }
+  "fallback": "default"
 }
 ```
 

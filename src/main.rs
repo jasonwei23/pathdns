@@ -77,7 +77,8 @@ async fn async_main(cfg: Config) -> Result<()> {
         .cfg
         .querylog
         .bind
-        .is_some_and(|addr| !addr.ip().is_loopback())
+        .iter()
+        .any(|addr| !addr.ip().is_loopback())
         && state.cfg.querylog.token.is_none()
     {
         eprintln!("warn: web dashboard is exposed without authentication");
@@ -89,11 +90,6 @@ async fn async_main(cfg: Config) -> Result<()> {
     if let Some(ws) = ql_worker {
         let ring = ws.ring.clone();
         let api_ring = ring.clone();
-        let api_qps = qps_ring.clone();
-        let api_handle = ql_handle.clone();
-        let api_state = state.clone();
-        let api_token = state.cfg.querylog.token.clone();
-        let api_bind = state.cfg.querylog.bind;
 
         ql_worker_task = Some(tokio::spawn(crate::querylog::worker::run(
             ws.rx,
@@ -103,35 +99,40 @@ async fn async_main(cfg: Config) -> Result<()> {
             ws.shutdown,
         )));
 
-        if let Some(addr) = api_bind {
-            let api_listener = tokio::net::TcpListener::bind(addr)
-                .await
+        for &addr in &state.cfg.querylog.bind {
+            let api_listener = crate::listener::bind_tcp_listener(addr)
                 .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
             startup!("listening web=http://{addr}");
-            let api_stats = stats_ring.clone();
             tokio::spawn(crate::querylog::api::serve(
-                api_listener, api_token, api_ring, api_qps, api_stats, api_handle, api_state,
+                api_listener,
+                state.cfg.querylog.token.clone(),
+                api_ring.clone(),
+                qps_ring.clone(),
+                stats_ring.clone(),
+                ql_handle.clone(),
+                state.clone(),
             ));
         }
-    } else if let Some(addr) = state.cfg.querylog.bind {
+    } else if !state.cfg.querylog.bind.is_empty() {
         // No collection (memory=0) but still serve API for stats.
-        let api_listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
-        startup!("listening web=http://{addr}");
         let api_ring = std::sync::Arc::new(crate::querylog::ring::EventRing::new(0));
-        tokio::spawn(crate::querylog::api::serve(
-            api_listener,
-            state.cfg.querylog.token.clone(),
-            api_ring,
-            qps_ring.clone(),
-            stats_ring.clone(),
-            ql_handle.clone(),
-            state.clone(),
-        ));
+        for &addr in &state.cfg.querylog.bind {
+            let api_listener = crate::listener::bind_tcp_listener(addr)
+                .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
+            startup!("listening web=http://{addr}");
+            tokio::spawn(crate::querylog::api::serve(
+                api_listener,
+                state.cfg.querylog.token.clone(),
+                api_ring.clone(),
+                qps_ring.clone(),
+                stats_ring.clone(),
+                ql_handle.clone(),
+                state.clone(),
+            ));
+        }
     }
 
-    let qps_task = state.cfg.querylog.bind.map(|_| {
+    let qps_task = (!state.cfg.querylog.bind.is_empty()).then(|| {
         tokio::spawn(crate::querylog::worker::run_qps_sampler(
             qps_ring.clone(),
             stats_ring.clone(),

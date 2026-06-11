@@ -238,6 +238,14 @@ fn bind_udp_socket_reuse_port(addr: SocketAddr, buf_size: usize) -> Result<UdpSo
     UdpSocket::from_std(socket).map_err(Into::into)
 }
 
+/// Bind a TCP listener with deterministic IPv6 behaviour (IPV6_V6ONLY set).
+/// Also used by the dashboard HTTP API so that a dual-stack bind array like
+/// `["0.0.0.0:8080", "[::]:8080"]` never conflicts on systems where
+/// net.ipv6.bindv6only is 0.
+pub fn bind_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    bind_tcp_listener_reuse_port(addr)
+}
+
 fn bind_tcp_listener_reuse_port(addr: SocketAddr) -> Result<TcpListener> {
     let fd = create_reuse_port_socket(addr, libc::SOCK_STREAM)?;
     bind_raw_socket(fd, addr)?;
