@@ -206,15 +206,23 @@ tr:last-child td{border-bottom:none}
   <div id="view-dashboard" class="view active">
     <div class="view-title">Dashboard</div>
 
-    <div class="section-label">Since startup</div>
+    <div class="range-btns">
+      <button class="range-btn" data-secs="60" onclick="setRange(60)">1m</button>
+      <button class="range-btn" data-secs="300" onclick="setRange(300)">5m</button>
+      <button class="range-btn" data-secs="900" onclick="setRange(900)">15m</button>
+      <button class="range-btn active" data-secs="3600" onclick="setRange(3600)">1h</button>
+      <button class="range-btn" data-secs="21600" onclick="setRange(21600)">6h</button>
+      <button class="range-btn" data-secs="86400" onclick="setRange(86400)">24h</button>
+    </div>
+
     <div class="stat-grid">
       <div class="stat-box">
         <div class="stat-box-body">
           <div class="stat-label">Total Queries</div>
-          <div class="stat-value" id="stat-total">—</div>
-          <div class="stat-sub" id="stat-qps-hint">— qps</div>
+          <div class="stat-value" id="stat-queries">—</div>
+          <div class="stat-sub" id="stat-qps">— qps now</div>
         </div>
-        <canvas class="spark" id="spark-total" height="44"></canvas>
+        <canvas class="spark" id="spark-queries" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
@@ -226,100 +234,45 @@ tr:last-child td{border-bottom:none}
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Cache Entries</div>
-          <div class="stat-value" id="stat-cache-entries">—</div>
-          <div class="stat-sub" id="stat-cache-cap">— capacity</div>
+          <div class="stat-label">Upstream OK</div>
+          <div class="stat-value" id="stat-upstream-ok">—</div>
         </div>
-        <canvas class="spark" id="spark-cache-entries" height="44"></canvas>
+        <canvas class="spark" id="spark-upstream-ok" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Avg Resolution</div>
-          <div class="stat-value" id="stat-rtt">—</div>
+          <div class="stat-label">Upstream Errors</div>
+          <div class="stat-value" id="stat-upstream-err" style="color:var(--red)">—</div>
         </div>
-        <canvas class="spark" id="spark-rtt" height="44"></canvas>
-      </div>
-      <div class="stat-box">
-        <div class="stat-box-body">
-          <div class="stat-label">Upstream OK / Err</div>
-          <div class="stat-value" id="stat-upstream">—</div>
-        </div>
-        <canvas class="spark" id="spark-upstream" height="44"></canvas>
-      </div>
-      <div class="stat-box">
-        <div class="stat-box-body">
-          <div class="stat-label">Singleflight Hits</div>
-          <div class="stat-value" id="stat-sf">—</div>
-        </div>
-        <canvas class="spark" id="spark-sf" height="44"></canvas>
+        <canvas class="spark" id="spark-upstream-err" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
           <div class="stat-label">Stale Served</div>
           <div class="stat-value" id="stat-stale">—</div>
-          <div class="stat-sub" id="stat-refresh">— refreshes</div>
         </div>
         <canvas class="spark" id="spark-stale" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Cache Refreshes</div>
-          <div class="stat-value" id="stat-cache-refresh">—</div>
-          <div class="stat-sub" id="stat-cache-refresh-fail"></div>
+          <div class="stat-label">Null / Filtered</div>
+          <div class="stat-value" id="stat-null-filtered">—</div>
         </div>
-        <canvas class="spark" id="spark-cache-refresh" height="44"></canvas>
+        <canvas class="spark" id="spark-null-filtered" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Inflight Drops</div>
-          <div class="stat-value" id="stat-drops">—</div>
+          <div class="stat-label">Cache Entries</div>
+          <div class="stat-value" id="stat-cache-entries">—</div>
+          <div class="stat-sub" id="stat-cache-cap">—</div>
         </div>
-        <canvas class="spark" id="spark-drops" height="44"></canvas>
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Query Log Drops</div>
-          <div class="stat-value" id="stat-log-drops">—</div>
-          <div class="stat-sub" id="stat-log-queue">— queued</div>
+          <div class="stat-label">Avg Resolution</div>
+          <div class="stat-value" id="stat-rtt">—</div>
+          <div class="stat-sub">current average</div>
         </div>
-        <canvas class="spark" id="spark-log-drops" height="44"></canvas>
-      </div>
-    </div>
-
-    <div class="section-label" id="agg-section-label">Last 1h</div>
-    <div class="range-btns">
-      <button class="range-btn" data-secs="60" onclick="setRange(60)">1m</button>
-      <button class="range-btn" data-secs="300" onclick="setRange(300)">5m</button>
-      <button class="range-btn" data-secs="900" onclick="setRange(900)">15m</button>
-      <button class="range-btn active" data-secs="3600" onclick="setRange(3600)">1h</button>
-      <button class="range-btn" data-secs="21600" onclick="setRange(21600)">6h</button>
-      <button class="range-btn" data-secs="86400" onclick="setRange(86400)">24h</button>
-    </div>
-    <div class="stat-grid">
-      <div class="stat-box">
-        <div class="stat-label">Total Queries</div>
-        <div class="stat-value" id="agg-queries">—</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">Cache Hit Rate</div>
-        <div class="stat-value" id="agg-cache-rate">—</div>
-        <div class="stat-sub" id="agg-cache-hits">— hits</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">Cache Hits</div>
-        <div class="stat-value" id="agg-cache-hits-val">—</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">Upstream OK</div>
-        <div class="stat-value" id="agg-upstream-ok">—</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">Upstream Errors</div>
-        <div class="stat-value" id="agg-upstream-err" style="color:var(--red)">—</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">Null / Filtered</div>
-        <div class="stat-value" id="agg-null-filtered">—</div>
       </div>
     </div>
 
@@ -478,32 +431,18 @@ function showView(v) {
 
 let statsRangeSeconds = 3600;
 
-const RANGE_LABELS = {60:'1m',300:'5m',900:'15m',3600:'1h',21600:'6h',86400:'24h'};
+// Bucket counts per range — controls sparkline granularity
+const RANGE_LABELS  = {60:'1m',300:'5m',900:'15m',3600:'1h',21600:'6h',86400:'24h'};
+const RANGE_BUCKETS = {60:12,300:15,900:15,3600:12,21600:12,86400:24};
 
 function setRange(secs) {
   statsRangeSeconds = secs;
   document.querySelectorAll('.range-btn').forEach(btn => {
     btn.classList.toggle('active', parseInt(btn.dataset.secs) === secs);
   });
-  const label = RANGE_LABELS[secs] || (secs + 's');
-  document.getElementById('agg-section-label').textContent = 'Last ' + label;
-  loadAggregateStats();
+  loadDashboard();
 }
 
-async function loadAggregateStats() {
-  try {
-    const r = await tryFetch('/api/stats/aggregate?seconds=' + statsRangeSeconds);
-    if (!r) return;
-    const d = await r.json();
-    document.getElementById('agg-queries').textContent = fmt(d.queries);
-    document.getElementById('agg-cache-rate').textContent = (d.cache_hit_rate_pct || 0).toFixed(1) + '%';
-    document.getElementById('agg-cache-hits').textContent = fmt(d.cache_hits) + ' hits';
-    document.getElementById('agg-cache-hits-val').textContent = fmt(d.cache_hits);
-    document.getElementById('agg-upstream-ok').textContent = fmt(d.upstream_ok);
-    document.getElementById('agg-upstream-err').textContent = fmt(d.upstream_err);
-    document.getElementById('agg-null-filtered').textContent = fmt((d.null_responses||0)+(d.filtered||0));
-  } catch(e) {}
-}
 
 async function loadGroups() {
   try {
@@ -559,64 +498,51 @@ function fmtCount(n) {
 }
 
 async function loadDashboard() {
-  const r = await tryFetch('/api/stats');
-  if (!r) return;
-  const s = await r.json();
-  document.getElementById('stat-total').textContent = fmt(s.queries_total);
-  document.getElementById('stat-qps-hint').textContent = s.qps_now + ' qps';
-  document.getElementById('stat-cache-rate').textContent = s.cache_hit_rate_pct.toFixed(1) + '%';
-  document.getElementById('stat-cache-hits').textContent = fmt(s.cache_hits) + ' hits';
-  // Cache entries / capacity
-  const entries = s.cache_entries || 0;
-  const cap = s.cache_capacity || 0;
-  document.getElementById('stat-cache-entries').textContent = fmt(entries);
-  if (cap > 0) {
-    const pct = (entries / cap * 100).toFixed(0);
-    document.getElementById('stat-cache-cap').textContent = pct + '% of ' + fmt(cap);
-  } else {
-    document.getElementById('stat-cache-cap').textContent = 'disabled';
+  const buckets = RANGE_BUCKETS[statsRangeSeconds] || 12;
+  const [r1, r2] = await Promise.all([
+    tryFetch('/api/stats'),
+    tryFetch('/api/stats/buckets?seconds=' + statsRangeSeconds + '&buckets=' + buckets),
+  ]);
+  if (!r1 || !r2) return;
+  const [live, bkts] = await Promise.all([r1.json(), r2.json()]);
+
+  // Aggregate bucket totals for the summary numbers
+  let qTotal=0, cHits=0, upOk=0, upErr=0, nullR=0, stale=0, filt=0;
+  for (const b of bkts) {
+    qTotal += b.queries;    cHits  += b.cache_hits;
+    upOk   += b.upstream_ok; upErr  += b.upstream_err;
+    nullR  += b.null_responses; stale  += b.stale_served; filt   += b.filtered;
   }
-  document.getElementById('stat-rtt').textContent = fmtRtt(s.avg_resolution_us);
-  document.getElementById('stat-upstream').textContent = fmt(s.upstream_ok) + ' / ' + fmt(s.upstream_err);
-  document.getElementById('stat-drops').textContent = fmt(s.inflight_drops);
-  document.getElementById('stat-log-drops').textContent = fmt(s.events_dropped_full + s.events_dropped_closed);
-  document.getElementById('stat-log-queue').textContent = fmt(s.queue_depth) + ' queued; peak ' + fmt(s.queue_high_watermark);
-  document.getElementById('stat-sf').textContent = fmt(s.singleflight_hits);
-  document.getElementById('stat-stale').textContent = fmt(s.stale_served);
-  document.getElementById('stat-cache-refresh').textContent = fmt(s.cache_refresh_started);
-  const failEl = document.getElementById('stat-cache-refresh-fail');
-  failEl.textContent = s.cache_refresh_failed > 0 ? s.cache_refresh_failed + ' failed' : '';
-  document.getElementById('stat-refresh').textContent = fmt(s.cache_refresh_started) + ' refreshes';
-  // Sparkline sampling
-  const d = field => prevStats ? Math.max(0, (s[field]||0) - (prevStats[field]||0)) : 0;
-  pushSpark('total',        s.qps_now || 0);
-  pushSpark('cacheRate',    s.cache_hit_rate_pct || 0);
-  pushSpark('cacheEntries', entries);
-  pushSpark('rtt',          s.avg_resolution_us || 0);
-  pushSpark('upstream',     d('upstream_err'));
-  pushSpark('sf',           d('singleflight_hits'));
-  pushSpark('stale',        d('stale_served'));
-  pushSpark('cacheRefresh', d('cache_refresh_started'));
-  pushSpark('drops',        d('inflight_drops'));
-  pushSpark('logDrops',     d('events_dropped_full') + d('events_dropped_closed'));
-  prevStats = s;
-  drawAllSparklines();
-  loadAggregateStats();
+  const hitRate = qTotal > 0 ? (cHits / qTotal * 100).toFixed(1) : '0.0';
+
+  document.getElementById('stat-queries').textContent    = fmt(qTotal);
+  document.getElementById('stat-qps').textContent        = live.qps_now + ' qps now';
+  document.getElementById('stat-cache-rate').textContent = hitRate + '%';
+  document.getElementById('stat-cache-hits').textContent = fmt(cHits) + ' hits';
+  document.getElementById('stat-upstream-ok').textContent  = fmt(upOk);
+  document.getElementById('stat-upstream-err').textContent = fmt(upErr);
+  document.getElementById('stat-stale').textContent        = fmt(stale);
+  document.getElementById('stat-null-filtered').textContent = fmt(nullR + filt);
+
+  // Live-only cards (not range-based)
+  const entries = live.cache_entries || 0;
+  const cap     = live.cache_capacity || 0;
+  document.getElementById('stat-cache-entries').textContent = fmt(entries);
+  document.getElementById('stat-cache-cap').textContent     = cap > 0
+    ? (entries / cap * 100).toFixed(0) + '% of ' + fmt(cap)
+    : 'disabled';
+  document.getElementById('stat-rtt').textContent = fmtRtt(live.avg_resolution_us);
+
+  // Sparklines — each array is one value per bucket; sum = displayed number
+  lastBuckets = bkts;
+  redrawSparklines(bkts);
   loadDashUpstreams();
   loadGroups();
 }
 
 // ── Sparklines ────────────────────────────────────────────────────────────────
 
-const SPARK_LEN = 40;
-const sparkHistory = {};
-let prevStats = null;
-
-function pushSpark(key, val) {
-  if (!sparkHistory[key]) sparkHistory[key] = [];
-  sparkHistory[key].push(isFinite(val) ? val : 0);
-  if (sparkHistory[key].length > SPARK_LEN) sparkHistory[key].shift();
-}
+let lastBuckets = [];
 
 function drawSparkline(id, data, color) {
   const canvas = document.getElementById(id);
@@ -635,7 +561,6 @@ function drawSparkline(id, data, color) {
   const grad = ctx.createLinearGradient(0, 0, 0, H);
   grad.addColorStop(0, `rgba(${r},${g},${b},0.22)`);
   grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-  // Filled area
   ctx.beginPath();
   ctx.moveTo(xp(0), yp(data[0]));
   for (let i = 1; i < n; i++) {
@@ -644,7 +569,6 @@ function drawSparkline(id, data, color) {
   }
   ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
-  // Stroke line
   ctx.beginPath();
   ctx.moveTo(xp(0), yp(data[0]));
   for (let i = 1; i < n; i++) {
@@ -654,21 +578,17 @@ function drawSparkline(id, data, color) {
   ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = 'round'; ctx.stroke();
 }
 
-function drawAllSparklines() {
-  drawSparkline('spark-total',         sparkHistory.total,        '#6366f1');
-  drawSparkline('spark-cache-rate',    sparkHistory.cacheRate,    '#22c55e');
-  drawSparkline('spark-cache-entries', sparkHistory.cacheEntries, '#38bdf8');
-  drawSparkline('spark-rtt',           sparkHistory.rtt,          '#f59e0b');
-  drawSparkline('spark-upstream',      sparkHistory.upstream,     '#ef4444');
-  drawSparkline('spark-sf',            sparkHistory.sf,           '#6366f1');
-  drawSparkline('spark-stale',         sparkHistory.stale,        '#f59e0b');
-  drawSparkline('spark-cache-refresh', sparkHistory.cacheRefresh, '#6366f1');
-  drawSparkline('spark-drops',         sparkHistory.drops,        '#ef4444');
-  drawSparkline('spark-log-drops',     sparkHistory.logDrops,     '#ef4444');
+function redrawSparklines(bkts) {
+  drawSparkline('spark-queries',       bkts.map(b => b.queries),                   '#6366f1');
+  drawSparkline('spark-cache-rate',    bkts.map(b => b.cache_hit_rate_pct),        '#22c55e');
+  drawSparkline('spark-upstream-ok',   bkts.map(b => b.upstream_ok),              '#22c55e');
+  drawSparkline('spark-upstream-err',  bkts.map(b => b.upstream_err),             '#ef4444');
+  drawSparkline('spark-stale',         bkts.map(b => b.stale_served),             '#f59e0b');
+  drawSparkline('spark-null-filtered', bkts.map(b => b.null_responses + b.filtered),'#6366f1');
 }
 
 window.addEventListener('resize', () => {
-  if (currentView === 'dashboard') drawAllSparklines();
+  if (currentView === 'dashboard' && lastBuckets.length) redrawSparklines(lastBuckets);
 });
 
 async function loadDashUpstreams() {

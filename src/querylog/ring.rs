@@ -180,6 +180,43 @@ impl StatsRing {
         }
         (agg, from_secs)
     }
+
+    /// Divide the last `seconds` per-second snapshots into `buckets` equal-width
+    /// groups, summing each group. Returns exactly `buckets` entries, oldest-first.
+    /// Empty buckets (when the ring has fewer samples than `buckets`) contain zeros.
+    pub fn bucket_aggregate(&self, seconds: usize, buckets: usize) -> Vec<PerSecondSnapshot> {
+        let buckets = buckets.max(1);
+        let Ok(data) = self.data.read() else {
+            return vec![PerSecondSnapshot::default(); buckets];
+        };
+        let take = seconds.min(86400).min(data.len());
+        if take == 0 {
+            return vec![PerSecondSnapshot::default(); buckets];
+        }
+        let skip = data.len() - take;
+        let snaps: Vec<&PerSecondSnapshot> = data.iter().skip(skip).collect();
+        let n = snaps.len();
+        let mut result = Vec::with_capacity(buckets);
+        for b in 0..buckets {
+            let start = b * n / buckets;
+            let end = if b + 1 == buckets { n } else { (b + 1) * n / buckets };
+            let mut agg = PerSecondSnapshot::default();
+            for snap in &snaps[start..end] {
+                agg.queries += snap.queries;
+                agg.cache_hits += snap.cache_hits;
+                agg.upstream_ok += snap.upstream_ok;
+                agg.upstream_err += snap.upstream_err;
+                agg.null_responses += snap.null_responses;
+                agg.stale_served += snap.stale_served;
+                agg.filtered += snap.filtered;
+            }
+            if start < end {
+                agg.unix_secs = snaps[start].unix_secs;
+            }
+            result.push(agg);
+        }
+        result
+    }
 }
 
 #[cfg(test)]

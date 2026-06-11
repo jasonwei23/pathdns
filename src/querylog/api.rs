@@ -4,6 +4,7 @@
 //!   GET  /                        → dashboard HTML (embedded)
 //!   GET  /api/stats               → current counters + avg RTT + QPS
 //!   GET  /api/stats/history       → last 3600 per-second QPS counts
+//!   GET  /api/stats/buckets       → StatsRing data divided into equal time buckets (?seconds=&buckets=)
 //!   GET  /api/querylog            → paginated events from ring (?limit=&before_seq=&q=)
 //!   DELETE /api/querylog          → clear ring buffer
 //!   GET  /api/querylog/files      → list compressed historical segments
@@ -303,6 +304,42 @@ async fn dispatch(
                     "application/json",
                 ),
             }
+        }
+
+        ("GET", "/api/stats/buckets") => {
+            let seconds = parse_query_param(&req.query, "seconds")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3600)
+                .min(86400)
+                .max(1);
+            let buckets = parse_query_param(&req.query, "buckets")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(12)
+                .min(1440)
+                .max(1);
+            let snaps = stats_ring.bucket_aggregate(seconds, buckets);
+            let json_buckets: Vec<serde_json::Value> = snaps
+                .iter()
+                .map(|s| {
+                    let rate = if s.queries > 0 {
+                        s.cache_hits as f64 / s.queries as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    serde_json::json!({
+                        "queries":        s.queries,
+                        "cache_hits":     s.cache_hits,
+                        "cache_hit_rate_pct": rate,
+                        "upstream_ok":    s.upstream_ok,
+                        "upstream_err":   s.upstream_err,
+                        "null_responses": s.null_responses,
+                        "stale_served":   s.stale_served,
+                        "filtered":       s.filtered,
+                    })
+                })
+                .collect();
+            let body = serde_json::to_vec(&json_buckets).unwrap_or_default();
+            ("200 OK", body, "application/json")
         }
 
         ("GET", "/api/stats/aggregate") => {
