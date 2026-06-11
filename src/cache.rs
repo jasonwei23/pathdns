@@ -37,16 +37,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub type CacheKey = u64;
 
 /// FNV-1a hash of a complete DNS query excluding its two-byte client ID.
+///
+/// The hash covers:
+/// - QNAME (ASCII-lowercased, self-delimiting label encoding)
+/// - QTYPE + QCLASS (exact)
+/// - EDNS semantics extracted via [`dns::extract_variant`]: RD/AD/CD flags,
+///   has_opt, DO bit, EDNS version, and normalised ECS source subnet.
+///
+/// Raw additional-section bytes are NOT hashed so that semantically equivalent
+/// queries with different OPT padding, unknown EDNS options, or varying ARCOUNT
+/// always share the same cache entry.
 pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
     let mut h = Fnv1a::new();
     if query.len() < 12 || question_end < 16 || question_end > query.len() {
         return h.finish();
     }
 
-    h.write(&query[2..12]);
     let question = &query[12..question_end];
     let mut pos = 0usize;
 
+    // QNAME: hash each label with ASCII-lowercase normalisation.
     while let Some(&len) = question.get(pos) {
         h.write_byte(len);
         pos += 1;
@@ -60,9 +70,26 @@ pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
         pos = end;
     }
 
-    // Tail (QTYPE/QCLASS) hashed exactly, matching dns::questions_match semantics.
+    // QTYPE + QCLASS — exact match required.
     h.write(question.get(pos..).unwrap_or(&[]));
-    h.write(query.get(question_end..).unwrap_or(&[]));
+
+    // EDNS semantics — semantic equality, not raw byte equality.
+    let v = dns::extract_variant(query, question_end);
+    h.write_byte(v.has_opt as u8);
+    h.write_byte(v.do_bit as u8);
+    h.write_byte(v.edns_version);
+    h.write_byte(v.rd as u8);
+    h.write_byte(v.ad as u8);
+    h.write_byte(v.cd as u8);
+    match v.ecs_src {
+        None => h.write_byte(0),
+        Some(ecs) => {
+            h.write_byte(1);
+            h.write(&ecs.addr.to_be_bytes());
+            h.write_byte(ecs.prefix_len);
+        }
+    }
+
     h.finish()
 }
 
@@ -492,7 +519,7 @@ impl DnsCache {
         atomic_write(path, |w| {
             // Magic encodes format implicitly; change it when the on-disk layout changes.
             // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-            w.write_all(b"PDNSC005")?;
+            w.write_all(b"PDNSC006")?;
             w.write_all(&fingerprint.to_le_bytes())?;
             w.write_all(&(count as u32).to_le_bytes())?;
 
@@ -556,7 +583,7 @@ impl DnsCache {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).context("read magic")?;
         anyhow::ensure!(
-            &magic == b"PDNSC005",
+            &magic == b"PDNSC006",
             "unrecognised cache file format (magic mismatch)"
         );
 
@@ -637,16 +664,21 @@ impl DnsCache {
 }
 
 fn queries_match(stored: &[u8], query: &[u8], question_end: usize) -> bool {
-    if stored.len() != query.len() || question_end > query.len() {
+    if question_end > query.len() || query.len() < 12 || stored.len() < 12 {
         return false;
     }
     let Some(stored_question_end) = dns::question_end(stored) else {
         return false;
     };
-    stored_question_end == question_end
-        && stored.get(2..12) == query.get(2..12)
-        && dns::questions_match(&stored[12..question_end], &query[12..question_end])
-        && stored.get(question_end..) == query.get(question_end..)
+    if stored_question_end != question_end {
+        return false;
+    }
+    if !dns::questions_match(&stored[12..question_end], &query[12..question_end]) {
+        return false;
+    }
+    // Compare EDNS semantics instead of raw additional-section bytes so that
+    // equivalent queries differing only in OPT padding share cache entries.
+    dns::extract_variant(stored, stored_question_end) == dns::extract_variant(query, question_end)
 }
 
 pub(crate) fn read_u16(r: &mut impl Read) -> Result<u16> {
@@ -899,6 +931,128 @@ mod tests {
         ]);
 
         assert!(cache.get(&edns_query, question_end, 2).is_none());
+    }
+
+    /// Build a query packet that includes an EDNS OPT record.
+    fn make_edns_query(do_bit: bool) -> (Vec<u8>, usize) {
+        let (_, mut query, question_end) = make_test_packets(100);
+        query[11] = 1; // ARCOUNT = 1
+        let do_byte: u8 = if do_bit { 0x80 } else { 0x00 };
+        query.extend_from_slice(&[
+            0x00,             // root owner name
+            0x00, 0x29,       // type OPT (41)
+            0x10, 0x00,       // UDP payload size = 4096
+            0x00, 0x00,       // ext-rcode, EDNS version 0
+            do_byte, 0x00,    // flags — DO bit in high byte
+            0x00, 0x00,       // RDLEN = 0
+        ]);
+        (query, question_end)
+    }
+
+    /// Build a query with an EDNS OPT record containing an ECS option.
+    /// `src_ip_last_octet` varies the source address (/24 prefix).
+    fn make_ecs_query(src_ip_last_octet: u8) -> (Vec<u8>, usize) {
+        let (_, mut query, question_end) = make_test_packets(100);
+        // ECS OPTION-DATA: FAMILY=1 (IPv4), SOURCE-PREFIX-LENGTH=24, SCOPE=0, ADDRESS=1.2.X.0
+        let ecs_data: [u8; 7] = [
+            0x00, 0x01,          // FAMILY = 1
+            24,                  // SOURCE-PREFIX-LENGTH
+            0x00,                // SCOPE-PREFIX-LENGTH
+            1, 2, src_ip_last_octet, // Address — 3 bytes for /24
+        ];
+        let opt_rdata_len: u16 = 4 + ecs_data.len() as u16; // code(2) + len(2) + data
+        query[11] = 1; // ARCOUNT = 1
+        query.extend_from_slice(&[
+            0x00,       // root owner name
+            0x00, 0x29, // type OPT
+            0x10, 0x00, // UDP payload size
+            0x00, 0x00, // ext-rcode, version
+            0x00, 0x00, // flags
+        ]);
+        query.extend_from_slice(&opt_rdata_len.to_be_bytes()); // RDLEN
+        query.extend_from_slice(&[0x00, 0x0b]);                // OPTION-CODE = 11 (ECS)
+        query.extend_from_slice(&(ecs_data.len() as u16).to_be_bytes()); // OPTION-LENGTH
+        query.extend_from_slice(&ecs_data);
+        (query, question_end)
+    }
+
+    #[test]
+    fn do_bit_zero_and_one_use_separate_cache_entries() {
+        let cache = DnsCache::new(&base_cache_config());
+        let (response, _, _) = make_test_packets(100);
+        let resolved = cache.resolve_policy(None);
+
+        // Cache a response under a DO=0 EDNS query.
+        let (query_do0, question_end) = make_edns_query(false);
+        cache.add(
+            CacheInsert {
+                key: cache_key(&query_do0, question_end),
+                qname: Arc::from("test.local"),
+                question_end,
+                query: &query_do0,
+                packet: &response,
+            },
+            &resolved,
+            0,
+        );
+
+        // A DO=1 query must not hit the DO=0 entry.
+        let (query_do1, _) = make_edns_query(true);
+        assert!(
+            cache.get(&query_do1, question_end, 1).is_none(),
+            "DO=1 query must not share a DO=0 cache entry"
+        );
+
+        // After caching a DO=1 response, that same DO=1 query must hit.
+        cache.add(
+            CacheInsert {
+                key: cache_key(&query_do1, question_end),
+                qname: Arc::from("test.local"),
+                question_end,
+                query: &query_do1,
+                packet: &response,
+            },
+            &resolved,
+            0,
+        );
+        assert!(
+            cache.get(&query_do1, question_end, 1).is_some(),
+            "DO=1 query must hit its own cache entry"
+        );
+    }
+
+    #[test]
+    fn ecs_source_subnet_isolates_cache_entries() {
+        let cache = DnsCache::new(&base_cache_config());
+        let (response, _, _) = make_test_packets(100);
+        let resolved = cache.resolve_policy(None);
+
+        // Cache a response for ECS subnet 1.2.3.0/24.
+        let (query_a, question_end) = make_ecs_query(3);
+        cache.add(
+            CacheInsert {
+                key: cache_key(&query_a, question_end),
+                qname: Arc::from("test.local"),
+                question_end,
+                query: &query_a,
+                packet: &response,
+            },
+            &resolved,
+            0,
+        );
+
+        // A query from a different /24 subnet must miss.
+        let (query_b, _) = make_ecs_query(4);
+        assert!(
+            cache.get(&query_b, question_end, 1).is_none(),
+            "ECS 1.2.4.0/24 must not share an entry cached for 1.2.3.0/24"
+        );
+
+        // The original subnet must still hit.
+        assert!(
+            cache.get(&query_a, question_end, 1).is_some(),
+            "ECS 1.2.3.0/24 query must still hit its own entry"
+        );
     }
 
     #[test]
