@@ -426,32 +426,27 @@ fn extract_file_timestamp(name: &str) -> Option<u64> {
 
 /// List historical segments in `dir`, newest-last.
 /// Returns `(file_name, size_bytes)` pairs.
-/// Includes both gzip-compressed (`.msgpack.gz`) and plain (`.msgpack`) segments.
-/// The most-recently-named plain `.msgpack` file is excluded because it is the
-/// active segment currently being written to.
+/// Includes both gzip-compressed (`.msgpack.gz`) and plain (`.msgpack`) segments,
+/// including the currently-active segment (safe to read; the decoder stops at the
+/// first incomplete record).
 pub fn list_history_files(dir: &Path) -> Vec<(String, u64)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
-    let mut gz_files: Vec<(String, u64)> = Vec::new();
-    let mut plain_files: Vec<(String, u64)> = Vec::new();
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-        if name.starts_with("querylog-") {
-            if name.ends_with(".msgpack.gz") {
-                gz_files.push((name, size));
-            } else if name.ends_with(".msgpack") {
-                plain_files.push((name, size));
+    let mut files: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("querylog-")
+                && (name.ends_with(".msgpack.gz") || name.ends_with(".msgpack"))
+            {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                Some((name, size))
+            } else {
+                None
             }
-        }
-    }
-    // The lexicographically largest plain `.msgpack` name is the active segment.
-    plain_files.sort_by(|a, b| a.0.cmp(&b.0));
-    if !plain_files.is_empty() {
-        plain_files.pop(); // drop the active segment
-    }
-    let mut files: Vec<(String, u64)> = gz_files.into_iter().chain(plain_files).collect();
+        })
+        .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
