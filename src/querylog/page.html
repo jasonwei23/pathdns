@@ -316,7 +316,7 @@ tr:last-child td{border-bottom:none}
         </div>
         <input id="ql-filter" type="text" placeholder="Filter by domain…" oninput="filterChanged()">
         <button class="btn btn-danger" id="ql-clear-btn" onclick="clearLog()">Clear</button>
-        <label class="toggle-label" id="ql-auto-label"><input type="checkbox" id="ql-auto" onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
+        <label class="toggle-label" id="ql-auto-label"><input type="checkbox" id="ql-auto" checked onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
       </div>
 
       <!-- Quick filter chips -->
@@ -675,6 +675,11 @@ function switchMode(mode) {
   } else {
     document.getElementById('arch-count').textContent = '';
     qlEvents = []; qlBeforeSeq = null; loadQueryLog();
+    // Restart auto-refresh timer if the toggle is on (default: on).
+    clearInterval(autoRefreshTimer); autoRefreshTimer = null;
+    if (document.getElementById('ql-auto').checked) {
+      autoRefreshTimer = setInterval(() => { qlEvents=[]; qlBeforeSeq=null; loadQueryLog(); }, 5000);
+    }
   }
 }
 
