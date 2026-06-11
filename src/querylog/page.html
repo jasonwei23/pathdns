@@ -271,7 +271,7 @@ tr:last-child td{border-bottom:none}
       </div>
       <div class="stat-box">
         <div class="stat-box-body">
-          <div class="stat-label">Null / Filtered</div>
+          <div class="stat-label">Filtered</div>
           <div class="stat-value" id="stat-null-filtered">—</div>
         </div>
         <canvas class="spark" id="spark-null-filtered" height="44"></canvas>
@@ -867,7 +867,7 @@ function renderQueryLog(events) {
       '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
       '<td>' + esc(qtypeName(ev.qtype)) + '</td>' +
       '<td>' + rcodeTag(ev.rcode) + '</td>' +
-      '<td>' + fmtRtt(ev.elapsed_us) + '</td>' +
+      '<td>' + fmtElapsed(ev.elapsed_us) + '</td>' +
       '<td>' + sourceTag(ev.source) + '</td>' +
       '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';
     tr.onclick = () => openModal(ev);
@@ -891,7 +891,7 @@ function openModal(ev) {
     modalItem('Time', ev.time) +
     modalItem('Type', QTYPE_NAMES[ev.qtype] || 'TYPE' + ev.qtype) +
     modalItem('RCode', RCODE_NAMES[ev.rcode] || 'RCODE' + ev.rcode) +
-    modalItem('Elapsed', fmtRtt(ev.elapsed_us)) +
+    modalItem('Elapsed', fmtElapsed(ev.elapsed_us)) +
     modalItem('Source', ev.source) +
     modalItem('Group', ev.group) +
     modalItem('Response', (ev.response_bytes || 0) + ' bytes') +
@@ -951,6 +951,9 @@ function fmtRtt(us) {
   if (!us) return '0 us';
   if (us>=1000) return (us/1000).toFixed(1)+' ms';
   return us+' us';
+}
+function fmtElapsed(us) {
+  return (us/1000).toFixed(1)+' ms';
 }
 
 function esc(s) {
