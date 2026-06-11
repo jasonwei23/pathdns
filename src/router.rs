@@ -46,14 +46,6 @@ impl<'a> RouteTarget<'a> {
         }
     }
 
-    /// Returns a human-readable display string for the upstream address(es), if any.
-    pub fn upstream_display(&self) -> Option<Arc<str>> {
-        match self {
-            Self::Group(group) => group.upstream.as_ref().map(|p| p.addr_display.clone()),
-            Self::Race { .. } | Self::NoneIpSet { .. } => None,
-        }
-    }
-
     /// Returns true when every upstream in this target strips ECS, meaning all clients
     /// can share a single cache entry keyed on the ECS-stripped variant.
     pub fn strip_ecs(&self) -> bool {
