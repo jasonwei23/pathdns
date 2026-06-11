@@ -103,7 +103,7 @@ struct Entry {
     /// Effective TTL (clamped by per-group or global min/max at write time).
     ttl: u32,
     stale_until: Instant,
-    ttl_offsets: Arc<[usize]>,
+    ttl_offsets: Arc<[(usize, u32)]>,
     /// Per-entry effective max TTL — used only to cap the stale advertised TTL.
     max_ttl: u32,
     /// Effective stale TTL advertised to clients when stale_ttl_reset is true.
@@ -344,6 +344,7 @@ impl DnsCache {
         }
 
         let now = Instant::now();
+        let elapsed = now.saturating_duration_since(entry.inserted).as_secs().min(u32::MAX as u64) as u32;
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
             EntryFreshness::Fresh { remaining } => (remaining, false),
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
@@ -355,16 +356,16 @@ impl DnsCache {
             }
         };
 
-        // TTL was clamped at write time; remaining already reflects that.
-        // No re-clamping here — that would freeze the countdown.
-        let wire_ttl = remaining;
-
         let mut packet = BytesMut::from(entry.packet.as_ref());
         let _ = dns::set_id(&mut packet, client_id);
         if packet.len() >= question_end {
             packet[12..question_end].copy_from_slice(question);
         }
-        dns::patch_ttls_at(&mut packet, &entry.ttl_offsets, wire_ttl);
+        if is_stale {
+            dns::patch_ttls_uniform(&mut packet, &entry.ttl_offsets, remaining);
+        } else {
+            dns::patch_ttls_at(&mut packet, &entry.ttl_offsets, elapsed);
+        }
         let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
         Some(CacheLookup {
             packet: packet.freeze(),
@@ -392,6 +393,7 @@ impl DnsCache {
         }
 
         let now = Instant::now();
+        let elapsed = now.saturating_duration_since(entry.inserted).as_secs().min(u32::MAX as u64) as u32;
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
             EntryFreshness::Fresh { remaining } => (remaining, false),
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
@@ -403,15 +405,17 @@ impl DnsCache {
             }
         };
 
-        let wire_ttl = remaining;
-
         out.clear();
         out.extend_from_slice(&entry.packet);
         let _ = dns::set_id(out, client_id);
         if out.len() >= question_end {
             out[12..question_end].copy_from_slice(question);
         }
-        dns::patch_ttls_at(out, &entry.ttl_offsets, wire_ttl);
+        if is_stale {
+            dns::patch_ttls_uniform(out, &entry.ttl_offsets, remaining);
+        } else {
+            dns::patch_ttls_at(out, &entry.ttl_offsets, elapsed);
+        }
         let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
         Some(CacheLookupMeta {
             refresh,
@@ -519,7 +523,7 @@ impl DnsCache {
         atomic_write(path, |w| {
             // Magic encodes format implicitly; change it when the on-disk layout changes.
             // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-            w.write_all(b"PDNSC006")?;
+            w.write_all(b"PDNSC007")?;
             w.write_all(&fingerprint.to_le_bytes())?;
             w.write_all(&(count as u32).to_le_bytes())?;
 
@@ -552,10 +556,11 @@ impl DnsCache {
                 w.write_all(&(qname.len() as u32).to_le_bytes())?;
                 w.write_all(qname)?;
 
-                let offsets: &[usize] = &entry.ttl_offsets;
+                let offsets: &[(usize, u32)] = &entry.ttl_offsets;
                 w.write_all(&(offsets.len() as u32).to_le_bytes())?;
-                for &off in offsets {
+                for &(off, original_ttl) in offsets {
                     w.write_all(&(off as u32).to_le_bytes())?;
+                    w.write_all(&original_ttl.to_le_bytes())?;
                 }
 
                 w.write_all(&entry.max_ttl.to_le_bytes())?;
@@ -583,7 +588,7 @@ impl DnsCache {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).context("read magic")?;
         anyhow::ensure!(
-            &magic == b"PDNSC006",
+            &magic == b"PDNSC007",
             "unrecognised cache file format (magic mismatch)"
         );
 
@@ -612,9 +617,11 @@ impl DnsCache {
             let query = read_bytes(&mut r)?;
             let qname_bytes = read_bytes(&mut r)?;
             let offsets_count = read_u32(&mut r)? as usize;
-            let mut offsets: Vec<usize> = Vec::with_capacity(offsets_count);
+            let mut offsets: Vec<(usize, u32)> = Vec::with_capacity(offsets_count);
             for _ in 0..offsets_count {
-                offsets.push(read_u32(&mut r)? as usize);
+                let off = read_u32(&mut r)? as usize;
+                let original_ttl = read_u32(&mut r)?;
+                offsets.push((off, original_ttl));
             }
 
             let entry_max_ttl = read_u32(&mut r)?;

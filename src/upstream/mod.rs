@@ -285,6 +285,7 @@ impl UpstreamPool {
                         MuxConnector::Tcp,
                         cfg.upstream_max_inflight,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_response_bytes,
                     )))
                 }
                 UpstreamProto::Tls => {
@@ -332,6 +333,7 @@ impl UpstreamPool {
                         },
                         cfg.upstream_max_inflight,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                        cfg.upstream_max_response_bytes,
                     )))
                 }
                 UpstreamProto::Https => {
@@ -354,7 +356,7 @@ impl UpstreamPool {
                         path,
                         cfg.timeout,
                         endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
-                    )))
+                    )?))
                 }
                 UpstreamProto::Quic => {
                     let server_name = endpoint

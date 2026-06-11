@@ -35,7 +35,7 @@ pub struct FastQueryInfo {
 pub use builder::{empty_reply, notimp_opcode_reply, notimp_reply, servfail_reply};
 pub use ecs::{inject_or_replace_ecs, strip_edns_ecs};
 pub use query::{get_id, is_reply, is_truncated, parse_query_fast, parse_query_from_fast, set_id};
-pub use scan::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, rcode};
+pub use scan::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, patch_ttls_uniform, rcode};
 
 // ── Query variant ──────────────────────────────────────────────────────────
 

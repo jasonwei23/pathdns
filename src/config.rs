@@ -55,6 +55,8 @@ pub struct UpstreamConfig {
     pub udp_buf_size: usize,
     pub upstream_max_inflight: usize,
     pub hedge_delay: Option<Duration>,
+    /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
+    pub upstream_max_response_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +221,8 @@ pub struct Config {
     pub geosite_files: Vec<PathBuf>,
     pub upstream_max_inflight: usize,
     pub hedge_delay: Option<Duration>,
+    /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
+    pub upstream_max_response_bytes: usize,
 }
 
 impl Config {
@@ -243,6 +247,7 @@ impl Config {
             udp_buf_size: self.udp_buf_size,
             upstream_max_inflight: self.upstream_max_inflight,
             hedge_delay: self.hedge_delay,
+            upstream_max_response_bytes: self.upstream_max_response_bytes,
         }
     }
 
@@ -308,7 +313,7 @@ impl Config {
         }
 
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
-        let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads).max(1);
+        let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads.max(32)).max(1);
 
         // Parse querylog section.
         let querylog = if let Some(ql) = json.querylog {
@@ -441,6 +446,7 @@ impl Config {
                 .collect(),
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
+            upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
         })
     }
 }

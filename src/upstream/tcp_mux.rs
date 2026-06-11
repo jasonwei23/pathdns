@@ -38,6 +38,8 @@ pub(super) struct TcpMux {
     reconnect_not_before_ms: AtomicU64,
     /// Consecutive failed TCP/TLS connection attempts; reset to 0 on first success.
     reconnect_fail_count: AtomicU32,
+    /// Drop the connection when a response frame exceeds this size. 0 = no limit.
+    max_response_bytes: usize,
 }
 
 impl TcpMux {
@@ -48,6 +50,7 @@ impl TcpMux {
         connector: MuxConnector,
         max_inflight: usize,
         ecs_mode: EcsMode,
+        max_response_bytes: usize,
     ) -> Self {
         Self {
             name,
@@ -60,6 +63,7 @@ impl TcpMux {
             pending: Arc::new(InflightRegistry::new(max_inflight)),
             generation: Arc::new(AtomicU64::new(0)),
             ecs_mode,
+            max_response_bytes,
         }
     }
 
@@ -132,8 +136,9 @@ impl TcpMux {
                 let pending = self.pending.clone();
                 let generation = self.generation.clone();
                 let write_conn = self.write_half.clone();
+                let max_resp = self.max_response_bytes;
                 tokio::spawn(async move {
-                    mux_reader_loop(read_half, pending, generation, my_gen, write_conn).await;
+                    mux_reader_loop(read_half, pending, generation, my_gen, write_conn, max_resp).await;
                 });
 
                 Ok(())
@@ -208,6 +213,7 @@ async fn mux_reader_loop(
     global_gen: Arc<AtomicU64>,
     my_gen: u64,
     write_conn: Arc<tokio::sync::Mutex<Option<BoxedWrite>>>,
+    max_response_bytes: usize,
 ) {
     let mut buf = BytesMut::with_capacity(4096);
     loop {
@@ -227,8 +233,8 @@ async fn mux_reader_loop(
         }
 
         let resp_len = u16::from_be_bytes(len_buf) as usize;
-        if resp_len < 12 {
-            // Malformed response; disconnect.
+        if resp_len < 12 || (max_response_bytes > 0 && resp_len > max_response_bytes) {
+            // Malformed or oversized response; disconnect.
             if global_gen.load(Ordering::Relaxed) == my_gen {
                 *write_conn.lock().await = None;
                 pending.clear();
