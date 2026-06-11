@@ -178,9 +178,9 @@ Groups are matched top-to-bottom. The first group whose GeoSite tags match the q
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Unique group name. Use `"null"` to return empty responses (no `upstream` needed). |
+| `name` | string | Unique group name. |
 | `tag` | string array | GeoSite tag expressions. `"TAG"` includes, `"!TAG"` excludes. |
-| `upstream` | string array | Upstream resolvers for this group (see [Upstream URLs](#upstream-urls)). |
+| `upstream` | string array | Upstream resolvers for this group (see [Upstream URLs](#upstream-urls)). Use `["RCODE://NXDOMAIN"]` (or another RCODE) to return a fixed response without querying any upstream. |
 | `add-ip` | string | `"v4set,v6set"` — add resolved IPs to these ipset/nftset sets. |
 | `cache` | object | Per-group cache overrides (see [Group-level cache overrides](#group-level-cache-overrides)). |
 | `filter-qtype` | int or int array | Drop queries of the given QTYPE(s) for this group (values 0–65535; e.g. `28` drops AAAA, `65` drops HTTPS). |
@@ -367,15 +367,16 @@ Each event is a JSON object:
 
 | URL form | Protocol |
 |----------|----------|
-| `1.1.1.1` | UDP + TCP (both created) |
-| `udp://1.1.1.1` | UDP only |
+| `1.1.1.1` | UDP (default; standard port 53 implied) |
+| `udp://1.1.1.1` | UDP |
 | `udp://1.1.1.1:5353` | UDP on custom port |
 | `tcp://1.1.1.1` | TCP (persistent mux connection) |
-| `tls://1.1.1.1` | DNS-over-TLS (RFC 7858) |
+| `tls://1.1.1.1` | DNS-over-TLS (RFC 7858; standard port 853) |
 | `tls://1.1.1.1?sni=dns.example` | DoT with explicit SNI |
-| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/2 via ALPN, fallback to HTTP/1.1) |
+| `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/2; standard port 443) |
 | `quic://dns.adguard.com` | DNS-over-QUIC (requires `--features doq`) |
 | `h3://dns.cloudflare.com/dns-query` | DoH over HTTP/3 (requires `--features h3`) |
+| `RCODE://NXDOMAIN` | Return a fixed RCODE immediately (no upstream query). Valid names: `NOERROR`, `NXDOMAIN`, `SERVFAIL`, `REFUSED`, `FORMERR`, `NOTIMP`, or a number 0–15. Only one RCODE upstream per group; cannot be mixed with real upstreams. |
 
 **ECS mode** (per-upstream, via query parameter):
 
@@ -481,16 +482,18 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 }
 ```
 
-### Block a domain category (null group)
+### Block a domain category
+
+Use `"RCODE://NXDOMAIN"` (or `NOERROR`, `REFUSED`, etc.) as the upstream to return a fixed DNS response without querying any real resolver.
 
 ```json
 {
   "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
-    { "name": "null",     "tag": ["category-ads-all"] },
-    { "name": "domestic", "tag": ["cn"],               "upstream": ["223.5.5.5"] },
-    { "name": "overseas", "tag": ["geolocation-!cn"],  "upstream": ["tls://1.1.1.1"] }
+    { "name": "adblock",  "tag": ["category-ads-all"],  "upstream": ["RCODE://NXDOMAIN"] },
+    { "name": "domestic", "tag": ["cn"],                 "upstream": ["udp://223.5.5.5"] },
+    { "name": "overseas", "tag": ["geolocation-!cn"],    "upstream": ["tls://1.1.1.1"] }
   ],
   "fallback": "domestic",
   "cache": { "size": 10000 }
@@ -551,7 +554,7 @@ When a token is configured, the dashboard HTML remains publicly loadable so its 
 | `GET /api/stats` | Snapshot of counters: total queries, cache-hit rate, current QPS, average RTT, upstream ok/err, inflight drops, ring length. |
 | `GET /api/stats/history?n=<N>` | Last `N` seconds of per-second QPS samples (max 3600). |
 | `GET /api/stats/aggregate?seconds=<N>` | Aggregated counters over the last N seconds (1–86400). Returns total queries, cache hits/rate, upstream ok/err, null responses, stale served, filtered. Used by the dashboard time-range selector. |
-| `GET /api/groups` | Routing groups in match order with their GeoSite tags (include/exclude), per-tag rule count, `filter-qtype`, and whether they have an upstream or are null groups. |
+| `GET /api/groups` | Routing groups in match order with their GeoSite tags (include/exclude), per-tag rule count, `filter-qtype`, whether they have an upstream, and `fixed_rcode` if a `RCODE://` upstream is configured. |
 | `GET /api/querylog?limit=<L>&before_seq=<S>&q=<filter>` | Recent events from the in-memory ring, newest first. `before_seq` paginates older entries; `q` filters by qname substring. |
 | `DELETE /api/querylog` | Clear the in-memory event ring. |
 | `GET /api/querylog/files` | JSON array of available compressed historical segments with their names and sizes (`[{"name":"querylog-…msgpack.gz","size_bytes":…}]`). Returns `[]` when file logging is disabled. |
