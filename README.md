@@ -207,19 +207,26 @@ Route unmatched queries to the named group. `"fallback": "null"` returns empty r
   "ipset-name6": "chnroute6"
 }
 ```
-Racing mode: query `primary` and `secondary` concurrently. With `ipset-name4`/`ipset-name6` configured, the primary response's IPs are tested against the ipset to pick the winner; without them, the first non-SERVFAIL response wins.
+**Ipset-test mode** — the upstream is decided by **ipset membership, not speed**:
 
-**Racing mode fields:**
+1. `primary` and `secondary` are queried concurrently (concurrency only hides latency; it does not influence the decision).
+2. The primary's answer IPs are tested against `ipset-name4`/`ipset-name6`.
+3. IPs found in the set → the **primary's** answer is returned. Not in the set → the **secondary's** answer is returned.
+4. The verdict is cached per domain (see [Verdict Cache](#verdict-cache)), so subsequent queries go straight to the chosen group.
+
+`ipset-name4` and/or `ipset-name6` are therefore **required** in this form — without a set to test against, the mode has no decision mechanism. Non-A/AAAA queries (which carry no testable IPs) fall back to the first non-SERVFAIL answer.
+
+**Ipset-test mode fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `primary` | string | Primary group name (required). |
-| `secondary` | string | Secondary group name (required). |
-| `ipset-name4` | string | IPv4 ipset/nftset for testing primary response IPs. |
-| `ipset-name6` | string | IPv6 ipset/nftset for testing primary response IPs. |
-| `noip-as-primary-ip` | bool | Treat NODATA primary replies as primary IPs (default: `false`). |
+| `primary` | string | Group preferred when its answer IPs are in the ipset (required). |
+| `secondary` | string | Group used when the primary's answer IPs are NOT in the ipset (required). |
+| `ipset-name4` | string | IPv4 ipset/nftset to test the primary's answer IPs against. At least one of the two set names is required. |
+| `ipset-name6` | string | IPv6 ipset/nftset to test the primary's answer IPs against. |
+| `noip-as-primary-ip` | bool | Treat NODATA primary replies as if their IPs were in the set (default: `false`). |
 
-**Legacy form** (still accepted): `{"default-group": "<name>"}`, `{"default-group": "null"}`, and `{"default-group": "none", "primary": ..., "secondary": ...}` map to the forms above.
+**Legacy form** (still accepted): `{"default-group": "<name>"}`, `{"default-group": "null"}`, and `{"default-group": "none", "primary": ..., "secondary": ...}` map to the forms above. Only the legacy `"none"` spelling may omit the ipset names, in which case it degrades to a pure latency race (first non-SERVFAIL answer wins).
 
 ### Cache
 

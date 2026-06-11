@@ -19,7 +19,12 @@
 //! }
 //! ```
 //!
-//! # Example – racing fallback (primary/secondary with ipset test)
+//! # Example – ipset-test fallback (upstream decided by ipset membership)
+//!
+//! The primary's answer IPs are tested against the ipset: in the set → use the
+//! primary's answer; not in the set → use the secondary's. Both groups are
+//! queried concurrently only to hide latency — this is IP-policy routing, not
+//! a race, so `ipset-name4`/`ipset-name6` are required in this form.
 //!
 //! ```json
 //! {
@@ -111,20 +116,29 @@ pub(crate) struct JsonConfig {
     pub(crate) fallback: Option<serde_json::Value>,
 }
 
+/// The object form of `fallback` configures **ipset-test mode**: both groups
+/// are queried concurrently (for latency), but the answer that is returned is
+/// decided by ipset membership — if the primary's answer IPs are found in the
+/// configured ipset, the primary's answer is used, otherwise the secondary's.
+/// This is IP-policy routing, not a latency race, so at least one of
+/// `ipset-name4`/`ipset-name6` is required (except in the legacy
+/// `"default-group": "none"` spelling, which degrades to a pure race when no
+/// ipset is given).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct JsonFallbackSection {
     /// Legacy selector: `"none"` | `"null"` | a group name defined in `group`.
-    /// Optional — when omitted, a `primary`/`secondary` pair selects racing
-    /// mode, and `"fallback": "<group>"` (string form) routes to a group.
+    /// Optional — when omitted, a `primary`/`secondary`/`ipset-name*` set
+    /// selects ipset-test mode, and `"fallback": "<group>"` (string form)
+    /// routes to a group.
     pub(crate) default_group: Option<String>,
-    /// Racing mode: primary upstream group name.
+    /// Ipset-test mode: group whose answer is preferred when its IPs are in the ipset.
     pub(crate) primary: Option<String>,
-    /// Racing mode: secondary upstream group name.
+    /// Ipset-test mode: group whose answer is used when the primary's IPs are NOT in the ipset.
     pub(crate) secondary: Option<String>,
-    /// IPv4 nftset/ipset name for IP-based routing in `"none"` fallback.
+    /// IPv4 nftset/ipset name the primary's answer IPs are tested against.
     pub(crate) ipset_name4: Option<String>,
-    /// IPv6 nftset/ipset name for IP-based routing in `"none"` fallback.
+    /// IPv6 nftset/ipset name the primary's answer IPs are tested against.
     pub(crate) ipset_name6: Option<String>,
     /// Treat NODATA primary replies as primary IPs for routing decisions.
     pub(crate) noip_as_primary_ip: Option<bool>,

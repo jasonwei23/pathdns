@@ -510,9 +510,15 @@ fn print_help() {
 /// Accepted forms:
 /// - `"fallback": "<group>"` — route unmatched queries to a named group
 /// - `"fallback": "null"` — return empty responses
-/// - `"fallback": { "primary": "...", "secondary": "...", ... }` — race two
-///   groups, optionally picking the winner via ipset test
-/// - legacy object form with `"default-group": "<name>" | "none" | "null"`
+/// - `"fallback": { "primary": ..., "secondary": ..., "ipset-name4"/"ipset-name6": ... }`
+///   — **ipset-test mode**: both groups are queried concurrently (for latency),
+///   but the upstream is *decided by ipset membership*: if the primary's answer
+///   IPs are in the configured ipset, the primary's answer is used, otherwise
+///   the secondary's. This is IP-policy routing, not a latency race, so the new
+///   form requires at least one of `ipset-name4`/`ipset-name6`.
+/// - legacy object form with `"default-group": "<name>" | "none" | "null"`.
+///   Legacy `"none"` *without* ipset names degrades to a pure latency race
+///   (first non-SERVFAIL answer wins) and is kept only for compatibility.
 fn parse_fallback_config(
     value: serde_json::Value,
     groups: &[GroupSpec],
@@ -540,17 +546,19 @@ fn parse_fallback_config(
 
     let target = match jf.default_group.as_deref() {
         Some("null") => FallbackTarget::Null,
-        // Racing mode: a primary/secondary pair, or the legacy "none" selector.
+        // Ipset-test mode: a primary/secondary pair, or the legacy "none" selector.
         Some("none") | None => {
+            // The new form omits "default-group" entirely.
+            let is_new_form = jf.default_group.is_none();
             let primary = jf.primary.ok_or_else(|| {
                 anyhow!(
-                    "fallback: racing mode requires \"primary\" \
+                    "fallback: ipset-test mode requires \"primary\" \
                      (to route to a single group use \"fallback\": \"<group>\")"
                 )
             })?;
             let secondary = jf
                 .secondary
-                .ok_or_else(|| anyhow!("fallback: racing mode requires \"secondary\""))?;
+                .ok_or_else(|| anyhow!("fallback: ipset-test mode requires \"secondary\""))?;
             if !group_exists(&primary) {
                 return Err(anyhow!("fallback.primary \"{primary}\": no such group"));
             }
@@ -576,6 +584,17 @@ fn parse_fallback_config(
                     }
                 }
             };
+            // The whole point of this mode is deciding the upstream by ipset
+            // membership of the primary's answer IPs. The new form therefore
+            // requires an ipset; only legacy "default-group": "none" may omit
+            // it (degrading to a pure latency race, kept for compatibility).
+            if is_new_form && ipset.is_none() {
+                return Err(anyhow!(
+                    "fallback: {{\"primary\", \"secondary\"}} requires \"ipset-name4\" \
+                     and/or \"ipset-name6\" — the primary's answer IPs are tested \
+                     against the ipset to decide which upstream's answer is used"
+                ));
+            }
             FallbackTarget::None {
                 primary,
                 secondary,
@@ -1393,22 +1412,37 @@ mod querylog_tests {
     }
 
     #[test]
-    fn fallback_racing_without_default_group() {
+    fn fallback_ipset_test_mode_without_default_group() {
         let cfg = parse(
+            r#"{"group":[
+                  {"name":"a","upstream":["1.1.1.1"]},
+                  {"name":"b","upstream":["8.8.8.8"]}],
+                "fallback":{"primary":"a","secondary":"b",
+                            "ipset-name4":"chnroute","ipset-name6":"chnroute6"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &cfg.fallback.target,
+            FallbackTarget::None { primary, secondary, ipset: Some(_) }
+                if primary == "a" && secondary == "b"
+        ));
+    }
+
+    #[test]
+    fn fallback_new_form_requires_ipset() {
+        // Without ipset names the decision mechanism is gone — must be rejected.
+        assert!(parse(
             r#"{"group":[
                   {"name":"a","upstream":["1.1.1.1"]},
                   {"name":"b","upstream":["8.8.8.8"]}],
                 "fallback":{"primary":"a","secondary":"b"}}"#,
         )
-        .unwrap();
-        assert!(matches!(
-            &cfg.fallback.target,
-            FallbackTarget::None { primary, secondary, .. } if primary == "a" && secondary == "b"
-        ));
+        .is_err());
     }
 
     #[test]
-    fn fallback_legacy_default_group_none_still_works() {
+    fn fallback_legacy_default_group_none_still_races_without_ipset() {
+        // Legacy "none" without ipset degrades to a latency race; kept for compat.
         let cfg = parse(
             r#"{"group":[
                   {"name":"a","upstream":["1.1.1.1"]},
@@ -1416,7 +1450,10 @@ mod querylog_tests {
                 "fallback":{"default-group":"none","primary":"a","secondary":"b"}}"#,
         )
         .unwrap();
-        assert!(matches!(&cfg.fallback.target, FallbackTarget::None { .. }));
+        assert!(matches!(
+            &cfg.fallback.target,
+            FallbackTarget::None { ipset: None, .. }
+        ));
     }
 
     #[test]
