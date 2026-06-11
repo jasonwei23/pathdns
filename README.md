@@ -19,9 +19,10 @@ Runs on Linux. UDP and TCP listeners with automatic `SO_REUSEPORT` sharding.
 - EDNS-aware cache isolation: responses are keyed by EDNS variant (DO bit, EDNS version, ECS subnet) so DO=0 and DO=1 clients never share cache entries. When an upstream uses `ecs=strip`, all clients share one cache entry regardless of their ECS subnet (ECS-normalized cache key).
 - DNS 0x20 QNAME case randomization: outgoing queries apply random per-letter capitalisation to the QNAME and verify the server echoes the same case back, adding ~16 bits of entropy against cache-poisoning attacks.
 - Upstream response size cap: configurable per-byte limit rejects oversized TCP/TLS frames before they reach the cache.
-- TCP connection limit and per-frame read timeouts guard against slowloris-style attacks.
-- Singleflight deduplication: concurrent identical cache-miss queries share one upstream request.
-- Graceful rate limiting: configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
+- TCP connection limit and per-frame read timeouts guard against slowloris-style attacks. TCP/TLS mux reader loops apply the upstream timeout to both the length-prefix and body reads, preventing half-frame deadlocks from stalling the connection indefinitely.
+- GeoSite hot-reload carries a routing generation counter. In-flight upstream responses from the old routing are silently dropped before cache insertion so they do not pollute the freshly-cleared cache.
+- Singleflight deduplication: concurrent identical cache-miss queries share one upstream request. The follower validates the leader's response question section (case-insensitively, tolerating 0x20 mixing) to detect and discard hash collisions.
+- Graceful rate limiting: the inflight semaphore is acquired before spawning the slow-path task, bounding queued tasks under UDP flood. Configurable per-query queue timeout before shedding with SERVFAIL when `max-inflight` is full.
 - Per-domain verdict cache for racing-fallback routing decisions.
 - Query type filtering with optional group and GeoSite tag conditions.
 - Native Linux netlink backend for ipset/nftset test and add operations (no shell-out).
@@ -178,9 +179,9 @@ Groups are matched top-to-bottom. The first group whose GeoSite tags match the q
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Unique group name. Use `"null"` to return empty responses (no `upstream` needed). |
+| `name` | string | Unique group name. |
 | `tag` | string array | GeoSite tag expressions. `"TAG"` includes, `"!TAG"` excludes. |
-| `upstream` | string array | Upstream resolvers for this group (see [Upstream URLs](#upstream-urls)). |
+| `upstream` | string array | Upstream resolvers for this group (see [Upstream URLs](#upstream-urls)). Omit (or use only `RCODE://` entries) to return a fixed response without querying any upstream. |
 | `add-ip` | string | `"v4set,v6set"` — add resolved IPs to these ipset/nftset sets. |
 | `cache` | object | Per-group cache overrides (see [Group-level cache overrides](#group-level-cache-overrides)). |
 | `filter-qtype` | int or int array | Drop queries of the given QTYPE(s) for this group (values 0–65535; e.g. `28` drops AAAA, `65` drops HTTPS). |
@@ -359,7 +360,7 @@ Each event is a JSON object:
 }
 ```
 
-`source` is one of `cache`, `stale`, `upstream`, `singleflight`, `filtered`, `overload`, or `null`.
+`source` is one of `cache`, `stale`, `upstream`, `singleflight`, `filtered`, `overload`, `rcode`, or `null`.
 
 ---
 
@@ -367,7 +368,7 @@ Each event is a JSON object:
 
 | URL form | Protocol |
 |----------|----------|
-| `1.1.1.1` | UDP + TCP (both created) |
+| `1.1.1.1` | UDP only (equivalent to `udp://1.1.1.1`; standard port 53 is not shown) |
 | `udp://1.1.1.1` | UDP only |
 | `udp://1.1.1.1:5353` | UDP on custom port |
 | `tcp://1.1.1.1` | TCP (persistent mux connection) |
@@ -376,6 +377,12 @@ Each event is a JSON object:
 | `https://8.8.8.8/dns-query` | DNS-over-HTTPS (HTTP/2 via ALPN, fallback to HTTP/1.1) |
 | `quic://dns.adguard.com` | DNS-over-QUIC (requires `--features doq`) |
 | `h3://dns.cloudflare.com/dns-query` | DoH over HTTP/3 (requires `--features h3`) |
+| `RCODE://NOERROR` | Return NOERROR with no records (empty response) |
+| `RCODE://NXDOMAIN` | Return NXDOMAIN |
+| `RCODE://SERVFAIL` | Return SERVFAIL |
+| `RCODE://REFUSED` | Return REFUSED |
+
+**RCODE upstreams** return a fixed DNS response immediately without querying any upstream. Use them in a group's `upstream` list to block or sink a domain category. Standard ports are omitted from the display (UDP/TCP :53, TLS/QUIC :853, HTTPS/H3 :443).
 
 **ECS mode** (per-upstream, via query parameter):
 
@@ -481,16 +488,16 @@ GeoSite files are watched for changes and hot-reloaded automatically.
 }
 ```
 
-### Block a domain category (null group)
+### Block a domain category
 
 ```json
 {
   "bind": ["0.0.0.0:53", "[::]:53"],
   "geosite-file": ["/etc/pathdns/geosite.dat"],
   "group": [
-    { "name": "null",     "tag": ["category-ads-all"] },
-    { "name": "domestic", "tag": ["cn"],               "upstream": ["223.5.5.5"] },
-    { "name": "overseas", "tag": ["geolocation-!cn"],  "upstream": ["tls://1.1.1.1"] }
+    { "name": "adblock",  "tag": ["category-ads-all"],   "upstream": ["RCODE://NXDOMAIN"] },
+    { "name": "domestic", "tag": ["cn"],                  "upstream": ["223.5.5.5"] },
+    { "name": "overseas", "tag": ["geolocation-!cn"],     "upstream": ["tls://1.1.1.1"] }
   ],
   "fallback": "domestic",
   "cache": { "size": 10000 }
