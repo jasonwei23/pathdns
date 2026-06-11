@@ -333,8 +333,8 @@ impl Config {
             }
             let file = if let Some(f) = ql.file {
                 let dir = PathBuf::from(f.dir.unwrap_or_else(|| "./querylog".to_string()));
-                let max_mb = f.max_mb.unwrap_or(100);
-                let max_segments = f.max_segments.unwrap_or(10);
+                let max_mb = f.max_mb.unwrap_or(8);
+                let max_segments = f.max_segments.unwrap_or(3);
                 if max_mb == 0 {
                     return Err(anyhow!("querylog.file.max-mb must be at least 1"));
                 }
