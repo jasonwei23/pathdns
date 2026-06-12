@@ -64,11 +64,16 @@ impl QueryContext {
 struct SingleflightLeader<'a> {
     state: &'a AppState,
     key: CacheKey,
+    /// Set to true after publish_bytes removes the key so Drop does not
+    /// accidentally evict a newly registered leader for the same key.
+    published: bool,
 }
 
 impl Drop for SingleflightLeader<'_> {
     fn drop(&mut self) {
-        singleflight::remove(&self.state.remote_inflight, &self.key);
+        if !self.published {
+            singleflight::remove(&self.state.remote_inflight, &self.key);
+        }
     }
 }
 
@@ -128,6 +133,7 @@ pub(crate) fn try_fast_path(
 
     // Non-QUERY opcodes (STATUS, NOTIFY, UPDATE, …): return NOTIMP per RFC 1035.
     if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        record_query_received(&state.querylog, proto);
         return FastPathOutcome::Response {
             resp: Bytes::from(dns::notimp_opcode_reply(packet)),
             refresh: None,
@@ -211,6 +217,7 @@ pub(crate) fn try_fast_path_into(
 
     // Non-QUERY opcodes: return NOTIMP per RFC 1035.
     if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
+        record_query_received(&state.querylog, ClientProto::Udp);
         return FastPathOutcome::Response {
             resp: Bytes::from(dns::notimp_opcode_reply(packet)),
             refresh: None,
@@ -654,7 +661,7 @@ async fn exchange_with_dedupe(
     }
     // If the leader task is cancelled while awaiting upstream I/O, Drop removes
     // the table entry so later callers can become the new leader instead of waiting forever.
-    let _leader = SingleflightLeader { state, key: sf_ck };
+    let mut _leader = SingleflightLeader { state, key: sf_ck, published: false };
 
     // Leader path: compute skip_cache before consuming packet, clone for cache use.
     let skip_cache = target.skip_cache();
@@ -682,6 +689,7 @@ async fn exchange_with_dedupe(
             Err(_timeout) => {
                 // Timeout fired first; serve stale to the client and spawn a background refresh.
                 singleflight::publish_bytes(&state.remote_inflight, &sf_ck, stale_pkt.clone());
+                _leader.published = true;
                 let elapsed = started.elapsed().as_micros() as u64;
                 record_client_latency(&ctx, state, elapsed);
                 if ctx.client().is_some() {
@@ -725,6 +733,7 @@ async fn exchange_with_dedupe(
                     started,
                     ctx.client().is_some(),
                 ) {
+                    _leader.published = true;
                     let elapsed = started.elapsed().as_micros() as u64;
                     emit_slow_event(
                         &ctx,
@@ -795,6 +804,7 @@ async fn exchange_with_dedupe(
             resp_mut[12..ctx.info.question_end].copy_from_slice(ctx.question());
             let resp = resp_mut.freeze();
             singleflight::publish_bytes(&state.remote_inflight, &sf_ck, resp.clone());
+            _leader.published = true;
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(&ctx, state, elapsed);
             if ctx.client().is_some() {
@@ -824,6 +834,7 @@ async fn exchange_with_dedupe(
                     started,
                     ctx.client().is_some(),
                 ) {
+                    _leader.published = true;
                     let elapsed = started.elapsed().as_micros() as u64;
                     emit_slow_event(
                         &ctx,
@@ -848,6 +859,7 @@ async fn exchange_with_dedupe(
             };
             let servfail = Bytes::from(servfail);
             singleflight::publish_bytes(&state.remote_inflight, &sf_ck, servfail.clone());
+            _leader.published = true;
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(&ctx, state, elapsed);
             if ctx.client().is_some() {

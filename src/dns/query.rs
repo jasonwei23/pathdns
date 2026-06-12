@@ -182,7 +182,7 @@ fn qname_from_question(packet: &[u8], question_end: usize) -> Result<Arc<str>> {
         return Err(anyhow!("invalid dns query"));
     }
     let mut pos = 12usize;
-    let mut qname = String::new();
+    let mut qname = String::with_capacity(question_end.saturating_sub(17));
 
     while pos < packet.len() && pos < question_end {
         let len = packet[pos] as usize;

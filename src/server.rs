@@ -66,7 +66,6 @@ pub struct AppState {
 
 pub struct RefreshGate {
     active: Mutex<HashSet<CacheKey>>,
-    bloom: [AtomicU64; 4],
 }
 
 pub struct CustomGroup {
@@ -466,37 +465,19 @@ impl RefreshGate {
     pub(crate) fn new() -> Self {
         Self {
             active: Mutex::new(HashSet::new()),
-            bloom: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
         }
     }
 
     pub(crate) fn begin(&self, key: &CacheKey) -> bool {
-        let bit_idx = key & 63;
-        let word_idx = (key >> 6) & 3;
-        let bit = 1u64 << bit_idx;
-        let old = self.bloom[word_idx as usize].fetch_or(bit, Ordering::Relaxed);
         let Ok(mut active) = self.active.lock() else {
             return false;
         };
-        if old & bit != 0 && active.contains(key) {
-            return false;
-        }
         active.insert(*key)
     }
 
     pub(crate) fn end(&self, key: &CacheKey) {
         if let Ok(mut active) = self.active.lock() {
             active.remove(key);
-            if active.is_empty() {
-                for w in &self.bloom {
-                    w.store(0, Ordering::Relaxed);
-                }
-            }
         }
     }
 }

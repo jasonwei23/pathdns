@@ -204,7 +204,7 @@ async fn dispatch(
 
     if let Some(expected) = token {
         let provided = req.auth.as_deref().unwrap_or("");
-        if provided != expected {
+        if !ct_str_eq(provided, expected) {
             return (
                 "401 Unauthorized",
                 br#"{"error":"unauthorized"}"#.to_vec(),
@@ -627,6 +627,14 @@ fn render_node_snapshots(snaps: &[crate::stats::NodeStatsSnapshot]) -> Vec<serde
             })
         })
         .collect()
+}
+
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
