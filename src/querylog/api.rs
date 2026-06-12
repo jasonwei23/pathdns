@@ -698,6 +698,15 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_defers_archive_queries_until_range_commit() {
+        assert!(DASHBOARD_HTML.contains("oninput=\"previewArchiveRange('start')\""));
+        assert!(DASHBOARD_HTML.contains("onchange=\"commitArchiveRange()\""));
+        assert!(DASHBOARD_HTML.contains("function selectArchiveFile(name)"));
+        assert!(DASHBOARD_HTML.contains("setArchiveRange("));
+        assert!(DASHBOARD_HTML.contains("function resetArchiveRange()"));
+    }
+
+    #[test]
     fn safe_filename_rejects_path_traversal() {
         assert!(!safe_history_filename("../etc/passwd"));
         assert!(!safe_history_filename("other-1234.msgpack.gz")); // wrong prefix
