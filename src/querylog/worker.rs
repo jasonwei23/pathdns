@@ -445,6 +445,19 @@ pub fn list_history_files(dir: &Path) -> Vec<(String, u64)> {
         })
         .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // During the compression window both querylog-T.msgpack and querylog-T.msgpack.gz
+    // can exist simultaneously.  Keep only the .gz to avoid exposing a partially-written
+    // compressed file or showing the same segment twice.
+    let gz_stems: std::collections::HashSet<String> = files
+        .iter()
+        .filter(|(n, _)| n.ends_with(".msgpack.gz"))
+        .map(|(n, _)| n.trim_end_matches(".msgpack.gz").to_owned())
+        .collect();
+    files.retain(|(n, _)| {
+        !n.ends_with(".msgpack") || !gz_stems.contains(n.trim_end_matches(".msgpack"))
+    });
+
     files
 }
 
@@ -476,10 +489,26 @@ fn decode_msgpack_stream<R: std::io::Read>(
     limit: usize,
     filter: Option<&str>,
 ) -> Vec<DecodedEvent> {
+    // When a filter is active, the caller may want up to `limit` matches from a
+    // file that has far more total records.  Cap total records scanned so a rare
+    // filter string on a large compressed file does not block the thread pool
+    // for seconds.  The cap is generous (100× the return limit) so typical
+    // queries are not truncated prematurely.
+    let max_scan = if filter.is_some_and(|f| !f.is_empty()) {
+        limit.saturating_mul(100).max(10_000)
+    } else {
+        usize::MAX
+    };
+
     let mut de = rmp_serde::Deserializer::new(reader);
     let mut events = Vec::new();
+    let mut scanned = 0usize;
     loop {
+        if scanned >= max_scan {
+            break;
+        }
         let result: Result<DecodedEvent, _> = serde::de::Deserialize::deserialize(&mut de);
+        scanned += 1;
         match result {
             Ok(ev) => {
                 if filter.is_none_or(|f| f.is_empty() || ev.qname.contains(f)) {

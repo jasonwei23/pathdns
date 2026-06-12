@@ -408,6 +408,14 @@ where
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
     }
 
+    // Minimum interval between successive reloads.  inotify emits multiple raw
+    // events (MODIFY, CLOSE_WRITE, MOVED_TO …) for a single file save; without a
+    // cooldown each save triggers 2-3 full GeoSite parses.
+    const DEBOUNCE: Duration = Duration::from_millis(500);
+    let mut last_reload = std::time::Instant::now()
+        .checked_sub(DEBOUNCE)
+        .unwrap_or(std::time::Instant::now());
+
     for res in rx {
         match res {
             Ok(event) => {
@@ -420,11 +428,17 @@ where
                 }) {
                     continue;
                 }
+                if last_reload.elapsed() < DEBOUNCE {
+                    continue;
+                }
 
                 let mut retries = RELOAD_RETRIES;
                 loop {
                     match reload() {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            last_reload = std::time::Instant::now();
+                            break;
+                        }
                         Err(err) => {
                             retries -= 1;
                             if retries == 0 {
