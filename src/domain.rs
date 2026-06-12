@@ -116,7 +116,6 @@ impl SuffixTable {
 // String helpers.
 
 /// Iterate the non-empty, whitespace-trimmed tokens in a comma-separated string.
-#[allow(dead_code)]
 pub(crate) fn split_csv(s: &str) -> impl Iterator<Item = &str> {
     s.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
