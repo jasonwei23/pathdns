@@ -251,7 +251,7 @@ async fn dispatch(
 
         // List available historical segments and their index metadata.
         ("GET", "/api/querylog/files") => {
-            let dir = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone());
+            let dir = state.hot.load().cfg.querylog.file.as_ref().map(|f| f.dir.clone());
             match dir {
                 None => {
                     let body = b"[]".to_vec();
@@ -288,7 +288,7 @@ async fn dispatch(
                 parse_query_param(&req.query, "rcode").and_then(|v| v.parse::<u8>().ok());
             let source = parse_query_param(&req.query, "source");
 
-            let Some(dir) = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone()) else {
+            let Some(dir) = state.hot.load().cfg.querylog.file.as_ref().map(|f| f.dir.clone()) else {
                 return (
                     "404 Not Found",
                     br#"{"error":"file logging disabled"}"#.to_vec(),
@@ -578,7 +578,8 @@ fn render_upstreams(state: &AppState) -> Vec<u8> {
     let mut out = Vec::with_capacity(1024);
     out.push(b'[');
     let mut first_group = true;
-    for group in &state.groups {
+    let hot = state.hot.load();
+    for group in &hot.groups {
         let Some(pool) = &group.upstream else {
             continue;
         };
@@ -606,7 +607,8 @@ fn render_groups(state: &AppState) -> Vec<u8> {
         .map(|db| db.tag_counts().collect())
         .unwrap_or_default();
 
-    let groups: Vec<_> = state
+    let hot = state.hot.load();
+    let groups: Vec<_> = hot
         .groups
         .iter()
         .map(|g| {

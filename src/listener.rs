@@ -36,8 +36,10 @@ const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 /// interface via `SO_BINDTODEVICE` so the kernel discards packets from other
 /// interfaces before they reach userspace.
 pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
-    let buf_size = state.cfg.udp_buf_size;
-    let n = state.cfg.worker_threads.max(1);
+    let (buf_size, n) = {
+        let hot = state.hot.load();
+        (hot.cfg.udp_buf_size, hot.cfg.worker_threads.max(1))
+    };
     let mut sockets = Vec::with_capacity(n);
     for _ in 0..n {
         sockets.push(Arc::new(
@@ -76,7 +78,7 @@ pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
 /// `iface` — when `Some`, each listener socket is additionally bound to that
 /// network interface via `SO_BINDTODEVICE`.
 pub async fn serve_tcp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
-    let n = state.cfg.worker_threads.max(1);
+    let n = state.hot.load().cfg.worker_threads.max(1);
     let mut listeners = Vec::with_capacity(n);
     for _ in 0..n {
         listeners.push(Arc::new(
@@ -216,10 +218,14 @@ async fn handle_tcp_conn(
     // Held for the lifetime of this connection; drop releases the slot.
     _conn_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
-    let idle_timeout = (state.cfg.tcp_idle_timeout_ms > 0)
-        .then(|| Duration::from_millis(state.cfg.tcp_idle_timeout_ms));
-    let read_timeout = (state.cfg.tcp_read_timeout_ms > 0)
-        .then(|| Duration::from_millis(state.cfg.tcp_read_timeout_ms));
+    let (idle_timeout, read_timeout) = {
+        let hot = state.hot.load();
+        let idle = (hot.cfg.tcp_idle_timeout_ms > 0)
+            .then(|| Duration::from_millis(hot.cfg.tcp_idle_timeout_ms));
+        let read = (hot.cfg.tcp_read_timeout_ms > 0)
+            .then(|| Duration::from_millis(hot.cfg.tcp_read_timeout_ms));
+        (idle, read)
+    };
 
     loop {
         // Wait for the 2-byte length prefix, applying the idle timeout.

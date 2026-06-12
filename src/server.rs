@@ -8,13 +8,12 @@ use crate::geosite::GeoSiteDb;
 use crate::ipset::IpSetManager;
 #[cfg(unix)]
 use crate::listener;
-use crate::router::RouteTarget;
 use crate::route_table::RouteIndex;
 use crate::singleflight;
 use crate::upstream::UpstreamPool;
 use crate::verdict_cache::VerdictCache;
 use anyhow::{anyhow, Context, Result};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -29,7 +28,7 @@ use tokio::sync::Semaphore;
 const RELOAD_RETRIES: usize = 5;
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// How the fallback target was resolved at startup (group indices into `AppState::groups`).
+/// How the fallback target was resolved at startup (group indices into `HotState::groups`).
 pub enum ResolvedFallback {
     /// Route unmatched queries to a fixed group.
     Group(usize),
@@ -41,25 +40,36 @@ pub enum ResolvedFallback {
     Null,
 }
 
-pub struct AppState {
+/// Hot-reloadable state: rebuilt from the config file on every reload.
+/// Wrapped in `ArcSwap` so query-handling tasks can load a snapshot cheaply
+/// without blocking writers (config reloads).
+pub struct HotState {
     pub cfg: Config,
+    pub groups: Vec<CustomGroup>,
+    pub needs_geosite: bool,
+    pub fallback: ResolvedFallback,
+    pub stale_client_timeout_ms: u64,
+    pub routing_index: RouteIndex,
+}
+
+pub struct AppState {
+    /// Hot-reloadable routing + config state.  Load with `state.hot.load()` (sync/fast)
+    /// or `state.hot.load_full()` (returns Arc, safe to hold across .await).
+    pub hot: ArcSwap<HotState>,
+    /// Path to the config file, used to watch for changes.
+    pub config_path: Option<PathBuf>,
     pub limit: Arc<Semaphore>,
     /// Connection-level semaphore for TCP. `None` = unlimited.
     pub tcp_conn_limit: Option<Arc<Semaphore>>,
     pub cache: DnsCache,
-    pub groups: Vec<CustomGroup>,
     pub(crate) remote_inflight: singleflight::InflightTable,
     pub refresh_gate: RefreshGate,
     pub refresh_tx: tokio::sync::mpsc::Sender<crate::cache::CacheRefresh>,
     pub ipset: Option<Arc<IpSetManager>>,
     pub verdict_cache: VerdictCache,
-    pub needs_geosite: bool,
     pub geosite: ArcSwapOption<GeoSiteDb>,
-    pub routing_index: RouteIndex,
-    pub fallback: ResolvedFallback,
-    pub stale_client_timeout_ms: u64,
     pub querylog: crate::querylog::QueryLogHandle,
-    /// Incremented on every GeoSite hot-reload. Used to prevent stale upstream responses
+    /// Incremented on every hot-reload. Used to prevent stale upstream responses
     /// (resolved under the old routing) from being inserted into the freshly-cleared cache.
     pub routing_generation: AtomicU64,
 }
@@ -84,14 +94,17 @@ pub struct CustomGroup {
 }
 
 impl CustomGroup {
-    pub fn target(&self) -> Option<RouteTarget<'_>> {
-        self.upstream.is_some().then_some(RouteTarget::Group(self))
+    pub fn target(&self) -> Option<crate::router::RouteTarget<'_>> {
+        self.upstream
+            .is_some()
+            .then_some(crate::router::RouteTarget::Group(self))
     }
 }
 
 impl AppState {
     pub async fn new(
         cfg: Config,
+        config_path: Option<PathBuf>,
         querylog: crate::querylog::QueryLogHandle,
     ) -> Result<(
         Self,
@@ -104,36 +117,7 @@ impl AppState {
         let cache = DnsCache::new(&cfg.cache_config());
 
         // Build custom group pools.
-        let mut groups = Vec::new();
-        for spec in &cfg.groups {
-            let upstream = if spec.fixed_rcode.is_some() {
-                None
-            } else {
-                Some(
-                    UpstreamPool::new(
-                        &format!("group-{}", spec.name),
-                        &spec.upstream,
-                        &upstream_cfg,
-                        Some(querylog.counters.clone()),
-                    )
-                    .await?,
-                )
-            };
-            let strip_ecs = spec
-                .upstream
-                .iter()
-                .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
-            groups.push(CustomGroup {
-                name: spec.name.clone(),
-                upstream,
-                cache_policy: cache.resolve_policy(spec.cache_policy.as_ref()),
-                filter_qtype: spec.filter_qtype.iter().copied().collect(),
-                geosite_include: spec.geosite_include.clone(),
-                geosite_exclude: spec.geosite_exclude.clone(),
-                strip_ecs,
-                fixed_rcode: spec.fixed_rcode,
-            });
-        }
+        let groups = build_groups(&cfg, &upstream_cfg, &querylog, &cache).await?;
 
         // Resolve fallback group indices.
         let fallback = resolve_fallback(&cfg, &groups)?;
@@ -183,23 +167,29 @@ impl AppState {
             .then(|| Arc::new(Semaphore::new(cfg.tcp_max_connections)));
         let stale_client_timeout_ms = cfg.cache_stale_client_timeout;
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel::<crate::cache::CacheRefresh>(64);
+
+        let hot = Arc::new(HotState {
+            cfg,
+            groups,
+            needs_geosite,
+            fallback,
+            stale_client_timeout_ms,
+            routing_index,
+        });
+
         Ok((
             Self {
-                cfg,
+                hot: ArcSwap::new(hot),
+                config_path,
                 limit: Arc::new(Semaphore::new(max)),
                 tcp_conn_limit,
                 cache,
-                groups,
                 remote_inflight: singleflight::InflightTable::new(),
                 refresh_gate: RefreshGate::new(),
                 refresh_tx,
                 ipset,
                 verdict_cache,
-                needs_geosite,
                 geosite: ArcSwapOption::new(geosite),
-                routing_index,
-                fallback,
-                stale_client_timeout_ms,
                 querylog,
                 routing_generation: AtomicU64::new(0),
             },
@@ -210,6 +200,46 @@ impl AppState {
     pub fn geosite_snapshot(&self) -> Option<Arc<GeoSiteDb>> {
         self.geosite.load_full()
     }
+}
+
+/// Build the list of `CustomGroup` from a parsed config.
+async fn build_groups(
+    cfg: &Config,
+    upstream_cfg: &crate::config::UpstreamConfig,
+    querylog: &crate::querylog::QueryLogHandle,
+    cache: &DnsCache,
+) -> Result<Vec<CustomGroup>> {
+    let mut groups = Vec::new();
+    for spec in &cfg.groups {
+        let upstream = if spec.fixed_rcode.is_some() {
+            None
+        } else {
+            Some(
+                UpstreamPool::new(
+                    &format!("group-{}", spec.name),
+                    &spec.upstream,
+                    upstream_cfg,
+                    Some(querylog.counters.clone()),
+                )
+                .await?,
+            )
+        };
+        let strip_ecs = spec
+            .upstream
+            .iter()
+            .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
+        groups.push(CustomGroup {
+            name: spec.name.clone(),
+            upstream,
+            cache_policy: cache.resolve_policy(spec.cache_policy.as_ref()),
+            filter_qtype: spec.filter_qtype.iter().copied().collect(),
+            geosite_include: spec.geosite_include.clone(),
+            geosite_exclude: spec.geosite_exclude.clone(),
+            strip_ecs,
+            fixed_rcode: spec.fixed_rcode,
+        });
+    }
+    Ok(groups)
 }
 
 /// Resolve fallback group names to indices in `groups`.
@@ -245,7 +275,7 @@ fn resolve_fallback(cfg: &Config, groups: &[CustomGroup]) -> Result<ResolvedFall
     })
 }
 
-fn needed_geosite_tags(cfg: &Config) -> HashSet<String> {
+pub(crate) fn needed_geosite_tags(cfg: &Config) -> HashSet<String> {
     cfg.groups
         .iter()
         .flat_map(|spec| spec.geosite_include.iter().chain(&spec.geosite_exclude))
@@ -281,9 +311,7 @@ fn listeners_summary(cfg: &Config) -> String {
     let iface_suffix = match &cfg.interface {
         InterfaceFilter::All => String::new(),
         InterfaceFilter::Only(ifaces) => format!(" (iface={})", ifaces.join(",")),
-        InterfaceFilter::Except(excluded) => {
-            format!(" (iface=!{})", excluded.join(",!"))
-        }
+        InterfaceFilter::Except(excluded) => format!(" (iface=!{})", excluded.join(",!")),
     };
     cfg.bind
         .iter()
@@ -312,17 +340,30 @@ enum ReloadWatcher {
         paths: Vec<PathBuf>,
         tags: HashSet<String>,
     },
+    Config {
+        path: PathBuf,
+        handle: tokio::runtime::Handle,
+    },
 }
 
 impl ReloadWatcher {
     fn for_state(state: &AppState) -> Vec<Self> {
+        let hot = state.hot.load();
         let mut watchers = Vec::new();
-        let tags = needed_geosite_tags(&state.cfg);
+        let tags = needed_geosite_tags(&hot.cfg);
         if !tags.is_empty() {
             watchers.push(Self::Geosite {
-                paths: state.cfg.geosite_files.clone(),
+                paths: hot.cfg.geosite_files.clone(),
                 tags,
             });
+        }
+        if let Some(path) = &state.config_path {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                watchers.push(Self::Config {
+                    path: path.clone(),
+                    handle,
+                });
+            }
         }
         watchers
     }
@@ -330,18 +371,23 @@ impl ReloadWatcher {
     fn name(&self) -> &'static str {
         match self {
             Self::Geosite { .. } => "geosite",
+            Self::Config { .. } => "config",
         }
     }
 
     fn paths(&self) -> Vec<PathBuf> {
         match self {
             Self::Geosite { paths, .. } => paths.clone(),
+            Self::Config { path, .. } => vec![path.clone()],
         }
     }
 
     fn reload(&self, state: &AppState) -> Result<()> {
         match self {
             Self::Geosite { tags, .. } => reload_geosite(state, tags),
+            Self::Config { handle, .. } => {
+                handle.block_on(reload_config(state))
+            }
         }
     }
 }
@@ -380,18 +426,53 @@ fn spawn_reload_watcher(state: Arc<AppState>, watcher: ReloadWatcher) {
 }
 
 fn reload_geosite(state: &AppState, needed_tags: &HashSet<String>) -> Result<()> {
-    let db = load_geosite(&state.cfg, needed_tags)?;
+    let (geosite_files_len, db) = {
+        let hot = state.hot.load();
+        let db = load_geosite(&hot.cfg, needed_tags)?;
+        (hot.cfg.geosite_files.len(), db)
+    };
     state.geosite.store(db);
-    state.routing_index.invalidate();
+    state.hot.load().routing_index.invalidate();
     // Increment generation before clearing the cache so in-flight queries that recorded
     // the old generation will skip the cache write and not re-pollute the fresh cache.
     state.routing_generation.fetch_add(1, Ordering::Release);
     state.cache.invalidate_all();
     crate::startup!(
         "reload event=geosite status=ok files={} tags={}",
-        state.cfg.geosite_files.len(),
+        geosite_files_len,
         needed_tags.len()
     );
+    Ok(())
+}
+
+async fn reload_config(state: &AppState) -> Result<()> {
+    let config_path = match &state.config_path {
+        Some(p) => p.clone(),
+        None => return Ok(()),
+    };
+    let json = crate::config_file::load_json_config(&config_path)?;
+    let cfg = Config::from_json(json)?;
+    let upstream_cfg = cfg.upstream_config();
+    let groups = build_groups(&cfg, &upstream_cfg, &state.querylog, &state.cache).await?;
+    let fallback = resolve_fallback(&cfg, &groups)?;
+    let needed_tags = needed_geosite_tags(&cfg);
+    let needs_geosite = !needed_tags.is_empty();
+    let geosite = load_geosite(&cfg, &needed_tags)?;
+    let stale_client_timeout_ms = cfg.cache_stale_client_timeout;
+    let routing_index = RouteIndex::build(&groups);
+    let hot = Arc::new(HotState {
+        cfg,
+        groups,
+        needs_geosite,
+        fallback,
+        stale_client_timeout_ms,
+        routing_index,
+    });
+    state.hot.store(hot);
+    state.geosite.store(geosite);
+    state.routing_generation.fetch_add(1, Ordering::Release);
+    state.cache.invalidate_all();
+    crate::startup!("reload event=config status=ok");
     Ok(())
 }
 
@@ -505,36 +586,37 @@ impl RefreshGate {
 
 #[cfg(unix)]
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
-    if !state.cfg.bind.iter().any(|ep| ep.udp || ep.tcp) {
-        return Err(anyhow!("at least one bind protocol is required"));
-    }
-
-    // Resolve the interface filter to a concrete list of Option<String>:
-    //   None      → bind without SO_BINDTODEVICE (all interfaces)
-    //   Some(name)→ bind with SO_BINDTODEVICE=name
-    let ifaces: Vec<Option<String>> = match &state.cfg.interface {
-        InterfaceFilter::All => vec![None],
-        InterfaceFilter::Only(names) => names.iter().map(|n| Some(n.clone())).collect(),
-        InterfaceFilter::Except(excluded) => {
-            let all = listener::list_interface_names();
-            let filtered: Vec<Option<String>> = all
-                .into_iter()
-                .filter(|n| !excluded.contains(n))
-                .map(Some)
-                .collect();
-            if filtered.is_empty() {
-                return Err(anyhow!(
-                    "interface filter excludes all available network interfaces; \
-                     no sockets will be created"
-                ));
-            }
-            filtered
+    let (bind, ifaces) = {
+        let hot = state.hot.load();
+        if !hot.cfg.bind.iter().any(|ep| ep.udp || ep.tcp) {
+            return Err(anyhow!("at least one bind protocol is required"));
         }
+        let ifaces: Vec<Option<String>> = match &hot.cfg.interface {
+            InterfaceFilter::All => vec![None],
+            InterfaceFilter::Only(names) => names.iter().map(|n| Some(n.clone())).collect(),
+            InterfaceFilter::Except(excluded) => {
+                let all = listener::list_interface_names();
+                let filtered: Vec<Option<String>> = all
+                    .into_iter()
+                    .filter(|n| !excluded.contains(n))
+                    .map(Some)
+                    .collect();
+                if filtered.is_empty() {
+                    return Err(anyhow!(
+                        "interface filter excludes all available network interfaces; \
+                         no sockets will be created"
+                    ));
+                }
+                filtered
+            }
+        };
+        crate::log_info!("listening dns=[{}]", listeners_summary(&hot.cfg));
+        (hot.cfg.bind.clone(), ifaces)
     };
 
-    crate::log_info!("listening dns=[{}]", listeners_summary(&state.cfg));
     let mut set = tokio::task::JoinSet::new();
-    for &ep in &state.cfg.bind {
+    for ep in &bind {
+        let ep = *ep;
         for iface in &ifaces {
             if ep.udp {
                 let s = state.clone();

@@ -8,7 +8,7 @@ use crate::cache::{cache_key, cache_key_strip_ecs, CacheKey, CacheRefresh};
 use crate::dns;
 use crate::ipset::TestVerdict;
 use crate::router::RouteTarget;
-use crate::server::{AppState, CustomGroup};
+use crate::server::{AppState, CustomGroup, HotState};
 use crate::upstream::ClientProto;
 use crate::{router, singleflight};
 use anyhow::{anyhow, Result};
@@ -94,15 +94,14 @@ pub(crate) enum FastPathOutcome {
 /// Decode a `group_id` stored in the cache into a display name.
 /// - `u16::MAX` (65535) → no group (legacy sentinel, treated as None)
 /// - `GROUP_ID_NONE_FALLBACK` (65534) → "none" (NoneIpSet route)
-/// - anything else → look up in `state.groups`
-fn group_id_to_name(group_id: u16, state: &AppState) -> Option<Arc<str>> {
+/// - anything else → look up in `hot.groups`
+fn group_id_to_name(group_id: u16, hot: &HotState) -> Option<Arc<str>> {
     if group_id == u16::MAX {
         None
     } else if group_id == GROUP_ID_NONE_FALLBACK {
         Some(Arc::from("none"))
     } else {
-        state
-            .groups
+        hot.groups
             .get(group_id as usize)
             .map(|g| Arc::from(g.name.as_str()))
     }
@@ -168,7 +167,7 @@ pub(crate) fn try_fast_path(
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
-        if hit.is_stale && state.stale_client_timeout_ms > 0 {
+        if hit.is_stale && state.hot.load().stale_client_timeout_ms > 0 {
             return FastPathOutcome::Miss { info: fast_info };
         }
         let ql = &state.querylog;
@@ -188,7 +187,7 @@ pub(crate) fn try_fast_path(
                 elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
                 response_bytes: hit.packet.len() as u32,
                 source: if hit.is_stale { "stale" } else { "cache" },
-                group: group_id_to_name(hit.group_id, state),
+                group: group_id_to_name(hit.group_id, &state.hot.load()),
                 answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
                     dns::answer_ips(&hit.packet, fast_info.question_end)
                 } else {
@@ -253,7 +252,7 @@ pub(crate) fn try_fast_path_into(
     ) {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
-        if meta.is_stale && state.stale_client_timeout_ms > 0 {
+        if meta.is_stale && state.hot.load().stale_client_timeout_ms > 0 {
             return FastPathOutcome::Miss { info: fast_info };
         }
         let ql = &state.querylog;
@@ -273,7 +272,7 @@ pub(crate) fn try_fast_path_into(
                 elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
                 response_bytes: send_buf.len() as u32,
                 source: if meta.is_stale { "stale" } else { "cache" },
-                group: group_id_to_name(meta.group_id, state),
+                group: group_id_to_name(meta.group_id, &state.hot.load()),
                 answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
                     dns::answer_ips(send_buf, fast_info.question_end)
                 } else {
@@ -346,13 +345,13 @@ async fn handle_packet_slow_with_info(
             Ok(permit) => permit,
             Err(_) => {
                 // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
-                let acquired = if state.cfg.inflight_queue_ms > 0 {
+                let acquired = if state.hot.load().cfg.inflight_queue_ms > 0 {
                     state
                         .querylog
                         .counters
                         .inflight_queued
                         .fetch_add(1, Ordering::Relaxed);
-                    let wait = Duration::from_millis(state.cfg.inflight_queue_ms);
+                    let wait = Duration::from_millis(state.hot.load().cfg.inflight_queue_ms);
                     tokio::time::timeout(wait, state.limit.clone().acquire_owned())
                         .await
                         .ok()
@@ -403,15 +402,15 @@ async fn handle_packet_slow_with_info(
 }
 
 async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes> {
-    let geosite = if state.needs_geosite {
+    let hot = state.hot.load_full();
+    let geosite = if hot.needs_geosite {
         state.geosite_snapshot()
     } else {
         None
     };
     if let Some(group) =
-        state
-            .routing_index
-            .route(&state.groups, &ctx.info.qname, geosite.as_deref())
+        hot.routing_index
+            .route(&hot.groups, &ctx.info.qname, geosite.as_deref())
     {
         if let Some(target) = group.target() {
             return exchange_with_dedupe(ctx, state, target).await;
@@ -435,7 +434,7 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
         }
     }
 
-    let Some(target) = router::classify_target(state, ctx.info.qtype) else {
+    let Some(target) = router::classify_target(&hot, ctx.info.qtype) else {
         state
             .querylog
             .counters
@@ -580,7 +579,7 @@ async fn exchange_with_dedupe(
 
     if let Some(mut rx) = waiter {
         // Bound the follower wait so a panicking leader never leaves clients hung forever.
-        let deadline = state.cfg.timeout + Duration::from_secs(1);
+        let deadline = state.hot.load().cfg.timeout + Duration::from_secs(1);
         let servfail = Bytes::from(
             dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
         );
@@ -669,7 +668,8 @@ async fn exchange_with_dedupe(
 
     // stale-client-timeout: if enabled, look up the stale cache entry before going upstream.
     // We will race the upstream against the timeout; if it fires first, return stale immediately.
-    let stale_fallback: Option<Bytes> = if state.stale_client_timeout_ms > 0 && !skip_cache {
+    let stale_timeout_ms = state.hot.load().stale_client_timeout_ms;
+    let stale_fallback: Option<Bytes> = if stale_timeout_ms > 0 && !skip_cache {
         state
             .cache
             .get_stale(&query_for_cache, ctx.info.question_end, ctx.info.id)
@@ -682,7 +682,7 @@ async fn exchange_with_dedupe(
     let group_name = target.group_name();
 
     let result = if let Some(stale_pkt) = stale_fallback {
-        let timeout_ms = state.stale_client_timeout_ms;
+        let timeout_ms = stale_timeout_ms;
         let upstream_fut = do_upstream_exchange(&ctx, state, &target);
         match tokio::time::timeout(Duration::from_millis(timeout_ms), upstream_fut).await {
             Ok(upstream_result) => upstream_result,
@@ -759,6 +759,8 @@ async fn exchange_with_dedupe(
                 let (cache_policy, group_id) = match &target {
                     RouteTarget::Group(g) => {
                         let gid = state
+                            .hot
+                            .load()
                             .groups
                             .iter()
                             .position(|sg| std::ptr::eq(sg, *g))
@@ -1074,7 +1076,7 @@ async fn resolve_none_group_with_ipset(
             let verdict = tokio::task::spawn_blocking(move || ipset.test_response(&ips))
                 .await
                 .map_err(|e| anyhow!("ipset test task failed: {e}"))?;
-            let noip_as_primary = state.cfg.fallback.noip_as_primary_ip;
+            let noip_as_primary = state.hot.load().cfg.fallback.noip_as_primary_ip;
             match verdict {
                 TestVerdict::PrimaryIp => {
                     state.verdict_cache.add(&info.qname, true);
@@ -1180,7 +1182,9 @@ async fn do_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) {
         qtype: refresh.qtype,
         question_end: refresh.question_end,
     };
-    let Some(target) = router::choose_refresh_target(state, &refresh.qname, refresh.qtype) else {
+    let hot = state.hot.load_full();
+    let geosite = if hot.needs_geosite { state.geosite_snapshot() } else { None };
+    let Some(target) = router::choose_refresh_target(&hot, geosite, &refresh.qname, refresh.qtype) else {
         state.refresh_gate.end(&refresh.key);
         return;
     };

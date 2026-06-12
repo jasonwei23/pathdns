@@ -36,7 +36,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cfg = Config::parse_args()?;
+    let (cfg, config_path) = Config::parse_args()?;
     let worker_threads = cfg.worker_threads.max(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -45,10 +45,10 @@ fn run() -> Result<()> {
         .enable_time()
         .build()?;
 
-    rt.block_on(async_main(cfg))
+    rt.block_on(async_main(cfg, config_path))
 }
 
-async fn async_main(cfg: Config) -> Result<()> {
+async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> {
     // Build querylog handle before AppState so it can be threaded in.
     let ql_cfg = crate::querylog::QueryLogConfig {
         enabled: cfg.querylog.enabled,
@@ -71,15 +71,14 @@ async fn async_main(cfg: Config) -> Result<()> {
     };
     let (ql_handle, ql_worker, qps_ring, stats_ring, ql_shutdown) = crate::querylog::build(ql_cfg);
 
-    let (app_state, refresh_rx) = server::AppState::new(cfg, ql_handle.clone()).await?;
+    let (app_state, refresh_rx) = server::AppState::new(cfg, Some(config_path), ql_handle.clone()).await?;
     let state = Arc::new(app_state);
-    if state
-        .cfg
-        .querylog
-        .bind
-        .iter()
-        .any(|addr| !addr.ip().is_loopback())
-        && state.cfg.querylog.token.is_none()
+    let (querylog_bind, querylog_token) = {
+        let hot = state.hot.load();
+        (hot.cfg.querylog.bind.clone(), hot.cfg.querylog.token.clone())
+    };
+    if querylog_bind.iter().any(|addr| !addr.ip().is_loopback())
+        && querylog_token.is_none()
     {
         eprintln!("warn: web dashboard is exposed without authentication");
     }
@@ -99,13 +98,13 @@ async fn async_main(cfg: Config) -> Result<()> {
             ws.shutdown,
         )));
 
-        for &addr in &state.cfg.querylog.bind {
+        for &addr in &querylog_bind {
             let api_listener = crate::listener::bind_tcp_listener(addr)
                 .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
             log_info!("listening web=http://{addr}");
             tokio::spawn(crate::querylog::api::serve(
                 api_listener,
-                state.cfg.querylog.token.clone(),
+                querylog_token.clone(),
                 api_ring.clone(),
                 qps_ring.clone(),
                 stats_ring.clone(),
@@ -113,16 +112,16 @@ async fn async_main(cfg: Config) -> Result<()> {
                 state.clone(),
             ));
         }
-    } else if !state.cfg.querylog.bind.is_empty() {
+    } else if !querylog_bind.is_empty() {
         // No collection (memory=0) but still serve API for stats.
         let api_ring = std::sync::Arc::new(crate::querylog::ring::EventRing::new(0));
-        for &addr in &state.cfg.querylog.bind {
+        for &addr in &querylog_bind {
             let api_listener = crate::listener::bind_tcp_listener(addr)
                 .map_err(|e| anyhow::anyhow!("web: failed to bind {addr}: {e}"))?;
             log_info!("listening web=http://{addr}");
             tokio::spawn(crate::querylog::api::serve(
                 api_listener,
-                state.cfg.querylog.token.clone(),
+                querylog_token.clone(),
                 api_ring.clone(),
                 qps_ring.clone(),
                 stats_ring.clone(),
@@ -132,7 +131,7 @@ async fn async_main(cfg: Config) -> Result<()> {
         }
     }
 
-    let qps_task = (!state.cfg.querylog.bind.is_empty()).then(|| {
+    let qps_task = (!querylog_bind.is_empty()).then(|| {
         tokio::spawn(crate::querylog::worker::run_qps_sampler(
             qps_ring.clone(),
             stats_ring.clone(),
@@ -141,14 +140,16 @@ async fn async_main(cfg: Config) -> Result<()> {
         ))
     });
 
-    if state.cfg.cache_persist_interval > 0 {
-        if let Some(path) = state.cfg.cache_persist_path.clone() {
+    let cache_persist_interval = state.hot.load().cfg.cache_persist_interval;
+    let cache_persist_path = state.hot.load().cfg.cache_persist_path.clone();
+    if cache_persist_interval > 0 {
+        if let Some(path) = cache_persist_path {
             let s = state.clone();
-            let fp = config::cache_fingerprint(&s.cfg);
+            let fp = config::cache_fingerprint(&s.hot.load().cfg);
             let vpath = verdict_cache::persist_path_for(&path);
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                    s.cfg.cache_persist_interval,
+                    cache_persist_interval,
                 ));
                 ticker.tick().await; // skip immediate first tick
                 loop {
@@ -180,14 +181,17 @@ async fn async_main(cfg: Config) -> Result<()> {
     }
 
     // Load verdict cache from disk on startup if DNS cache persistence is configured.
-    if let Some(path) = &state.cfg.cache_persist_path {
-        if state.verdict_cache.enabled() {
-            let fp = config::cache_fingerprint(&state.cfg);
-            let vpath = verdict_cache::persist_path_for(path);
-            if vpath.exists() {
-                match state.verdict_cache.load_from_file(&vpath, fp) {
-                    Ok(n) => startup!("verdict_cache persist=loaded entries={n}"),
-                    Err(e) => startup!("verdict_cache persist=load_failed error={e:#}"),
+    {
+        let hot = state.hot.load();
+        if let Some(path) = &hot.cfg.cache_persist_path {
+            if state.verdict_cache.enabled() {
+                let fp = config::cache_fingerprint(&hot.cfg);
+                let vpath = verdict_cache::persist_path_for(path);
+                if vpath.exists() {
+                    match state.verdict_cache.load_from_file(&vpath, fp) {
+                        Ok(n) => startup!("verdict_cache persist=loaded entries={n}"),
+                        Err(e) => startup!("verdict_cache persist=load_failed error={e:#}"),
+                    }
                 }
             }
         }
@@ -221,17 +225,20 @@ async fn async_main(cfg: Config) -> Result<()> {
         }
     }
 
-    if let Some(path) = &state.cfg.cache_persist_path {
-        let fp = config::cache_fingerprint(&state.cfg);
-        match state.cache.save_to_file(path, fp) {
-            Ok(n) => startup!("cache persist=saved entries={n}"),
-            Err(e) => startup!("cache persist=save_failed error={e:#}"),
-        }
-        if state.verdict_cache.enabled() {
-            let vpath = verdict_cache::persist_path_for(path);
-            match state.verdict_cache.save_to_file(&vpath, fp) {
-                Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
-                Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
+    {
+        let hot = state.hot.load();
+        if let Some(path) = &hot.cfg.cache_persist_path {
+            let fp = config::cache_fingerprint(&hot.cfg);
+            match state.cache.save_to_file(path, fp) {
+                Ok(n) => startup!("cache persist=saved entries={n}"),
+                Err(e) => startup!("cache persist=save_failed error={e:#}"),
+            }
+            if state.verdict_cache.enabled() {
+                let vpath = verdict_cache::persist_path_for(path);
+                match state.verdict_cache.save_to_file(&vpath, fp) {
+                    Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
+                    Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
+                }
             }
         }
     }

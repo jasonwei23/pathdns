@@ -3,8 +3,10 @@
 //! Groups are checked in definition order via `route_table.route()`.
 //! When no group matches, the configured `fallback` is applied.
 
-use crate::server::{AppState, CustomGroup, ResolvedFallback};
+use crate::geosite::GeoSiteDb;
+use crate::server::{CustomGroup, HotState, ResolvedFallback};
 use crate::upstream::UpstreamPool;
+use std::sync::Arc;
 
 /// The upstream target selected for a query.
 #[derive(Clone, Copy)]
@@ -59,27 +61,27 @@ impl<'a> RouteTarget<'a> {
 
 /// Determine the `RouteTarget` for a (qname, qtype) using the fallback config.
 /// Returns `None` for `FallbackTarget::Null` (caller returns empty response).
-pub fn classify_target<'a>(state: &'a AppState, qtype: u16) -> Option<RouteTarget<'a>> {
-    match &state.fallback {
+pub fn classify_target<'a>(hot: &'a HotState, qtype: u16) -> Option<RouteTarget<'a>> {
+    match &hot.fallback {
         ResolvedFallback::Null => None,
         ResolvedFallback::Group(idx) => {
-            let group = &state.groups[*idx];
+            let group = &hot.groups[*idx];
             group.target()
         }
         ResolvedFallback::Race { primary, secondary } => Some(RouteTarget::Race {
-            primary: &state.groups[*primary],
-            secondary: &state.groups[*secondary],
+            primary: &hot.groups[*primary],
+            secondary: &hot.groups[*secondary],
         }),
         ResolvedFallback::NoneIpSet { primary, secondary } => {
             if matches!(qtype, 1 | 28) {
                 Some(RouteTarget::NoneIpSet {
-                    primary: &state.groups[*primary],
-                    secondary: &state.groups[*secondary],
+                    primary: &hot.groups[*primary],
+                    secondary: &hot.groups[*secondary],
                 })
             } else {
                 Some(RouteTarget::Race {
-                    primary: &state.groups[*primary],
-                    secondary: &state.groups[*secondary],
+                    primary: &hot.groups[*primary],
+                    secondary: &hot.groups[*secondary],
                 })
             }
         }
@@ -88,20 +90,16 @@ pub fn classify_target<'a>(state: &'a AppState, qtype: u16) -> Option<RouteTarge
 
 /// Determine the `RouteTarget` for a background cache-refresh task.
 pub fn choose_refresh_target<'a>(
-    state: &'a AppState,
+    hot: &'a HotState,
+    geosite: Option<Arc<GeoSiteDb>>,
     qname: &str,
     qtype: u16,
 ) -> Option<RouteTarget<'a>> {
-    let geosite = if state.needs_geosite {
-        state.geosite_snapshot()
-    } else {
-        None
-    };
-    if let Some(group) = state
+    if let Some(group) = hot
         .routing_index
-        .route(&state.groups, qname, geosite.as_deref())
+        .route(&hot.groups, qname, geosite.as_deref())
     {
         return group.target();
     }
-    classify_target(state, qtype)
+    classify_target(hot, qtype)
 }

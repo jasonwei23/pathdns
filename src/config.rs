@@ -273,10 +273,10 @@ impl Config {
         }
     }
 
-    pub fn parse_args() -> Result<Self> {
+    pub fn parse_args() -> Result<(Self, PathBuf)> {
         let config_path = parse_cli()?;
         let json = crate::config_file::load_json_config(&config_path)?;
-        Self::from_json(json)
+        Ok((Self::from_json(json)?, config_path))
     }
 
     pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
