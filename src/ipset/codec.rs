@@ -8,7 +8,7 @@
 //! module needs to construct raw netlink bytes directly.
 
 use super::config::NftFamily;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 // -- Subsystem / command constants -------------------------------------------
 
@@ -18,6 +18,8 @@ const IPSET_CMD_TEST: u16 = 11;
 const IPSET_PROTOCOL: u8 = 6;
 
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
+const NFT_MSG_NEWSET: u16 = 9;
+const NFT_MSG_GETSET: u16 = 10;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_GETSETELEM: u16 = 13;
 const NFNL_MSG_BATCH_BEGIN: u16 = 16;
@@ -40,6 +42,8 @@ pub(super) const NLMSG_ERROR: u16 = 0x2;
 
 const NLA_F_NESTED: u16 = 1 << 15;
 const NLA_F_NET_BYTEORDER: u16 = 1 << 14;
+/// Mask to strip flag bits and get the bare NLA type.
+const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 
 const IPSET_ATTR_PROTOCOL: u16 = 1;
 const IPSET_ATTR_SETNAME: u16 = 2;
@@ -49,6 +53,7 @@ const IPSET_ATTR_DATA: u16 = 7;
 const IPSET_ATTR_IP: u16 = 1;
 const IPSET_ATTR_IPADDR_IPV4: u16 = 1;
 const IPSET_ATTR_IPADDR_IPV6: u16 = 2;
+const IPSET_ATTR_CIDR: u16 = 3;
 const IPSET_ERR_EXIST: i32 = 4103;
 
 const NFTA_SET_ELEM_LIST_TABLE: u16 = 1;
@@ -59,6 +64,14 @@ const NFTA_SET_ELEM_KEY: u16 = 1;
 const NFTA_SET_ELEM_FLAGS: u16 = 3;
 const NFTA_DATA_VALUE: u16 = 1;
 const NFT_SET_ELEM_INTERVAL_END: u32 = 1;
+
+// nftset metadata attributes (for NFT_MSG_GETSET / NFT_MSG_NEWSET).
+const NFTA_SET_TABLE: u16 = 1;
+const NFTA_SET_NAME: u16 = 2;
+const NFTA_SET_FLAGS: u16 = 3;
+
+/// `NFT_SET_INTERVAL` kernel flag: set stores interval ranges.
+pub(super) const NFT_SET_INTERVAL: u32 = 0x4;
 
 // -- Typed request model -----------------------------------------------------
 
@@ -72,6 +85,8 @@ pub(super) enum NetfilterRequest<'a> {
     IpsetAddBatch {
         name: &'a str,
         ips: &'a [IpAddr],
+        /// When `Some(prefix)` each IP is written as a CIDR entry (hash:net sets).
+        mask: Option<u8>,
     },
     NftSetTest {
         family: NftFamily,
@@ -84,6 +99,19 @@ pub(super) enum NetfilterRequest<'a> {
         table: &'a str,
         set: &'a str,
         ips: &'a [IpAddr],
+        /// When `Some(prefix)`, mask IPs to their network address before writing.
+        mask: Option<u8>,
+        /// When `true` (only meaningful with `mask`), write each prefix as an
+        /// interval range `[network, next_network)` instead of a single element.
+        /// Requires the target set to carry the `NFT_SET_INTERVAL` flag.
+        /// Without a mask the existing host-interval format is always used.
+        interval: bool,
+    },
+    /// Query set metadata to check for the `NFT_SET_INTERVAL` flag.
+    NftSetGetMeta {
+        family: NftFamily,
+        table: &'a str,
+        set: &'a str,
     },
 }
 
@@ -94,7 +122,9 @@ impl<'a> NetfilterRequest<'a> {
     pub(super) fn encode(&self, seq: u32) -> Vec<u8> {
         match *self {
             Self::IpsetTest { name, ip } => encode_ipset_test(name, ip, seq),
-            Self::IpsetAddBatch { name, ips } => encode_ipset_add_batch(name, ips, seq),
+            Self::IpsetAddBatch { name, ips, mask } => {
+                encode_ipset_add_batch(name, ips, mask, seq)
+            }
             Self::NftSetTest {
                 family,
                 table,
@@ -106,7 +136,12 @@ impl<'a> NetfilterRequest<'a> {
                 table,
                 set,
                 ips,
-            } => encode_nftset_add(family, table, set, ips, seq),
+                mask,
+                interval,
+            } => encode_nftset_add(family, table, set, ips, mask, interval, seq),
+            Self::NftSetGetMeta { family, table, set } => {
+                encode_nftset_getmeta(family, table, set, seq)
+            }
         }
     }
 }
@@ -123,11 +158,11 @@ fn encode_ipset_test(name: &str, ip: IpAddr, seq: u32) -> Vec<u8> {
     msg.set_seq(seq);
     msg.attr(IPSET_ATTR_PROTOCOL, &[IPSET_PROTOCOL]);
     msg.attr_nul(IPSET_ATTR_SETNAME, name);
-    ipset_elem(&mut msg, ip);
+    ipset_elem(&mut msg, ip, None);
     msg.buf
 }
 
-fn encode_ipset_add_batch(name: &str, ips: &[IpAddr], seq: u32) -> Vec<u8> {
+fn encode_ipset_add_batch(name: &str, ips: &[IpAddr], mask: Option<u8>, seq: u32) -> Vec<u8> {
     assert!(!ips.is_empty());
     let family = ip_family(ips[0]);
     let mut msg = NlBuilder::new(
@@ -142,7 +177,8 @@ fn encode_ipset_add_batch(name: &str, ips: &[IpAddr], seq: u32) -> Vec<u8> {
     msg.attr(IPSET_ATTR_LINENO, &0u32.to_ne_bytes());
     msg.nest(IPSET_ATTR_ADT, |msg| {
         for &ip in ips {
-            ipset_elem(msg, ip);
+            let write_ip = mask.map(|m| apply_mask(ip, m)).unwrap_or(ip);
+            ipset_elem(msg, write_ip, mask);
         }
     });
     msg.buf
@@ -173,6 +209,8 @@ fn encode_nftset_add(
     table: &str,
     set: &str,
     ips: &[IpAddr],
+    mask: Option<u8>,
+    interval: bool,
     seq: u32,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -192,8 +230,25 @@ fn encode_nftset_add(
     msg.attr_nul(NFTA_SET_ELEM_LIST_SET, set);
     msg.nest(NFTA_SET_ELEM_LIST_ELEMENTS, |msg| {
         for &ip in ips {
-            nft_interval_elem(msg, ip, false);
-            nft_interval_elem(msg, ip_next(ip), true);
+            match mask {
+                Some(prefix) => {
+                    let net = apply_mask(ip, prefix);
+                    if interval {
+                        // Write a prefix range: [net, next_net) as two interval endpoints.
+                        let end = prefix_end(net, prefix);
+                        nft_interval_elem(msg, net, false);
+                        nft_interval_elem(msg, end, true);
+                    } else {
+                        // Set has no interval flag; write just the network address.
+                        nft_interval_elem(msg, net, false);
+                    }
+                }
+                None => {
+                    // No mask: existing behaviour — host interval [ip, ip+1).
+                    nft_interval_elem(msg, ip, false);
+                    nft_interval_elem(msg, ip_next(ip), true);
+                }
+            }
         }
     });
     buf.extend_from_slice(&msg.buf);
@@ -203,6 +258,19 @@ fn encode_nftset_add(
     buf.extend_from_slice(&end.buf);
 
     buf
+}
+
+fn encode_nftset_getmeta(family: NftFamily, table: &str, set: &str, seq: u32) -> Vec<u8> {
+    let mut msg = NlBuilder::new(
+        nft_msg_type(NFT_MSG_GETSET),
+        NLM_F_REQUEST,
+        nft_family_code(family),
+        0,
+    );
+    msg.set_seq(seq);
+    msg.attr_nul(NFTA_SET_TABLE, table);
+    msg.attr_nul(NFTA_SET_NAME, set);
+    msg.buf
 }
 
 // -- Decode helpers ----------------------------------------------------------
@@ -248,6 +316,78 @@ pub(super) fn decode_ack_ok_or_exists(msg_type: u16, data: &[u8]) -> anyhow::Res
     }
 }
 
+/// Parse the `NFTA_SET_FLAGS` from a `NFT_MSG_NEWSET` response.
+/// Returns 0 if no flags attribute is present (set has no special flags).
+pub(super) fn decode_nft_set_flags(msg_type: u16, data: &[u8]) -> anyhow::Result<u32> {
+    if msg_type != nft_msg_type(NFT_MSG_NEWSET) {
+        if let Some(code) = nlmsg_errno(msg_type, data) {
+            return Err(anyhow::anyhow!(
+                "netlink GETSET error: errno={}",
+                code.abs()
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "unexpected msg type {msg_type} in GETSET response"
+        ));
+    }
+    // data = full nlmsg: 16-byte nlmsghdr + 4-byte nfgenmsg + NLA attributes.
+    if data.len() < 20 {
+        return Err(anyhow::anyhow!("truncated NEWSET response"));
+    }
+    for (attr_type, value) in nla_iter(&data[20..]) {
+        if attr_type == NFTA_SET_FLAGS && value.len() >= 4 {
+            return Ok(u32::from_be_bytes(value[..4].try_into().unwrap()));
+        }
+    }
+    Ok(0)
+}
+
+// -- IP address helpers ------------------------------------------------------
+
+/// Mask `ip` to its network address for the given prefix length.
+pub(super) fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let mask = if prefix >= 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            IpAddr::V4(Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let mask = if prefix >= 128 {
+                u128::MAX
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            IpAddr::V6(Ipv6Addr::from(bits & mask))
+        }
+    }
+}
+
+/// Return the first address immediately after the prefix (the interval end point).
+pub(super) fn prefix_end(network: IpAddr, prefix: u8) -> IpAddr {
+    match network {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let size = if prefix >= 32 { 1u32 } else { 1u32 << (32 - prefix) };
+            IpAddr::V4(Ipv4Addr::from(bits.wrapping_add(size)))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let size = if prefix >= 128 {
+                1u128
+            } else {
+                1u128 << (128 - prefix)
+            };
+            IpAddr::V6(Ipv6Addr::from(bits.wrapping_add(size)))
+        }
+    }
+}
+
 // -- Wire-format helpers (private) -------------------------------------------
 
 fn nlmsg_errno(msg_type: u16, data: &[u8]) -> Option<i32> {
@@ -258,7 +398,7 @@ fn nlmsg_errno(msg_type: u16, data: &[u8]) -> Option<i32> {
     Some(i32::from_ne_bytes(data[16..20].try_into().ok()?))
 }
 
-fn ipset_elem(msg: &mut NlBuilder, ip: IpAddr) {
+fn ipset_elem(msg: &mut NlBuilder, ip: IpAddr, mask: Option<u8>) {
     msg.nest(IPSET_ATTR_DATA, |msg| {
         msg.nest(IPSET_ATTR_IP, |msg| {
             let attr = match ip {
@@ -267,6 +407,9 @@ fn ipset_elem(msg: &mut NlBuilder, ip: IpAddr) {
             };
             msg.attr_ip(attr | NLA_F_NET_BYTEORDER, ip);
         });
+        if let Some(cidr) = mask {
+            msg.attr(IPSET_ATTR_CIDR, &[cidr]);
+        }
     });
 }
 
@@ -315,6 +458,42 @@ fn ipset_msg_type(cmd: u16) -> u16 {
 
 fn nft_msg_type(cmd: u16) -> u16 {
     (NFNL_SUBSYS_NFTABLES << 8) | cmd
+}
+
+/// Iterate over top-level NLA (netlink attribute) entries in `data`.
+/// Each item is `(type_without_flags, value_bytes)`.
+fn nla_iter(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    NlaIter { data, pos: 0 }
+}
+
+struct NlaIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for NlaIter<'a> {
+    type Item = (u16, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + 4 > self.data.len() {
+            return None;
+        }
+        let nla_len =
+            u16::from_ne_bytes(self.data[self.pos..self.pos + 2].try_into().ok()?) as usize;
+        if nla_len < 4 {
+            return None;
+        }
+        let end = self.pos.checked_add(nla_len)?;
+        if end > self.data.len() {
+            return None;
+        }
+        let nla_type =
+            u16::from_ne_bytes(self.data[self.pos + 2..self.pos + 4].try_into().ok()?)
+                & NLA_TYPE_MASK;
+        let value = &self.data[self.pos + 4..end];
+        self.pos = (end + 3) & !3; // advance to next 4-byte boundary
+        Some((nla_type, value))
+    }
 }
 
 // -- NlBuilder (private wire-format builder) ---------------------------------
@@ -429,5 +608,31 @@ mod tests {
     fn truncated_error_messages_are_rejected() {
         assert!(decode_ipset_test(NLMSG_ERROR, &[0; 19]).is_err());
         assert!(decode_nft_test(NLMSG_ERROR, &[0; 19]).is_err());
+    }
+
+    #[test]
+    fn apply_mask_v4() {
+        use std::net::Ipv4Addr;
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 100));
+        assert_eq!(apply_mask(ip, 24), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 0)));
+        assert_eq!(apply_mask(ip, 16), IpAddr::V4(Ipv4Addr::new(1, 2, 0, 0)));
+        assert_eq!(apply_mask(ip, 32), ip);
+        assert_eq!(apply_mask(ip, 0), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn apply_mask_v6() {
+        use std::net::Ipv6Addr;
+        let ip = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        let net = apply_mask(ip, 32);
+        assert_eq!(net, IpAddr::V6("2001:db8::".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn prefix_end_v4() {
+        use std::net::Ipv4Addr;
+        let net = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 0));
+        assert_eq!(prefix_end(net, 24), IpAddr::V4(Ipv4Addr::new(1, 2, 4, 0)));
+        assert_eq!(prefix_end(net, 32), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 1)));
     }
 }

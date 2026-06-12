@@ -26,7 +26,7 @@ use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
 use client::NetfilterClient;
 #[cfg(target_os = "linux")]
-use config::SetPair;
+use config::{SetName, SetPair};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
@@ -42,6 +42,9 @@ pub struct IpSetManager {
     test: Option<SetPair>,
     add_groups: Vec<(String, SetPair)>,
     blacklist: bool,
+    /// NftSet entries (with mask) that carry the `NFT_SET_INTERVAL` kernel flag.
+    /// Looked up at startup; controls whether adds are written as prefix ranges.
+    interval_nft_sets: HashSet<SetName>,
     warned: Mutex<HashSet<String>>,
     client: Mutex<NetfilterClient>,
     add_tx: Option<mpsc::SyncSender<AddJob>>,
@@ -69,12 +72,38 @@ impl IpSetManager {
             None
         };
         let test = cfg.test.as_ref().map(SetPair::parse).transpose()?;
+
+        let mut netfilter_client = NetfilterClient::new()?;
+
+        // At startup, query the NFT_SET_INTERVAL flag for every masked NftSet entry.
+        // This avoids a per-IP query at runtime.
+        let mut interval_nft_sets: HashSet<SetName> = HashSet::new();
+        for (_, pair) in &add_groups {
+            for set in [pair.v4.as_ref(), pair.v6.as_ref()].into_iter().flatten() {
+                if let SetName::NftSet { family, table, set: set_name, mask: Some(_) } = set {
+                    match netfilter_client.query_nft_interval_flag(*family, table, set_name) {
+                        Ok(true) => {
+                            interval_nft_sets.insert(set.clone());
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            crate::log_error!(
+                                "netlink op=query_interval status=failed \
+                                 set={table}@{set_name} error={e:#}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             test,
             add_groups,
             blacklist: cfg.blacklist,
+            interval_nft_sets,
             warned: Mutex::new(HashSet::new()),
-            client: Mutex::new(NetfilterClient::new()?),
+            client: Mutex::new(netfilter_client),
             add_tx,
         })
     }
@@ -151,12 +180,14 @@ impl IpSetManager {
             let Some(set) = pair.set_for(*ip) else {
                 continue;
             };
+            let interval = self.interval_nft_sets.contains(set);
             let Some(add_tx) = &self.add_tx else {
                 continue;
             };
             match add_tx.try_send(AddJob {
                 set: set.clone(),
                 ip: *ip,
+                interval,
             }) {
                 Ok(()) => {}
                 Err(e) => {
@@ -168,7 +199,7 @@ impl IpSetManager {
                     self.warn_once("add", anyhow!("{msg}"));
                     match self.client.lock() {
                         Ok(mut c) => {
-                            if let Err(err) = c.add_many(set, &[*ip]) {
+                            if let Err(err) = c.add_many(set, &[*ip], interval) {
                                 self.warn_once("add", err);
                             }
                         }
@@ -231,8 +262,12 @@ mod tests {
         pairs
             .iter()
             .map(|(set, ip)| AddJob {
-                set: SetName::IpSet(set.to_string()),
+                set: SetName::IpSet {
+                    name: set.to_string(),
+                    mask: None,
+                },
                 ip: *ip,
+                interval: false,
             })
             .collect()
     }

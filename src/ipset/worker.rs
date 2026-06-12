@@ -20,6 +20,9 @@ pub(super) const ADD_BATCH_SIZE: usize = 64;
 pub(super) struct AddJob {
     pub(super) set: SetName,
     pub(super) ip: IpAddr,
+    /// Whether the target nftset carries the `NFT_SET_INTERVAL` flag.
+    /// Always `false` for ipset entries.
+    pub(super) interval: bool,
 }
 
 pub(super) fn spawn_add_worker() -> mpsc::SyncSender<AddJob> {
@@ -59,13 +62,14 @@ fn run_add_worker(rx: mpsc::Receiver<AddJob>) {
         let mut pos = 0usize;
         while pos < batch.len() {
             let set = batch[pos].set.clone();
+            let interval = batch[pos].interval;
             let chunk_start = pos;
             pos += 1;
             while pos < batch.len() && batch[pos].set == set {
                 pos += 1;
             }
             let ips: Vec<IpAddr> = batch[chunk_start..pos].iter().map(|j| j.ip).collect();
-            if let Err(err) = client.add_many(&set, &ips) {
+            if let Err(err) = client.add_many(&set, &ips, interval) {
                 first_err.get_or_insert_with(|| format!("{err:#}"));
             }
         }
