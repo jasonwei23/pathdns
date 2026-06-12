@@ -17,7 +17,8 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use tokio::sync::{oneshot, OwnedSemaphorePermit};
 
 struct Entry {
     tx: oneshot::Sender<Bytes>,
@@ -40,34 +41,46 @@ pub(super) struct InflightRegistry {
     /// Counter seeded from system time at startup; mixed through `mix16` before use
     /// so that upstream query IDs are non-sequential and unpredictable.
     next_id: AtomicU32,
-    /// Maximum concurrent in-flight queries (0 = unlimited).
-    max_inflight: usize,
+    /// Semaphore-based inflight cap: each in-flight query holds one permit for its
+    /// entire lifetime (from `register` until the guard is dropped).  Using an
+    /// `OwnedSemaphorePermit` stored in the guard eliminates the TOCTOU race that
+    /// a `len() >= cap` check-then-insert pattern would have.  None when unlimited.
+    cap: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl InflightRegistry {
     pub(super) fn new(max_inflight: usize) -> Self {
+        let cap = if max_inflight > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(max_inflight)))
+        } else {
+            None
+        };
         Self {
             entries: DashMap::with_hasher(FxBuildHasher),
             next_id: AtomicU32::new(super::random_id_seed()),
-            max_inflight,
+            cap,
         }
     }
 
     /// Register a query: allocate an unused upstream ID and store the responder.
     /// The returned guard removes the entry on drop (timeout/error paths); a
     /// delivered response removes it first, making the guard's removal a no-op.
+    /// When a per-upstream cap is configured, the guard also holds a semaphore
+    /// permit that is released atomically on drop.
     pub(super) fn register(
         &self,
         name: &str,
         client_id: u16,
         question: Bytes,
     ) -> Result<(u16, oneshot::Receiver<Bytes>, InflightGuard<'_>)> {
-        if self.max_inflight > 0 && self.entries.len() >= self.max_inflight {
-            return Err(anyhow!(
-                "upstream {name} inflight cap ({}) reached",
-                self.max_inflight
-            ));
-        }
+        let permit = if let Some(sem) = &self.cap {
+            match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => return Err(anyhow!("upstream {name} inflight cap reached")),
+            }
+        } else {
+            None
+        };
         let (tx, rx) = oneshot::channel();
         let mut tx = Some(tx);
         for _ in 0..u16::MAX {
@@ -82,7 +95,7 @@ impl InflightRegistry {
                         client_id,
                         question,
                     });
-                    return Ok((id, rx, InflightGuard { registry: self, id }));
+                    return Ok((id, rx, InflightGuard { registry: self, id, _permit: permit }));
                 }
                 dashmap::mapref::entry::Entry::Occupied(_) => continue,
             }
@@ -195,16 +208,40 @@ mod tests {
         let (mut buf, len) = build_response(uid, 4, 1, &question);
         assert!(matches!(reg.complete(&mut buf, len), Completion::NoWaiter));
     }
+
+    #[test]
+    fn inflight_cap_blocks_and_releases() {
+        let reg = InflightRegistry::new(2);
+        let q = q();
+        let r1 = reg.register("t", 1, q.clone()).unwrap();
+        let r2 = reg.register("t", 2, q.clone()).unwrap();
+        // Cap reached: third registration must fail.
+        assert!(reg.register("t", 3, q.clone()).is_err());
+        // Drop one guard; capacity is returned atomically.
+        drop(r1);
+        let _r3 = reg.register("t", 4, q.clone()).unwrap();
+        // Still at cap: another must fail.
+        assert!(reg.register("t", 5, q.clone()).is_err());
+        drop(r2);
+        drop(_r3);
+        // All released: should accept again.
+        assert!(reg.register("t", 6, q.clone()).is_ok());
+    }
 }
 
-/// RAII guard: removes the registered entry when dropped.
+/// RAII guard: removes the registered entry on drop (timeout / error paths).
+/// A delivered response removes the entry first via `complete`, making the
+/// removal here a no-op.  The optional semaphore permit is also released on
+/// drop, returning capacity to the inflight cap.
 pub(super) struct InflightGuard<'a> {
     registry: &'a InflightRegistry,
     id: u16,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         self.registry.entries.remove(&self.id);
+        // _permit drops here, atomically returning one slot to the semaphore
     }
 }
