@@ -349,7 +349,9 @@ pub(super) fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let mask = if prefix >= 32 {
+            let mask = if prefix == 0 {
+                0u32
+            } else if prefix >= 32 {
                 u32::MAX
             } else {
                 u32::MAX << (32 - prefix)
@@ -358,7 +360,9 @@ pub(super) fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
         }
         IpAddr::V6(v6) => {
             let bits = u128::from(v6);
-            let mask = if prefix >= 128 {
+            let mask = if prefix == 0 {
+                0u128
+            } else if prefix >= 128 {
                 u128::MAX
             } else {
                 u128::MAX << (128 - prefix)

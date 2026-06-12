@@ -1,6 +1,67 @@
 use crate::config::EcsSubnet;
 use std::net::IpAddr;
 
+/// Clear all option data from the OPT RDATA in a DNS *response*.
+///
+/// Keeps the OPT fixed header (extended RCODE, EDNS version, DO bit) but removes
+/// all per-connection option payloads (server COOKIE, NSID, EXPIRE, …) so they
+/// are not returned to subsequent clients served from cache.
+///
+/// Returns `Some(new_packet)` only when an OPT RR with non-empty RDATA was found.
+/// Returns `None` when no modification is needed (no OPT, or RDATA already empty).
+pub fn strip_opt_rdata(packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let ar = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+    if ar == 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let an = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let ns = u16::from_be_bytes([packet[8], packet[9]]) as usize;
+
+    let mut pos = 12usize;
+    for _ in 0..qd {
+        pos = super::skip_name(packet, pos)?;
+        pos = pos.checked_add(4).filter(|&p| p <= packet.len())?;
+    }
+    for _ in 0..(an + ns) {
+        let fixed = super::skip_name(packet, pos)?;
+        if fixed + 10 > packet.len() {
+            return None;
+        }
+        let rdlen = u16::from_be_bytes([packet[fixed + 8], packet[fixed + 9]]) as usize;
+        pos = fixed
+            .checked_add(10 + rdlen)
+            .filter(|&p| p <= packet.len())?;
+    }
+    for _ in 0..ar {
+        let name_end = super::skip_name(packet, pos)?;
+        if name_end + 10 > packet.len() {
+            return None;
+        }
+        let rr_type = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
+        let rdlen = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
+        let rdata_start = name_end + 10;
+        let rdata_end = rdata_start
+            .checked_add(rdlen)
+            .filter(|&p| p <= packet.len())?;
+
+        if rr_type == 41 && rdlen > 0 {
+            // Replace RDLEN with 0 and drop the RDATA bytes.
+            let rdlen_pos = name_end + 8;
+            let mut out = Vec::with_capacity(packet.len() - rdlen);
+            out.extend_from_slice(&packet[..rdlen_pos]);
+            out.extend_from_slice(&0u16.to_be_bytes());
+            out.extend_from_slice(&packet[rdata_end..]);
+            return Some(out);
+        }
+        pos = rdata_end;
+    }
+    None
+}
+
 /// Strip the EDNS Client Subnet option (code 0x000b) from a DNS query packet.
 ///
 /// Returns `Some(new_packet)` only when ECS was found and removed.

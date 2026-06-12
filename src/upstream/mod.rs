@@ -1074,16 +1074,16 @@ mod tests {
 
     #[test]
     fn failure_inflates_rtt_estimate() {
-        let h = HealthStats::new();
+        let h = HealthStats::new(0);
         h.record_success(20_000);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 20_000);
 
         // First failure: 20_000 * 2 = 40_000 < floor, so the floor applies.
-        h.record_failure();
+        h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_FLOOR_US);
 
         // Subsequent failures double the estimate.
-        h.record_failure();
+        h.record_failure(false);
         assert_eq!(
             h.ewma_rtt_us.load(Ordering::Relaxed),
             FAILURE_RTT_FLOOR_US * 2
@@ -1092,27 +1092,27 @@ mod tests {
 
     #[test]
     fn failure_inflation_is_capped() {
-        let h = HealthStats::new();
+        let h = HealthStats::new(0);
         h.record_success(8_000_000);
-        h.record_failure();
+        h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_CAP_US);
-        h.record_failure();
+        h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_CAP_US);
     }
 
     #[test]
     fn failure_with_no_data_uses_floor() {
-        let h = HealthStats::new();
-        h.record_failure();
+        let h = HealthStats::new(0);
+        h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_FLOOR_US);
     }
 
     #[test]
     fn success_after_failure_adopts_fresh_sample() {
-        let h = HealthStats::new();
+        let h = HealthStats::new(0);
         h.record_success(20_000);
-        h.record_failure();
-        h.record_failure();
+        h.record_failure(false);
+        h.record_failure(false);
         // Recovery: fresh sample replaces the inflated estimate outright.
         h.record_success(22_000);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 22_000);
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn steady_state_success_blends_ewma() {
-        let h = HealthStats::new();
+        let h = HealthStats::new(0);
         h.record_success(20_000);
         h.record_success(40_000);
         // 0.75 * 20_000 + 0.25 * 40_000 = 25_000
@@ -1130,9 +1130,9 @@ mod tests {
 
     #[test]
     fn penalty_after_threshold_and_reset_on_success() {
-        let h = HealthStats::new();
+        let h = HealthStats::new(0);
         for _ in 0..FAILURE_THRESHOLD {
-            h.record_failure();
+            h.record_failure(false);
         }
         assert!(h.is_penalized_at(now_ms()));
         h.record_success(1_000);

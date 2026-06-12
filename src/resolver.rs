@@ -774,13 +774,20 @@ async fn exchange_with_dedupe(
                     None
                 };
                 let cache_query: &[u8] = stripped_query.as_deref().unwrap_or(&query_for_cache);
+                // Strip per-connection OPT data (COOKIE, NSID, …) from the cached copy so
+                // those options from one client's upstream exchange are not returned to
+                // subsequent clients served from cache.  The response sent to the first
+                // client is unchanged.
+                let sanitized_resp = dns::strip_opt_rdata(resp.as_ref()).map(bytes::Bytes::from);
+                let cache_packet: &[u8] =
+                    sanitized_resp.as_deref().unwrap_or_else(|| resp.as_ref());
                 state.cache.add(
                     crate::cache::CacheInsert {
                         key: ck,
                         qname: ctx.info.qname.clone(),
                         question_end: ctx.info.question_end,
                         query: cache_query,
-                        packet: resp.as_ref(),
+                        packet: cache_packet,
                     },
                     &cache_policy,
                     group_id,

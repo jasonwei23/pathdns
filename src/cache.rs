@@ -105,6 +105,9 @@ fn cache_key_impl(query: &[u8], question_end: usize, strip_ecs: bool) -> CacheKe
             }
         }
     }
+    // Include the hash of any non-ECS/non-PADDING EDNS option codes (COOKIE, NSID, …)
+    // so queries with different option sets do not share a cache entry.
+    h.write(&v.extra_opts_hash.to_le_bytes());
 
     h.finish()
 }
@@ -615,7 +618,7 @@ impl DnsCache {
         atomic_write(path, |w| {
             // Magic encodes format implicitly; change it when the on-disk layout changes.
             // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-            w.write_all(b"PDNSC007")?;
+            w.write_all(b"PDNSC008")?;
             w.write_all(&fingerprint.to_le_bytes())?;
             w.write_all(&(count as u32).to_le_bytes())?;
 
@@ -680,7 +683,7 @@ impl DnsCache {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).context("read magic")?;
         anyhow::ensure!(
-            &magic == b"PDNSC007",
+            &magic == b"PDNSC008",
             "unrecognised cache file format (magic mismatch)"
         );
 

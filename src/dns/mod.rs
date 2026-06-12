@@ -11,6 +11,7 @@ mod ecs;
 mod query;
 mod ttl;
 
+use crate::hasher::Fnv1a;
 use bytes::{Bytes, BytesMut};
 
 // Shared types.
@@ -33,7 +34,7 @@ pub struct FastQueryInfo {
 // Re-exports.
 
 pub use builder::{empty_reply, notimp_opcode_reply, notimp_reply, rcode_reply, servfail_reply};
-pub use ecs::{inject_or_replace_ecs, strip_edns_ecs};
+pub use ecs::{inject_or_replace_ecs, strip_edns_ecs, strip_opt_rdata};
 pub use query::{get_id, is_reply, is_truncated, parse_query_fast, parse_query_from_fast, set_id};
 pub use ttl::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, patch_ttls_uniform, rcode};
 
@@ -48,8 +49,11 @@ pub use ttl::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, patch_ttls_u
 ///
 /// ECS source subnet is included so that `ecs=forward` clients from different
 /// subnets receive subnet-specific responses rather than sharing a cache entry.
-/// This causes one cache entry per unique client subnet for `ecs=strip` upstreams;
-/// ECS-mode-aware normalisation (keying by the stripped variant) is a Phase 2 item.
+///
+/// `extra_opts_hash` covers every other EDNS option code (e.g. COOKIE=10,
+/// NSID=3, DAU/DHU/N3U=5/6/7, CHAIN=13) whose presence or absence may cause
+/// the upstream to return a different response.  Two queries with different
+/// non-ECS/non-PADDING option sets are placed in different cache buckets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryVariant {
     /// Client presented an EDNS OPT record.
@@ -67,6 +71,9 @@ pub struct QueryVariant {
     /// Normalised ECS source network from the client query, or `None` when no
     /// ECS option was present.
     pub ecs_src: Option<EcsSrc>,
+    /// FNV-1a hash of the sorted set of non-ECS, non-PADDING EDNS option codes
+    /// present in the query.  Zero when no such options exist.
+    pub extra_opts_hash: u64,
 }
 
 /// Normalised ECS source network extracted from a client query.
@@ -91,6 +98,7 @@ impl QueryVariant {
             ad,
             cd,
             ecs_src: None,
+            extra_opts_hash: 0,
         }
     }
 }
@@ -139,7 +147,8 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
             // OPT TTL layout: ext-rcode(1) version(1) flags(2); DO is bit 15 of flags.
             let edns_version = packet[name_end + 5];
             let do_bit = (packet[name_end + 6] & 0x80) != 0;
-            let ecs_src = extract_ecs_src(packet.get(rdata_start..rdata_end).unwrap_or(&[]));
+            let (ecs_src, extra_opts_hash) =
+                extract_opt_data(packet.get(rdata_start..rdata_end).unwrap_or(&[]));
             return QueryVariant {
                 has_opt: true,
                 do_bit,
@@ -148,6 +157,7 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
                 ad,
                 cd,
                 ecs_src,
+                extra_opts_hash,
             };
         }
 
@@ -157,9 +167,20 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
     QueryVariant::no_edns(rd, ad, cd)
 }
 
-/// Scan OPT RDATA for the ECS option (code 0x000b) and return its normalised
-/// source network.  Returns `None` when ECS is absent or malformed.
-fn extract_ecs_src(rdata: &[u8]) -> Option<EcsSrc> {
+/// Walk OPT RDATA; return the normalised ECS source network and a hash of any
+/// other option codes that influence the upstream response.
+///
+/// The hash is FNV-1a over the sorted set of option codes, excluding:
+/// - ECS (`0x000b`) — handled separately via `ecs_src`
+/// - PADDING (`12`) — does not affect response content
+///
+/// Zero is returned when no such options are present.
+fn extract_opt_data(rdata: &[u8]) -> (Option<EcsSrc>, u64) {
+    let mut ecs_src = None;
+    // Stack array; covers all practical EDNS option combinations without allocation.
+    let mut codes = [0u16; 8];
+    let mut ncodes = 0usize;
+
     let mut pos = 0usize;
     while pos + 4 <= rdata.len() {
         let code = u16::from_be_bytes([rdata[pos], rdata[pos + 1]]);
@@ -170,44 +191,60 @@ fn extract_ecs_src(rdata: &[u8]) -> Option<EcsSrc> {
             break;
         }
         if code == 0x000b && opt_len >= 4 {
-            // ECS OPTION-DATA: FAMILY(2) SOURCE-PREFIX-LENGTH(1) SCOPE-PREFIX-LENGTH(1) ADDRESS(var)
-            let family = u16::from_be_bytes([rdata[pos], rdata[pos + 1]]);
-            let prefix_len = rdata[pos + 2];
-            let addr_data = rdata.get(pos + 4..end).unwrap_or(&[]);
-            let (addr, prefix_len) = match family {
-                1 => {
-                    let mut buf = [0u8; 4];
-                    let n = addr_data.len().min(4);
-                    buf[..n].copy_from_slice(&addr_data[..n]);
-                    let plen = prefix_len.min(32);
-                    let raw = u32::from_be_bytes(buf);
-                    let mask = if plen == 0 {
-                        0u32
-                    } else {
-                        !0u32 << (32 - plen)
-                    };
-                    (u128::from(raw & mask), plen)
-                }
-                2 => {
-                    let mut buf = [0u8; 16];
-                    let n = addr_data.len().min(16);
-                    buf[..n].copy_from_slice(&addr_data[..n]);
-                    let plen = prefix_len.min(128);
-                    let raw = u128::from_be_bytes(buf);
-                    let mask = if plen == 0 {
-                        0u128
-                    } else {
-                        !0u128 << (128 - plen)
-                    };
-                    (raw & mask, plen)
-                }
-                _ => return None,
-            };
-            return Some(EcsSrc { addr, prefix_len });
+            ecs_src = parse_ecs_src(&rdata[pos..end]);
+        } else if code != 12 && ncodes < codes.len() {
+            // Collect unknown/non-padding option codes.
+            codes[ncodes] = code;
+            ncodes += 1;
         }
         pos = end;
     }
-    None
+
+    let extra_opts_hash = if ncodes == 0 {
+        0
+    } else {
+        codes[..ncodes].sort_unstable();
+        let mut h = Fnv1a::new();
+        for &c in &codes[..ncodes] {
+            h.write(&c.to_le_bytes());
+        }
+        h.finish()
+    };
+
+    (ecs_src, extra_opts_hash)
+}
+
+/// Parse the ECS OPTION-DATA (everything after the 4-byte option header).
+/// OPTION-DATA layout: FAMILY(2) SOURCE-PREFIX-LENGTH(1) SCOPE-PREFIX-LENGTH(1) ADDRESS(var)
+fn parse_ecs_src(opt_data: &[u8]) -> Option<EcsSrc> {
+    if opt_data.len() < 4 {
+        return None;
+    }
+    let family = u16::from_be_bytes([opt_data[0], opt_data[1]]);
+    let prefix_len = opt_data[2];
+    let addr_data = &opt_data[4..];
+    let (addr, prefix_len) = match family {
+        1 => {
+            let mut buf = [0u8; 4];
+            let n = addr_data.len().min(4);
+            buf[..n].copy_from_slice(&addr_data[..n]);
+            let plen = prefix_len.min(32);
+            let raw = u32::from_be_bytes(buf);
+            let mask = if plen == 0 { 0u32 } else { !0u32 << (32 - plen) };
+            (u128::from(raw & mask), plen)
+        }
+        2 => {
+            let mut buf = [0u8; 16];
+            let n = addr_data.len().min(16);
+            buf[..n].copy_from_slice(&addr_data[..n]);
+            let plen = prefix_len.min(128);
+            let raw = u128::from_be_bytes(buf);
+            let mask = if plen == 0 { 0u128 } else { !0u128 << (128 - plen) };
+            (raw & mask, plen)
+        }
+        _ => return None,
+    };
+    Some(EcsSrc { addr, prefix_len })
 }
 
 /// Return the byte offset immediately after the question section (QNAME + QTYPE + QCLASS).
