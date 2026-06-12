@@ -4,20 +4,20 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod cache;
 mod config;
-mod config_json;
+mod config_file;
 mod dns;
 mod domain;
-mod fnv;
+mod hasher;
 mod geosite;
 mod ipset;
 #[cfg(unix)]
 mod listener;
 mod log;
 mod persist;
-mod pipeline;
+mod resolver;
 mod querylog;
 mod router;
-mod routing_index;
+mod route_table;
 mod server;
 mod singleflight;
 mod stats;
@@ -83,7 +83,7 @@ async fn async_main(cfg: Config) -> Result<()> {
     {
         eprintln!("warn: web dashboard is exposed without authentication");
     }
-    pipeline::spawn_refresh_worker(state.clone(), refresh_rx);
+    resolver::spawn_refresh_worker(state.clone(), refresh_rx);
     server::spawn_reload_watchers(state.clone());
 
     let mut ql_worker_task = None;

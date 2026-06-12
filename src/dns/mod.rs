@@ -3,13 +3,13 @@
 //! Responsibilities are split into focused submodules:
 //! - [`query`]: query parsing, qname extraction, fast query info
 //! - [`builder`]: response construction (empty, NXDOMAIN, A/AAAA/CNAME/rewrite)
-//! - [`scan`]: TTL scanning / patching, SOA negative-TTL, answer IP extraction
+//! - [`ttl`]: TTL scanning / patching, SOA negative-TTL, answer IP extraction
 //! - [`ecs`]: EDNS Client Subnet stripping and injection
 
 mod builder;
 mod ecs;
 mod query;
-mod scan;
+mod ttl;
 
 use bytes::{Bytes, BytesMut};
 
@@ -35,7 +35,7 @@ pub struct FastQueryInfo {
 pub use builder::{empty_reply, notimp_opcode_reply, notimp_reply, rcode_reply, servfail_reply};
 pub use ecs::{inject_or_replace_ecs, strip_edns_ecs};
 pub use query::{get_id, is_reply, is_truncated, parse_query_fast, parse_query_from_fast, set_id};
-pub use scan::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, patch_ttls_uniform, rcode};
+pub use ttl::{answer_ips, effective_ttl_and_offsets, patch_ttls_at, patch_ttls_uniform, rcode};
 
 // ── Query variant ──────────────────────────────────────────────────────────
 

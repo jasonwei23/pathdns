@@ -23,7 +23,7 @@
 
 use crate::config::{CacheConfig, GroupCachePolicy};
 use crate::dns;
-use crate::fnv::Fnv1a;
+use crate::hasher::Fnv1a;
 use crate::persist::atomic_write;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};

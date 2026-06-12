@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config_json::{JsonConfig, JsonGroupCacheSection, JsonGroupEntry};
+use crate::config_file::{JsonConfig, JsonGroupCacheSection, JsonGroupEntry};
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -262,7 +262,7 @@ impl Config {
 
     pub fn parse_args() -> Result<Self> {
         let config_path = parse_cli()?;
-        let json = crate::config_json::load_json_config(&config_path)?;
+        let json = crate::config_file::load_json_config(&config_path)?;
         Self::from_json(json)
     }
 
@@ -540,7 +540,7 @@ fn parse_fallback_config(value: serde_json::Value, groups: &[GroupSpec]) -> Resu
     }
 
     // Object form: always ipset-test mode.
-    let jf: crate::config_json::JsonFallbackSection =
+    let jf: crate::config_file::JsonFallbackSection =
         serde_json::from_value(value).map_err(|e| anyhow!("invalid fallback section: {e}"))?;
 
     let primary = jf.primary.ok_or_else(|| {
@@ -969,7 +969,7 @@ fn parse_upstreams(items: &[String]) -> Result<Vec<UpstreamEndpoint>> {
 /// Covers: groups (name, tags, filter_qtype, cache policy), fallback routing, global
 /// cache TTL settings, and GeoSite file paths.
 pub fn cache_fingerprint(cfg: &Config) -> u64 {
-    let mut h = crate::fnv::Fnv1a::new();
+    let mut h = crate::hasher::Fnv1a::new();
     macro_rules! feed {
         ($bytes:expr) => {
             h.write($bytes)

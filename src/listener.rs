@@ -11,7 +11,7 @@
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
 use crate::dns;
-use crate::pipeline::{
+use crate::resolver::{
     handle_packet_bytes, handle_packet_slow_preparsed, spawn_cache_refresh, try_fast_path_into,
     FastPathOutcome,
 };

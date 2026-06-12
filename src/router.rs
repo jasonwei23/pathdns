@@ -1,6 +1,6 @@
 //! Routing decisions: map a query (qname, qtype) to a `RouteTarget`.
 //!
-//! Groups are checked in definition order via `routing_index.route()`.
+//! Groups are checked in definition order via `route_table.route()`.
 //! When no group matches, the configured `fallback` is applied.
 
 use crate::server::{AppState, CustomGroup, ResolvedFallback};

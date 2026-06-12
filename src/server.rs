@@ -9,7 +9,7 @@ use crate::ipset::IpSetManager;
 #[cfg(unix)]
 use crate::listener;
 use crate::router::RouteTarget;
-use crate::routing_index::RouteIndex;
+use crate::route_table::RouteIndex;
 use crate::singleflight;
 use crate::upstream::UpstreamPool;
 use crate::verdict_cache::VerdictCache;
