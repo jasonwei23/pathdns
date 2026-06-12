@@ -185,6 +185,18 @@ pub struct QueryLogFileConfig {
     pub compress: bool,
 }
 
+/// Network interface filter, resolved from the `interface` JSON field.
+#[derive(Debug, Clone, Default)]
+pub enum InterfaceFilter {
+    /// Accept on all interfaces (default; no SO_BINDTODEVICE applied).
+    #[default]
+    All,
+    /// Accept only on the listed interfaces.
+    Only(Vec<String>),
+    /// Accept on all interfaces except the listed ones.
+    Except(Vec<String>),
+}
+
 /// One DNS listen address with its enabled protocols (from an optional
 /// `@udp`/`@tcp` suffix; both when no suffix is given).
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +209,7 @@ pub struct BindEndpoint {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: Vec<BindEndpoint>,
+    pub interface: InterfaceFilter,
     pub timeout: Duration,
     pub max_inflight: usize,
     /// 0 = hard-drop immediately; >0 = queue for up to this many ms before dropping.
@@ -268,6 +281,7 @@ impl Config {
 
     pub(crate) fn from_json(json: JsonConfig) -> Result<Self> {
         let bind_addrs = parse_bind_config(json.bind)?;
+        let interface = parse_interface_filter(json.interface.unwrap_or_default())?;
 
         let worker_threads = json.worker_threads.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -405,6 +419,7 @@ impl Config {
 
         Ok(Self {
             bind: bind_addrs,
+            interface,
             timeout: Duration::from_millis(json.timeout_ms.unwrap_or(3000)),
             max_inflight,
             inflight_queue_ms,
@@ -828,6 +843,40 @@ fn parse_groups(json_groups: Vec<JsonGroupEntry>) -> Result<Vec<GroupSpec>> {
     }
 
     Ok(groups)
+}
+
+/// Parse the `interface` config list into an `InterfaceFilter`.
+///
+/// - Empty list → `All` (default, no SO_BINDTODEVICE)
+/// - All entries start with `!` → `Except(names)` (all interfaces except these)
+/// - No entry starts with `!` → `Only(names)` (only these interfaces)
+/// - Mixed → error
+fn parse_interface_filter(names: Vec<String>) -> Result<InterfaceFilter> {
+    if names.is_empty() {
+        return Ok(InterfaceFilter::All);
+    }
+    let n_deny = names.iter().filter(|n| n.starts_with('!')).count();
+    if n_deny > 0 && n_deny < names.len() {
+        return Err(anyhow!(
+            "interface list must be all allow (e.g. [\"eth0\"]) or all deny (e.g. [\"!wan\"]); \
+             cannot mix '!' and non-'!' entries"
+        ));
+    }
+    if n_deny == names.len() {
+        let excluded: Vec<String> = names
+            .into_iter()
+            .map(|n| n[1..].to_string())
+            .collect();
+        if excluded.iter().any(|n| n.is_empty()) {
+            return Err(anyhow!("interface deny entry must not be just '!'"));
+        }
+        Ok(InterfaceFilter::Except(excluded))
+    } else {
+        if names.iter().any(|n| n.is_empty()) {
+            return Err(anyhow!("interface name must not be empty"));
+        }
+        Ok(InterfaceFilter::Only(names))
+    }
 }
 
 fn parse_bind_config(value: Option<serde_json::Value>) -> Result<Vec<BindEndpoint>> {
@@ -1474,5 +1523,55 @@ mod querylog_tests {
                 "querylog":{"bind":["127.0.0.1:8080","127.0.0.1:8080"]}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn interface_omitted_defaults_to_all() {
+        let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
+        assert!(matches!(cfg.interface, InterfaceFilter::All));
+    }
+
+    #[test]
+    fn interface_empty_array_means_all() {
+        let cfg = parse(r#"{"fallback":"null","interface":[]}"#).unwrap();
+        assert!(matches!(cfg.interface, InterfaceFilter::All));
+    }
+
+    #[test]
+    fn interface_allow_list_parsed() {
+        let cfg =
+            parse(r#"{"fallback":"null","interface":["eth0","br-lan"]}"#).unwrap();
+        match &cfg.interface {
+            InterfaceFilter::Only(ifaces) => {
+                assert_eq!(ifaces, &["eth0", "br-lan"]);
+            }
+            other => panic!("expected Only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interface_deny_list_parsed() {
+        let cfg = parse(r#"{"fallback":"null","interface":["!wan","!eth1"]}"#).unwrap();
+        match &cfg.interface {
+            InterfaceFilter::Except(excluded) => {
+                assert_eq!(excluded, &["wan", "eth1"]);
+            }
+            other => panic!("expected Except, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interface_mixed_allow_deny_rejected() {
+        assert!(parse(r#"{"fallback":"null","interface":["eth0","!wan"]}"#).is_err());
+    }
+
+    #[test]
+    fn interface_bare_bang_rejected() {
+        assert!(parse(r#"{"fallback":"null","interface":["!"]}"#).is_err());
+    }
+
+    #[test]
+    fn interface_empty_name_rejected() {
+        assert!(parse(r#"{"fallback":"null","interface":[""]}"#).is_err());
     }
 }

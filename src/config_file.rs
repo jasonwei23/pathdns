@@ -71,6 +71,11 @@ pub(crate) struct JsonGroupCacheSection {
 pub(crate) struct JsonConfig {
     // Listener — accepts a single address string or an array of address strings.
     pub(crate) bind: Option<serde_json::Value>,
+    /// Network interface filter: `["eth0","br-lan"]` to allow only named
+    /// interfaces, `["!wan"]` to accept from all except the listed ones, or
+    /// absent/`[]` to bind all interfaces (default).  Mixing allow and deny
+    /// entries in the same list is an error.  Applied via SO_BINDTODEVICE.
+    pub(crate) interface: Option<Vec<String>>,
     pub(crate) worker_threads: Option<usize>,
 
     // Query log / dashboard

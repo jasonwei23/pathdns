@@ -3,7 +3,7 @@
 //! Query lifecycle logic lives in `pipeline`; listener sockets live in `listener`.
 
 use crate::cache::{CacheKey, DnsCache};
-use crate::config::{Config, EcsMode, FallbackTarget};
+use crate::config::{Config, EcsMode, FallbackTarget, InterfaceFilter};
 use crate::geosite::GeoSiteDb;
 use crate::ipset::IpSetManager;
 #[cfg(unix)]
@@ -278,6 +278,13 @@ fn load_geosite(cfg: &Config, needed_tags: &HashSet<String>) -> Result<Option<Ar
 }
 
 fn listeners_summary(cfg: &Config) -> String {
+    let iface_suffix = match &cfg.interface {
+        InterfaceFilter::All => String::new(),
+        InterfaceFilter::Only(ifaces) => format!(" (iface={})", ifaces.join(",")),
+        InterfaceFilter::Except(excluded) => {
+            format!(" (iface=!{})", excluded.join(",!"))
+        }
+    };
     cfg.bind
         .iter()
         .map(|ep| {
@@ -287,7 +294,7 @@ fn listeners_summary(cfg: &Config) -> String {
                 (false, true) => "tcp",
                 (false, false) => "none",
             };
-            format!("{proto}://{}", ep.addr)
+            format!("{proto}://{}{iface_suffix}", ep.addr)
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -501,16 +508,48 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     if !state.cfg.bind.iter().any(|ep| ep.udp || ep.tcp) {
         return Err(anyhow!("at least one bind protocol is required"));
     }
+
+    // Resolve the interface filter to a concrete list of Option<String>:
+    //   None      → bind without SO_BINDTODEVICE (all interfaces)
+    //   Some(name)→ bind with SO_BINDTODEVICE=name
+    let ifaces: Vec<Option<String>> = match &state.cfg.interface {
+        InterfaceFilter::All => vec![None],
+        InterfaceFilter::Only(names) => names.iter().map(|n| Some(n.clone())).collect(),
+        InterfaceFilter::Except(excluded) => {
+            let all = listener::list_interface_names();
+            let filtered: Vec<Option<String>> = all
+                .into_iter()
+                .filter(|n| !excluded.contains(n))
+                .map(Some)
+                .collect();
+            if filtered.is_empty() {
+                return Err(anyhow!(
+                    "interface filter excludes all available network interfaces; \
+                     no sockets will be created"
+                ));
+            }
+            filtered
+        }
+    };
+
     crate::log_info!("listening dns=[{}]", listeners_summary(&state.cfg));
     let mut set = tokio::task::JoinSet::new();
     for &ep in &state.cfg.bind {
-        if ep.udp {
-            let s = state.clone();
-            set.spawn(async move { listener::serve_udp(ep.addr, s).await });
-        }
-        if ep.tcp {
-            let s = state.clone();
-            set.spawn(async move { listener::serve_tcp(ep.addr, s).await });
+        for iface in &ifaces {
+            if ep.udp {
+                let s = state.clone();
+                let iface = iface.clone();
+                set.spawn(async move {
+                    listener::serve_udp(ep.addr, iface.as_deref(), s).await
+                });
+            }
+            if ep.tcp {
+                let s = state.clone();
+                let iface = iface.clone();
+                set.spawn(async move {
+                    listener::serve_tcp(ep.addr, iface.as_deref(), s).await
+                });
+            }
         }
     }
     // Return as soon as any listener exits (error or unexpected shutdown).

@@ -31,22 +31,34 @@ use tokio::task::JoinSet;
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
 /// Bind `worker_threads` SO_REUSEPORT UDP sockets and race them in a `JoinSet`.
-pub async fn serve_udp(bind: SocketAddr, state: Arc<AppState>) -> Result<()> {
+///
+/// `iface` — when `Some`, each socket is additionally bound to that network
+/// interface via `SO_BINDTODEVICE` so the kernel discards packets from other
+/// interfaces before they reach userspace.
+pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
     let buf_size = state.cfg.udp_buf_size;
     let n = state.cfg.worker_threads.max(1);
     let mut sockets = Vec::with_capacity(n);
     for _ in 0..n {
         sockets.push(Arc::new(
-            bind_udp_socket_reuse_port(bind, buf_size)
+            bind_udp_socket_reuse_port(bind, buf_size, iface)
                 .with_context(|| format!("failed to bind UDP on {bind}"))?,
         ));
     }
     let addr = sockets[0].local_addr()?;
     if n == 1 {
-        crate::startup!("listen udp://{}", addr);
+        if let Some(iface) = iface {
+            crate::startup!("listen udp://{} (iface={})", addr, iface);
+        } else {
+            crate::startup!("listen udp://{}", addr);
+        }
         return serve_udp_socket(sockets.remove(0), state).await;
     }
-    crate::startup!("listen udp://{} shards={}", addr, n);
+    if let Some(iface) = iface {
+        crate::startup!("listen udp://{} shards={} (iface={})", addr, n, iface);
+    } else {
+        crate::startup!("listen udp://{} shards={}", addr, n);
+    }
     let mut set = JoinSet::new();
     for socket in sockets {
         let s = state.clone();
@@ -60,21 +72,32 @@ pub async fn serve_udp(bind: SocketAddr, state: Arc<AppState>) -> Result<()> {
 }
 
 /// Bind `worker_threads` SO_REUSEPORT TCP listeners and race them in a `JoinSet`.
-pub async fn serve_tcp(bind: SocketAddr, state: Arc<AppState>) -> Result<()> {
+///
+/// `iface` — when `Some`, each listener socket is additionally bound to that
+/// network interface via `SO_BINDTODEVICE`.
+pub async fn serve_tcp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
     let n = state.cfg.worker_threads.max(1);
     let mut listeners = Vec::with_capacity(n);
     for _ in 0..n {
         listeners.push(Arc::new(
-            bind_tcp_listener_reuse_port(bind)
+            bind_tcp_listener_reuse_port(bind, iface)
                 .with_context(|| format!("failed to bind TCP on {bind}"))?,
         ));
     }
     let addr = listeners[0].local_addr()?;
     if n == 1 {
-        crate::startup!("listen tcp://{}", addr);
+        if let Some(iface) = iface {
+            crate::startup!("listen tcp://{} (iface={})", addr, iface);
+        } else {
+            crate::startup!("listen tcp://{}", addr);
+        }
         return serve_tcp_listener(listeners.remove(0), state).await;
     }
-    crate::startup!("listen tcp://{} shards={}", addr, n);
+    if let Some(iface) = iface {
+        crate::startup!("listen tcp://{} shards={} (iface={})", addr, n, iface);
+    } else {
+        crate::startup!("listen tcp://{} shards={}", addr, n);
+    }
     let mut set = JoinSet::new();
     for listener in listeners {
         let s = state.clone();
@@ -254,8 +277,12 @@ async fn write_tcp_response(stream: &mut TcpStream, resp: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn bind_udp_socket_reuse_port(addr: SocketAddr, buf_size: usize) -> Result<UdpSocket> {
-    let fd = create_reuse_port_socket(addr, libc::SOCK_DGRAM)?;
+fn bind_udp_socket_reuse_port(
+    addr: SocketAddr,
+    buf_size: usize,
+    iface: Option<&str>,
+) -> Result<UdpSocket> {
+    let fd = create_reuse_port_socket(addr, libc::SOCK_DGRAM, iface)?;
     bind_raw_socket(fd, addr)?;
     set_raw_socket_buf_size(fd, buf_size);
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
@@ -268,11 +295,11 @@ fn bind_udp_socket_reuse_port(addr: SocketAddr, buf_size: usize) -> Result<UdpSo
 /// `["0.0.0.0:8080", "[::]:8080"]` never conflicts on systems where
 /// net.ipv6.bindv6only is 0.
 pub fn bind_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
-    bind_tcp_listener_reuse_port(addr)
+    bind_tcp_listener_reuse_port(addr, None)
 }
 
-fn bind_tcp_listener_reuse_port(addr: SocketAddr) -> Result<TcpListener> {
-    let fd = create_reuse_port_socket(addr, libc::SOCK_STREAM)?;
+fn bind_tcp_listener_reuse_port(addr: SocketAddr, iface: Option<&str>) -> Result<TcpListener> {
+    let fd = create_reuse_port_socket(addr, libc::SOCK_STREAM, iface)?;
     bind_raw_socket(fd, addr)?;
     let backlog = 1024;
     if unsafe { libc::listen(fd, backlog) } < 0 {
@@ -285,7 +312,11 @@ fn bind_tcp_listener_reuse_port(addr: SocketAddr) -> Result<TcpListener> {
     TcpListener::from_std(listener).map_err(Into::into)
 }
 
-fn create_reuse_port_socket(addr: SocketAddr, ty: libc::c_int) -> Result<libc::c_int> {
+fn create_reuse_port_socket(
+    addr: SocketAddr,
+    ty: libc::c_int,
+    iface: Option<&str>,
+) -> Result<libc::c_int> {
     let domain = if addr.is_ipv6() {
         libc::AF_INET6
     } else {
@@ -335,7 +366,73 @@ fn create_reuse_port_socket(addr: SocketAddr, ty: libc::c_int) -> Result<libc::c
         unsafe { libc::close(fd) };
         return Err(err).context("failed to set IPV6_V6ONLY");
     }
+    if let Some(name) = iface {
+        if let Err(e) = set_bindtodevice(fd, name) {
+            unsafe { libc::close(fd) };
+            return Err(e).with_context(|| {
+                format!("failed to bind socket to interface {name:?} (requires root or CAP_NET_RAW)")
+            });
+        }
+    }
     Ok(fd)
+}
+
+/// Apply `SO_BINDTODEVICE` to restrict the socket to a specific network interface.
+/// Requires `CAP_NET_RAW` or root privileges.
+fn set_bindtodevice(fd: libc::c_int, iface: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let name_cstr = std::ffi::CString::new(iface)
+            .map_err(|_| std::io::Error::other("interface name contains null byte"))?;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name_cstr.as_ptr() as *const libc::c_void,
+                name_cstr.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, iface);
+        Err(std::io::Error::other(
+            "SO_BINDTODEVICE is only available on Linux",
+        ))
+    }
+}
+
+/// Enumerate all network interface names present on this host.
+/// Used to resolve `InterfaceFilter::Except` at startup.
+pub fn list_interface_names() -> Vec<String> {
+    let mut names = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return names;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = ifap;
+        while !cursor.is_null() {
+            let ifa = &*cursor;
+            if !ifa.ifa_name.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                if seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+            cursor = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    names
 }
 
 fn bind_raw_socket(fd: libc::c_int, addr: SocketAddr) -> Result<()> {
