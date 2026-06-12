@@ -732,7 +732,15 @@ impl DnsCache {
 
             let remaining = expire_unix.saturating_sub(now_unix);
             let age_secs = (raw_ttl as u64).saturating_sub(remaining);
-            let inserted = now_instant - Duration::from_secs(age_secs);
+            // On embedded targets (e.g. OpenWrt) Instant is CLOCK_MONOTONIC and resets
+            // on reboot.  If age_secs exceeds the system uptime, checked_sub underflows.
+            // Re-anchor the entry: treat it as just-inserted with its wall-clock remaining
+            // TTL as the nominal TTL.  All freshness/stale/refresh maths stay correct.
+            let (inserted, ttl_for_entry) =
+                match now_instant.checked_sub(Duration::from_secs(age_secs)) {
+                    Some(t) => (t, raw_ttl),
+                    None => (now_instant, remaining.min(raw_ttl as u64) as u32),
+                };
             let stale_remaining = stale_until_unix.saturating_sub(now_unix);
             let stale_until = now_instant + Duration::from_secs(stale_remaining);
 
@@ -748,7 +756,7 @@ impl DnsCache {
                 query: Bytes::from(query),
                 qname,
                 inserted,
-                ttl: raw_ttl,
+                ttl: ttl_for_entry,
                 stale_until,
                 ttl_offsets: Arc::from(offsets.as_slice()),
                 max_ttl: entry_max_ttl,

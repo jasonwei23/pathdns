@@ -115,15 +115,16 @@ impl DoQUpstream {
 
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
         let mut pkt = raw.to_vec();
-        let upstream_id = mix16(self.next_id.fetch_add(1, Ordering::Relaxed));
-        dns::set_id(&mut pkt, upstream_id)?;
+        // RFC 9250 §4.2.1: the DNS Message ID on a DoQ stream MUST be 0.
+        // Servers (AdGuard Home, dnsdist, …) may send DOQ_PROTOCOL_ERROR for non-zero IDs.
+        dns::set_id(&mut pkt, 0)?;
 
         let result = self.do_exchange(&pkt).await;
         if result.is_err() {
             *self.connection.lock().await = None;
         }
         let mut body = result?;
-        super::validate_upstream_response(&body, upstream_id, &req.question)
+        super::validate_upstream_response(&body, 0, &req.question)
             .map_err(|e| anyhow!("upstream {}: DoQ {e}", self.name))?;
         dns::set_id(&mut body, req.client_id)?;
         Ok(Bytes::from(body))

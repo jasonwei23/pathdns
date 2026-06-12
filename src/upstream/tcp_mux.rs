@@ -264,14 +264,34 @@ async fn mux_reader_loop(
             return;
         }
 
-        // Length prefix read with timeout. An upstream that sends the 2-byte header then
-        // stalls (half-frame deadlock) would otherwise hold the connection open indefinitely
-        // while all per-query timeouts fire but the connection is never torn down.
+        // Length-prefix read: idle vs active connections are treated differently.
+        //
+        // When no queries are in flight the connection is idle.  Applying a
+        // read timeout here would tear down the connection after `read_timeout`
+        // seconds of silence, defeating the purpose of a persistent mux.  We
+        // therefore wait for the first byte without any timeout.
+        //
+        // Once the first byte of the 2-byte length header has arrived, a frame
+        // is in progress.  We then apply the read timeout to the rest so that an
+        // upstream that sends the header and then stalls (half-frame deadlock)
+        // cannot hold the connection open indefinitely.
         let mut len_buf = [0u8; 2];
-        let len_ok = matches!(
-            tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await,
-            Ok(Ok(_))
-        );
+        let len_ok = if pending.is_empty() {
+            // Idle path: no timeout on the first byte.
+            match reader.read_exact(&mut len_buf[..1]).await {
+                Ok(_) => matches!(
+                    tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf[1..])).await,
+                    Ok(Ok(_))
+                ),
+                Err(_) => false,
+            }
+        } else {
+            // Active path: full 2-byte read under timeout.
+            matches!(
+                tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await,
+                Ok(Ok(_))
+            )
+        };
         if !len_ok {
             disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;

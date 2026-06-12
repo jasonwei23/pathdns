@@ -449,9 +449,7 @@ fn try_stale(
     ck: &CacheKey,
     query: &[u8],
     info: &dns::QueryInfo,
-    _group_name: &str,
     started: Instant,
-    _reason: &str,
     count_client_stats: bool,
 ) -> Option<Bytes> {
     let stale = serve_stale(state, ck, query, info)?;
@@ -721,12 +719,10 @@ async fn exchange_with_dedupe(
             if !skip_cache && dns::rcode(&resp) == 2 {
                 if let Some(stale) = try_stale(
                     state,
-                    &ck,
+                    &sf_ck,
                     &query_for_cache,
                     &ctx.info,
-                    group_name,
                     started,
-                    "servfail",
                     ctx.client().is_some(),
                 ) {
                     let elapsed = started.elapsed().as_micros() as u64;
@@ -817,12 +813,10 @@ async fn exchange_with_dedupe(
             if !skip_cache {
                 if let Some(stale) = try_stale(
                     state,
-                    &ck,
+                    &sf_ck,
                     &query_for_cache,
                     &ctx.info,
-                    group_name,
                     started,
-                    "upstream_error",
                     ctx.client().is_some(),
                 ) {
                     let elapsed = started.elapsed().as_micros() as u64;

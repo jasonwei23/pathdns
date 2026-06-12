@@ -149,6 +149,11 @@ impl InflightRegistry {
         Completion::NoWaiter
     }
 
+    /// Returns `true` when no queries are currently in flight.
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Drop all pending entries; waiters observe a closed channel.
     /// Used by connection-oriented transports when the connection dies.
     pub(super) fn clear(&self) {
