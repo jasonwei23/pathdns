@@ -84,12 +84,11 @@ impl TcpMux {
                 let tls =
                     tokio::time::timeout(self.timeout, connector.connect(server_name.clone(), tcp))
                         .await
-                        .map_err(|_| {
-                            anyhow!(
+                        .map_err(|e| {
+                            anyhow::Error::from(e).context(format!(
                                 "upstream {} tls handshake timeout: {}",
-                                self.name,
-                                self.remote
-                            )
+                                self.name, self.remote
+                            ))
                         })?
                         .with_context(|| {
                             format!(
@@ -196,10 +195,11 @@ impl TcpMux {
         .await;
 
         match write_result {
-            Err(_elapsed) => {
+            Err(elapsed) => {
                 // Write timed out; drop the connection.
                 *self.write_half.lock().await = None;
-                return Err(anyhow!("upstream {} tcp write timeout", self.name));
+                return Err(anyhow::Error::from(elapsed)
+                    .context(format!("upstream {} tcp write timeout", self.name)));
             }
             Ok(Err(e)) => {
                 *self.write_half.lock().await = None;
@@ -226,7 +226,8 @@ impl TcpMux {
                 "upstream {} tcp response channel closed",
                 self.name
             )),
-            Err(_elapsed) => Err(anyhow!("upstream {} tcp timeout", self.name)),
+            Err(elapsed) => Err(anyhow::Error::from(elapsed)
+                .context(format!("upstream {} tcp timeout", self.name))),
         }
     }
 }

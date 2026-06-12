@@ -86,10 +86,11 @@ fn band_limit(best: u64) -> u64 {
 }
 
 pub(super) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    // Use a process-start Instant as epoch so penalty windows are immune to NTP jumps.
+    // On OpenWrt (CLOCK_MONOTONIC resets on reboot), this is always monotonic within a
+    // single process run, which is all we need.
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Seed the upstream query-ID counter from the current time.
@@ -813,7 +814,9 @@ impl UpstreamNode {
                 }
             }
             Err(err) => {
-                let is_timeout = err.to_string().contains("timeout");
+                let is_timeout = err
+                    .chain()
+                    .any(|e| e.downcast_ref::<tokio::time::error::Elapsed>().is_some());
                 let n = self.health.record_failure(is_timeout);
                 if is_timeout {
                     self.stats.record_timeout();

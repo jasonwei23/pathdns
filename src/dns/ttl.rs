@@ -2,7 +2,9 @@ use smallvec::SmallVec;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// `(byte_offset_of_ttl_field, original_clamped_ttl)` pairs collected from all RR sections.
-pub type TtlOffsets = SmallVec<[(usize, u32); 8]>;
+/// Offsets fit in u32 since DNS packets are at most 65 535 bytes; halves the per-pair size
+/// vs `(usize, u32)` on 64-bit targets (8 bytes instead of 16).
+pub type TtlOffsets = SmallVec<[(u32, u32); 8]>;
 
 pub fn rcode(packet: &[u8]) -> u8 {
     if packet.len() < 4 {
@@ -130,9 +132,10 @@ pub fn effective_ttl_and_offsets(
 
 /// Patch each RR's TTL field to `original_clamped_ttl − elapsed_secs` (per-RR countdown).
 /// Used for fresh cache entries so clients see an accurate remaining-lifetime for every RR.
-pub fn patch_ttls_at(packet: &mut [u8], offsets: &[(usize, u32)], elapsed: u32) {
+pub fn patch_ttls_at(packet: &mut [u8], offsets: &[(u32, u32)], elapsed: u32) {
     for &(offset, original_ttl) in offsets {
         let remaining = original_ttl.saturating_sub(elapsed);
+        let offset = offset as usize;
         if offset + 4 <= packet.len() {
             packet[offset..offset + 4].copy_from_slice(&remaining.to_be_bytes());
         }
@@ -141,9 +144,10 @@ pub fn patch_ttls_at(packet: &mut [u8], offsets: &[(usize, u32)], elapsed: u32) 
 
 /// Patch all RR TTL fields to the same uniform value.
 /// Used for stale entries (where `ttl` is the stale-advertised value) and synthetic responses.
-pub fn patch_ttls_uniform(packet: &mut [u8], offsets: &[(usize, u32)], ttl: u32) {
+pub fn patch_ttls_uniform(packet: &mut [u8], offsets: &[(u32, u32)], ttl: u32) {
     let ttl_bytes = ttl.to_be_bytes();
     for &(offset, _) in offsets {
+        let offset = offset as usize;
         if offset + 4 <= packet.len() {
             packet[offset..offset + 4].copy_from_slice(&ttl_bytes);
         }
@@ -195,7 +199,7 @@ fn ttl_offsets_and_soa(
 
         // OPT (type 41): its TTL field encodes EDNS version + extended RCODE, not a real TTL.
         if rr_type != 41 {
-            offsets.push((fixed + 4, rr_ttl));
+            offsets.push(((fixed + 4) as u32, rr_ttl));
             if i < an {
                 an_offsets += 1;
             }

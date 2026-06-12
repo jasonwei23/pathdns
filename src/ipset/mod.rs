@@ -32,9 +32,23 @@ use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+#[cfg(target_os = "linux")]
 use std::sync::{mpsc, Mutex};
 #[cfg(target_os = "linux")]
 use worker::{spawn_add_worker, AddJob};
+
+#[cfg(target_os = "linux")]
+/// Fixed-index warning categories for `warn_once`.  Using an enum-indexed array
+/// instead of a `HashSet<String>` prevents the warned-set from growing without bound.
+#[derive(Clone, Copy)]
+enum WarnKind {
+    AddQueueFull = 0,
+    AddWorkerExited = 1,
+    TestNetlink = 2,
+}
+#[cfg(target_os = "linux")]
+const WARN_KIND_COUNT: usize = 3;
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -45,7 +59,10 @@ pub struct IpSetManager {
     /// NftSet entries (with mask) that carry the `NFT_SET_INTERVAL` kernel flag.
     /// Looked up at startup; controls whether adds are written as prefix ranges.
     interval_nft_sets: HashSet<SetName>,
-    warned: Mutex<HashSet<String>>,
+    /// Per-category once-flag; avoids log spam without unbounded string growth.
+    warned: [std::sync::atomic::AtomicBool; WARN_KIND_COUNT],
+    /// Count of IPs dropped when the add queue was full.
+    dropped_count: AtomicU64,
     client: Mutex<NetfilterClient>,
     add_tx: Option<mpsc::SyncSender<AddJob>>,
 }
@@ -102,7 +119,8 @@ impl IpSetManager {
             add_groups,
             blacklist: cfg.blacklist,
             interval_nft_sets,
-            warned: Mutex::new(HashSet::new()),
+            warned: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+            dropped_count: AtomicU64::new(0),
             client: Mutex::new(netfilter_client),
             add_tx,
         })
@@ -131,7 +149,7 @@ impl IpSetManager {
                     // No set configured for this address family; skip.
                 }
                 Err(err) => {
-                    self.warn_once("test", err);
+                    self.warn_once(WarnKind::TestNetlink, err);
                     verdict = TestVerdict::OtherCase;
                     break;
                 }
@@ -190,36 +208,35 @@ impl IpSetManager {
                 interval,
             }) {
                 Ok(()) => {}
-                Err(e) => {
-                    let msg = if matches!(e, mpsc::TrySendError::Full(_)) {
-                        "ipset/nftset add queue is full; falling back to sync add"
-                    } else {
-                        "ipset/nftset add worker exited; falling back to sync add"
-                    };
-                    self.warn_once("add", anyhow!("{msg}"));
-                    match self.client.lock() {
-                        Ok(mut c) => {
-                            if let Err(err) = c.add_many(set, &[*ip], interval) {
-                                self.warn_once("add", err);
-                            }
-                        }
-                        Err(_) => {
-                            self.warn_once("add", anyhow!("netlink client lock poisoned"));
-                        }
-                    }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    let dropped = self.dropped_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    self.warn_once(
+                        WarnKind::AddQueueFull,
+                        anyhow!("ipset/nftset add queue is full; {dropped} IPs dropped so far"),
+                    );
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.warn_once(
+                        WarnKind::AddWorkerExited,
+                        anyhow!("ipset/nftset add worker exited; IPs will not be added"),
+                    );
                 }
             }
         }
     }
 
-    fn warn_once(&self, op: &str, err: anyhow::Error) {
-        let key = format!("{op}: {err:#}");
-        let Ok(mut warned) = self.warned.lock() else {
-            crate::log_error!("netlink op={} status=failed error={err:#}", op);
-            return;
-        };
-        if warned.insert(key) {
-            crate::log_error!("netlink op={} status=failed error={err:#}", op);
+    fn warn_once(&self, kind: WarnKind, err: anyhow::Error) {
+        let slot = &self.warned[kind as usize];
+        if slot
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            crate::log_error!("netlink status=failed error={err:#}");
         }
     }
 }

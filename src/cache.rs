@@ -114,15 +114,19 @@ fn cache_key_impl(query: &[u8], question_end: usize, strip_ecs: bool) -> CacheKe
 
 #[derive(Debug)]
 struct Entry {
-    question: Arc<[u8]>,
     packet: Bytes,
     query: Bytes,
     qname: Arc<str>,
+    /// Byte offset of the first byte past the question section in `query`.
+    /// Stored instead of a separate question copy: saves one Arc + data allocation per entry.
+    question_end: usize,
     inserted: Instant,
     /// Effective TTL (clamped by per-group or global min/max at write time).
     ttl: u32,
     stale_until: Instant,
-    ttl_offsets: Arc<[(usize, u32)]>,
+    /// Per-RR `(ttl_byte_offset_in_packet, original_clamped_ttl)` pairs.
+    /// u32 offsets fit DNS packets (≤ 65535 bytes) and halve per-pair size vs (usize, u32).
+    ttl_offsets: Arc<[(u32, u32)]>,
     /// Per-entry effective max TTL — used only to cap the stale advertised TTL.
     max_ttl: u32,
     /// Effective stale TTL advertised to clients when stale_ttl_reset is true.
@@ -369,13 +373,12 @@ impl DnsCache {
         // Do NOT patch TTLs at write time; they are patched at read time with remaining TTL.
         let now = Instant::now();
         let stale_until = now + Duration::from_secs(raw_ttl as u64 + policy.stale_expire_ttl);
-        let question: Arc<[u8]> = Arc::from(&ins.query[12..ins.question_end]);
         let frozen_packet = packet.freeze();
         let entry = Arc::new(Entry {
-            question: question.clone(),
             packet: frozen_packet,
             query: Bytes::copy_from_slice(ins.query),
             qname: ins.qname,
+            question_end: ins.question_end,
             inserted: now,
             ttl: raw_ttl,
             stale_until,
@@ -565,10 +568,9 @@ impl DnsCache {
                 .refresh_min_ttl
                 .is_some_and(|min| min > 0 && remaining <= min);
         if needs_refresh {
-            let q = &entry.question;
-            let question_end = 12 + q.len();
-            let qtype = if q.len() >= 4 {
-                u16::from_be_bytes([q[q.len() - 4], q[q.len() - 3]])
+            let question_end = entry.question_end;
+            let qtype = if question_end >= 16 && question_end <= entry.query.len() {
+                u16::from_be_bytes([entry.query[question_end - 4], entry.query[question_end - 3]])
             } else {
                 1
             };
@@ -637,7 +639,10 @@ impl DnsCache {
                 w.write_all(&stale_until_unix.to_le_bytes())?;
                 w.write_all(&entry.ttl.to_le_bytes())?;
 
-                let question: &[u8] = &entry.question;
+                let question = entry
+                    .query
+                    .get(12..entry.question_end)
+                    .unwrap_or_default();
                 w.write_all(&(question.len() as u32).to_le_bytes())?;
                 w.write_all(question)?;
 
@@ -651,10 +656,10 @@ impl DnsCache {
                 w.write_all(&(qname.len() as u32).to_le_bytes())?;
                 w.write_all(qname)?;
 
-                let offsets: &[(usize, u32)] = &entry.ttl_offsets;
+                let offsets: &[(u32, u32)] = &entry.ttl_offsets;
                 w.write_all(&(offsets.len() as u32).to_le_bytes())?;
                 for &(off, original_ttl) in offsets {
-                    w.write_all(&(off as u32).to_le_bytes())?;
+                    w.write_all(&off.to_le_bytes())?;
                     w.write_all(&original_ttl.to_le_bytes())?;
                 }
 
@@ -712,9 +717,9 @@ impl DnsCache {
             let query = read_bytes(&mut r)?;
             let qname_bytes = read_bytes(&mut r)?;
             let offsets_count = read_u32(&mut r)? as usize;
-            let mut offsets: Vec<(usize, u32)> = Vec::with_capacity(offsets_count);
+            let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(offsets_count);
             for _ in 0..offsets_count {
-                let off = read_u32(&mut r)? as usize;
+                let off = read_u32(&mut r)?;
                 let original_ttl = read_u32(&mut r)?;
                 offsets.push((off, original_ttl));
             }
@@ -749,12 +754,12 @@ impl DnsCache {
                 Err(_) => continue,
             };
 
-            let question_arc: Arc<[u8]> = Arc::from(question.as_slice());
+            let question_end = 12 + question.len();
             let entry = Arc::new(Entry {
-                question: question_arc.clone(),
                 packet: Bytes::from(packet),
                 query: Bytes::from(query),
                 qname,
+                question_end,
                 inserted,
                 ttl: ttl_for_entry,
                 stale_until,

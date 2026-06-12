@@ -133,7 +133,8 @@ impl UdpUpstream {
                 Ok(resp)
             }
             Ok(Err(_closed)) => Err(anyhow!("upstream {} response channel closed", self.name)),
-            Err(_elapsed) => Err(anyhow!("upstream {} timeout: {}", self.name, self.remote)),
+            Err(elapsed) => Err(anyhow::Error::from(elapsed)
+                .context(format!("upstream {} timeout: {}", self.name, self.remote))),
         }
     }
 

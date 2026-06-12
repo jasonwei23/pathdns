@@ -76,7 +76,7 @@ impl DoHUpstream {
                 .send(),
         )
         .await
-        .map_err(|_| anyhow!("upstream {}: DoH timeout", self.name))?
+        .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: DoH timeout", self.name)))?
         .map_err(|e| anyhow!("upstream {}: DoH request failed: {e}", self.name))?;
 
         if !response.status().is_success() {
@@ -89,7 +89,7 @@ impl DoHUpstream {
 
         let body = tokio::time::timeout(self.timeout, response.bytes())
             .await
-            .map_err(|_| anyhow!("upstream {}: DoH body read timeout", self.name))?
+            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: DoH body read timeout", self.name)))?
             .map_err(|e| anyhow!("upstream {}: DoH body read: {e}", self.name))?;
 
         if body.len() > 65_535 {

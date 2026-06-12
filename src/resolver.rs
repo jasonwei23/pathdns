@@ -789,6 +789,11 @@ async fn exchange_with_dedupe(
                     group_id,
                 );
             }
+            // Restore canonical QNAME case before sending to this client and publishing
+            // to singleflight waiters (strips upstream 0x20 case mixing).
+            let mut resp_mut = BytesMut::from(resp.as_ref());
+            resp_mut[12..ctx.info.question_end].copy_from_slice(ctx.question());
+            let resp = resp_mut.freeze();
             singleflight::publish_bytes(&state.remote_inflight, &sf_ck, resp.clone());
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(&ctx, state, elapsed);
@@ -1042,12 +1047,13 @@ async fn resolve_none_group_with_ipset(
         };
     }
 
+    // Await primary first; only start secondary when the verdict requires it.
+    // This avoids the wasted upstream query on the common PrimaryIp path.
     let primary_packet = packet.clone();
     let secondary_packet = packet;
-    let (primary_resp, secondary_resp) = tokio::join!(
-        primary_upstream.exchange_observed(primary_packet, info.id, client_proto, count_hedge),
-        secondary_upstream.exchange_observed(secondary_packet, info.id, client_proto, count_hedge)
-    );
+    let primary_resp = primary_upstream
+        .exchange_observed(primary_packet, info.id, client_proto, count_hedge)
+        .await;
 
     match primary_resp {
         Ok(resp) => {
@@ -1062,19 +1068,26 @@ async fn resolve_none_group_with_ipset(
                     state.verdict_cache.add(&info.qname, true);
                     Ok(resp)
                 }
-                TestVerdict::SecondaryIp => {
-                    state.verdict_cache.add(&info.qname, false);
-                    secondary_resp.or(Ok(resp))
-                }
                 TestVerdict::NoIpFound if noip_as_primary => Ok(resp),
-                TestVerdict::NoIpFound | TestVerdict::OtherCase => secondary_resp.or(Ok(resp)),
+                verdict => {
+                    if matches!(verdict, TestVerdict::SecondaryIp) {
+                        state.verdict_cache.add(&info.qname, false);
+                    }
+                    secondary_upstream
+                        .exchange_observed(secondary_packet, info.id, client_proto, count_hedge)
+                        .await
+                        .or(Ok(resp))
+                }
             }
         }
-        Err(primary_err) => secondary_resp.map_err(|secondary_err| {
-            anyhow!(
-                "primary upstream failed: {primary_err:#}; secondary upstream failed: {secondary_err:#}"
-            )
-        }),
+        Err(primary_err) => secondary_upstream
+            .exchange_observed(secondary_packet, info.id, client_proto, count_hedge)
+            .await
+            .map_err(|secondary_err| {
+                anyhow!(
+                    "primary upstream failed: {primary_err:#}; secondary upstream failed: {secondary_err:#}"
+                )
+            }),
     }
 }
 

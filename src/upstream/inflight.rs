@@ -143,7 +143,7 @@ impl InflightRegistry {
         drop(entry); // release shared ref before taking ownership
         if let Some((_, entry)) = self.entries.remove(&id) {
             let _ = dns::set_id(&mut buf[..len], entry.client_id);
-            let _ = entry.tx.send(buf.split_to(len).freeze());
+            let _ = entry.tx.send(Bytes::copy_from_slice(&buf[..len]));
             return Completion::Delivered;
         }
         Completion::NoWaiter
