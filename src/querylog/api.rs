@@ -7,8 +7,8 @@
 //!   GET  /api/stats/buckets       → StatsRing data divided into equal time buckets (?seconds=&buckets=)
 //!   GET  /api/querylog            → paginated events from ring (?limit=&before_seq=&q=)
 //!   DELETE /api/querylog          → clear ring buffer
-//!   GET  /api/querylog/files      → list compressed historical segments
-//!   GET  /api/querylog/history    → decode a historical segment (?file=name&limit=&q=)
+//!   GET  /api/querylog/files      → list historical segments and metadata
+//!   GET  /api/querylog/history    → paginated historical query
 //!   GET  /api/upstreams           → per-node stats snapshot
 
 use super::{QpsRing, QueryLogHandle};
@@ -16,12 +16,15 @@ use crate::querylog::ring::{EventRing, StatsRing};
 use crate::querylog::worker::micros_to_rfc3339;
 use crate::server::AppState;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 static DASHBOARD_HTML: &str = include_str!("page.html");
+/// One concurrent history query at a time — keeps memory and CPU predictable
+/// on router-class hardware.
+static HISTORY_QUERY_GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 pub async fn serve(
     listener: TcpListener,
@@ -246,7 +249,7 @@ async fn dispatch(
             ("204 No Content", vec![], "application/json")
         }
 
-        // List available compressed historical segments.
+        // List available historical segments and their index metadata.
         ("GET", "/api/querylog/files") => {
             let dir = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone());
             match dir {
@@ -261,23 +264,29 @@ async fn dispatch(
                     .await
                     .unwrap_or_default();
 
-                    let json_list: Vec<serde_json::Value> = result
-                        .into_iter()
-                        .map(|(name, size)| serde_json::json!({"name": name, "size_bytes": size}))
-                        .collect();
-                    let body = serde_json::to_vec(&json_list).unwrap_or_default();
+                    let body = serde_json::to_vec(&result).unwrap_or_default();
                     ("200 OK", body, "application/json")
                 }
             }
         }
 
-        // Decode a specific historical segment and return its events as JSON.
+        // Paginated historical segment reader.
         ("GET", "/api/querylog/history") => {
             let file_name = parse_query_param(&req.query, "file").unwrap_or_default();
             let limit = parse_query_param(&req.query, "limit")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1000);
-            let filter = parse_query_param(&req.query, "q");
+                .unwrap_or(100)
+                .clamp(1, 200);
+            let cursor =
+                parse_query_param(&req.query, "cursor").and_then(|v| v.parse::<u64>().ok());
+            let from_micros =
+                parse_query_param(&req.query, "from").and_then(|v| v.parse::<u64>().ok());
+            let to_micros =
+                parse_query_param(&req.query, "to").and_then(|v| v.parse::<u64>().ok());
+            let qname = parse_query_param(&req.query, "q");
+            let rcode =
+                parse_query_param(&req.query, "rcode").and_then(|v| v.parse::<u8>().ok());
+            let source = parse_query_param(&req.query, "source");
 
             let Some(dir) = state.cfg.querylog.file.as_ref().map(|f| f.dir.clone()) else {
                 return (
@@ -295,15 +304,35 @@ async fn dispatch(
                 );
             }
 
+            let gate = HISTORY_QUERY_GATE.get_or_init(|| tokio::sync::Semaphore::new(1));
+            let Ok(Ok(_permit)) =
+                tokio::time::timeout(Duration::from_secs(2), gate.acquire()).await
+            else {
+                return (
+                    "503 Service Unavailable",
+                    br#"{"error":"history query busy"}"#.to_vec(),
+                    "application/json",
+                );
+            };
+
             let path = dir.join(&file_name);
+            let query = crate::querylog::worker::HistoryQuery {
+                limit,
+                cursor,
+                from_micros,
+                to_micros,
+                qname,
+                rcode,
+                source,
+            };
             let result = tokio::task::spawn_blocking(move || {
-                crate::querylog::worker::read_history_file(&path, limit, filter.as_deref())
+                crate::querylog::worker::read_history_page(&path, &query)
             })
             .await;
 
             match result {
-                Ok(Ok(events)) => {
-                    let body = render_history_events(&events);
+                Ok(Ok(page)) => {
+                    let body = render_history_page(&page);
                     ("200 OK", body, "application/json")
                 }
                 _ => (
@@ -509,11 +538,12 @@ fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8
     serde_json::to_vec(&values).unwrap_or_default()
 }
 
-/// Render decoded history events using the same JSON shape as the live ring
+/// Render a history page using the same event JSON shape as the live ring
 /// (notably `time` as RFC3339 rather than raw `unix_micros`) so the dashboard
 /// can render live and archive events through one code path.
-fn render_history_events(events: &[super::DecodedEvent]) -> Vec<u8> {
-    let values: Vec<_> = events
+fn render_history_page(page: &crate::querylog::worker::HistoryPage) -> Vec<u8> {
+    let values: Vec<_> = page
+        .events
         .iter()
         .map(|ev| {
             serde_json::json!({
@@ -532,7 +562,16 @@ fn render_history_events(events: &[super::DecodedEvent]) -> Vec<u8> {
             })
         })
         .collect();
-    serde_json::to_vec(&values).unwrap_or_default()
+    serde_json::to_vec(&serde_json::json!({
+        "items": values,
+        "total_entries": page.total_entries,
+        "start_time": page.start_micros.map(micros_to_rfc3339),
+        "end_time": page.end_micros.map(micros_to_rfc3339),
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "indexed": page.indexed,
+    }))
+    .unwrap_or_default()
 }
 
 fn render_upstreams(state: &AppState) -> Vec<u8> {

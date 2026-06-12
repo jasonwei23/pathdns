@@ -118,6 +118,11 @@ tr:last-child td{border-bottom:none}
 .chip.chip-warn.active{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.4);color:var(--red)}
 .chip.chip-src.active{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.4);color:var(--blue)}
 .arch-count{font-size:11px;color:var(--text2);margin-bottom:8px}
+.archive-controls{display:none;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.archive-controls input{padding:7px 9px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;border-radius:7px;outline:none}
+.archive-controls input:focus{border-color:var(--accent)}
+.archive-pager{display:none;align-items:center;justify-content:center;gap:10px;margin-top:14px}
+.archive-page-label{font-size:12px;color:var(--text2);min-width:64px;text-align:center}
 
 /* Section label */
 .section-label{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;margin-top:4px}
@@ -345,6 +350,14 @@ tr:last-child td{border-bottom:none}
 
       <!-- Archive file picker -->
       <div id="file-picker" class="file-picker" style="display:none"></div>
+      <div id="archive-controls" class="archive-controls">
+        <span style="font-size:11px;color:var(--text2)">From</span>
+        <input id="arch-from" type="datetime-local" step="1">
+        <span style="font-size:11px;color:var(--text2)">To</span>
+        <input id="arch-to" type="datetime-local" step="1">
+        <button class="btn" onclick="resetArchiveQuery()">Search</button>
+        <button class="btn" onclick="clearArchiveTime()">Reset time</button>
+      </div>
       <div id="arch-count" class="arch-count" style="display:none"></div>
 
       <div style="overflow-x:auto">
@@ -359,6 +372,11 @@ tr:last-child td{border-bottom:none}
       </div>
       <div class="more-btn-wrap">
         <button class="btn" id="ql-more" onclick="loadMore()" style="display:none">Load more</button>
+      </div>
+      <div id="archive-pager" class="archive-pager">
+        <button class="btn" id="arch-prev" onclick="archivePrev()">Previous</button>
+        <span id="arch-page-label" class="archive-page-label">Page 1</span>
+        <button class="btn" id="arch-next" onclick="archiveNext()">Next</button>
       </div>
     </div>
   </div>
@@ -382,8 +400,12 @@ let qlEvents = [];
 let qlBeforeSeq = null;
 let archFiles = [];
 let archFile = null;
-let archAllEvents = [];
-let archShowCount = 200;
+let archEvents = [];
+let archCursor = null;
+let archNextCursor = null;
+let archCursorStack = [];
+let archPage = 1;
+let archMeta = null;
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -670,6 +692,9 @@ function switchMode(mode) {
   document.getElementById('ql-clear-btn').style.display = isArchive ? 'none' : '';
   document.getElementById('ql-auto-label').style.display = isArchive ? 'none' : '';
   document.getElementById('arch-count').style.display = isArchive ? 'block' : 'none';
+  document.getElementById('archive-controls').style.display = isArchive ? 'flex' : 'none';
+  document.getElementById('archive-pager').style.display = isArchive ? 'flex' : 'none';
+  document.getElementById('ql-more').style.display = isArchive ? 'none' : document.getElementById('ql-more').style.display;
 
   if (isArchive) {
     clearInterval(autoRefreshTimer); autoRefreshTimer = null;
@@ -732,6 +757,17 @@ function formatDateTime(date) {
   return dp + ' ' + p(date.getHours()) + ':' + p(date.getMinutes());
 }
 
+function dateFromMicros(micros) {
+  return micros ? new Date(Number(micros) / 1000) : null;
+}
+
+function localInputMicros(id) {
+  const value = document.getElementById(id).value;
+  if (!value) return null;
+  const millis = new Date(value).getTime();
+  return Number.isFinite(millis) ? Math.trunc(millis * 1000) : null;
+}
+
 function fmtBytes(n) {
   if (!n) return '—';
   if (n >= 1024*1024) return (n/1024/1024).toFixed(1)+' MB';
@@ -746,7 +782,7 @@ async function loadArchiveFiles() {
   if (!r) { picker.innerHTML = '<div class="file-picker-empty">Failed to load files</div>'; return; }
   const raw = await r.json();
   archFiles = raw
-    .map(f => ({...f, time: parseFileTime(f.name)}))
+    .map(f => ({...f, time: dateFromMicros(f.start_micros) || parseFileTime(f.name)}))
     .sort((a,b) => (b.time||0) - (a.time||0));
   renderFilePicker();
   if (archFiles.length > 0) selectArchiveFile(archFiles[0].name);
@@ -764,13 +800,17 @@ function renderFilePicker() {
     const div = document.createElement('div');
     div.className = 'file-item' + (f.name === archFile ? ' selected' : '');
     div.onclick = () => selectArchiveFile(f.name);
-    const startStr = formatDateTime(f.time);
-    const endTime = i === 0 ? new Date() : archFiles[i-1].time;
+    const startTime = dateFromMicros(f.start_micros) || f.time;
+    const endTime = dateFromMicros(f.end_micros) || (i === 0 ? new Date() : archFiles[i-1].time);
+    const startStr = formatDateTime(startTime);
     const endStr = formatDateTime(endTime);
-    const rangeStr = f.time ? startStr + '  →  ' + endStr : f.name;
+    const rangeStr = startTime ? startStr + '  →  ' + endStr : f.name;
+    const countStr = f.total_entries === null || f.total_entries === undefined
+      ? 'legacy · count unavailable'
+      : Number(f.total_entries).toLocaleString() + ' entries';
     div.innerHTML =
       '<div class="fi-dot"></div>' +
-      '<div class="fi-info"><div class="fi-range">' + esc(rangeStr) + '</div><div class="fi-name">' + esc(f.name) + '</div></div>' +
+      '<div class="fi-info"><div class="fi-range">' + esc(rangeStr) + '</div><div class="fi-name">' + esc(countStr + ' · ' + f.name) + '</div></div>' +
       '<div class="fi-size">' + fmtBytes(f.size_bytes) + '</div>';
     frag.appendChild(div);
   });
@@ -780,45 +820,86 @@ function renderFilePicker() {
 
 function selectArchiveFile(name) {
   if (archFile === name) return;
-  archFile = name; archAllEvents = []; archShowCount = 200;
+  archFile = name;
   renderFilePicker();
+  clearArchiveTime(false);
+  resetArchiveQuery();
+}
+
+function resetArchiveQuery() {
+  archCursor = null;
+  archNextCursor = null;
+  archCursorStack = [];
+  archPage = 1;
   loadArchive();
+}
+
+function clearArchiveTime(reload = true) {
+  document.getElementById('arch-from').value = '';
+  document.getElementById('arch-to').value = '';
+  if (reload && archFile) resetArchiveQuery();
 }
 
 async function loadArchive() {
   if (!archFile) return;
   const filter = document.getElementById('ql-filter').value.trim();
-  let url = '/api/querylog/history?file=' + encodeURIComponent(archFile) + '&limit=2000';
+  let url = '/api/querylog/history?file=' + encodeURIComponent(archFile) + '&limit=100';
+  if (archCursor !== null) url += '&cursor=' + archCursor;
   if (filter) url += '&q=' + encodeURIComponent(filter);
+  if (activeRcode !== '*') url += '&rcode=' + encodeURIComponent(activeRcode);
+  if (activeSource !== '*') url += '&source=' + encodeURIComponent(activeSource);
+  const from = localInputMicros('arch-from');
+  const to = localInputMicros('arch-to');
+  if (from !== null) url += '&from=' + from;
+  if (to !== null) url += '&to=' + to;
   document.getElementById('ql-tbody').innerHTML =
     '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Loading…</td></tr>';
   document.getElementById('ql-more').style.display = 'none';
-  document.getElementById('arch-count').textContent = '';
   const r = await tryFetch(url);
-  if (!r) {
+  if (!r || !r.ok) {
     document.getElementById('ql-tbody').innerHTML =
       '<tr><td colspan="8" style="color:var(--red);text-align:center">Failed to load archive</td></tr>';
     return;
   }
-  archAllEvents = await r.json();
-  archShowCount = 200;
+  const page = await r.json();
+  archEvents = page.items || [];
+  archNextCursor = page.next_cursor;
+  archMeta = page;
   renderArchiveView();
 }
 
 function renderArchiveView() {
-  const filtered = applyFilters(archAllEvents);
-  const shown = filtered.slice(0, archShowCount);
-  renderQueryLog(shown);
+  renderQueryLog(archEvents);
   const countEl = document.getElementById('arch-count');
-  const total = archAllEvents.length, fTotal = filtered.length;
-  if (total === 0) {
-    countEl.textContent = 'No entries in this file';
-  } else if (fTotal < total) {
-    countEl.textContent = 'Showing ' + Math.min(archShowCount, fTotal).toLocaleString() + ' of ' + fTotal.toLocaleString() + ' matching (total ' + total.toLocaleString() + ')';
+  const total = archMeta && archMeta.total_entries;
+  if (!archEvents.length) {
+    countEl.textContent = total === null || total === undefined
+      ? 'No matching entries on this page · legacy archive'
+      : 'No matching entries · ' + Number(total).toLocaleString() + ' total in file';
   } else {
-    countEl.textContent = 'Showing ' + Math.min(archShowCount, fTotal).toLocaleString() + ' of ' + fTotal.toLocaleString() + ' entries';
+    countEl.textContent = archEvents.length.toLocaleString() + ' entries on this page'
+      + (total === null || total === undefined
+        ? ' · legacy archive'
+        : ' · ' + Number(total).toLocaleString() + ' total in file');
   }
-  document.getElementById('ql-more').style.display = fTotal > archShowCount ? 'inline-block' : 'none';
+  document.getElementById('arch-page-label').textContent = 'Page ' + archPage;
+  document.getElementById('arch-prev').disabled = archCursorStack.length === 0;
+  document.getElementById('arch-next').disabled = !archMeta || !archMeta.has_more;
+}
+
+function archiveNext() {
+  if (!archMeta || !archMeta.has_more || archNextCursor === null) return;
+  archCursorStack.push(archCursor);
+  archCursor = archNextCursor;
+  archPage += 1;
+  loadArchive();
+}
+
+function archivePrev() {
+  if (!archCursorStack.length) return;
+  archCursor = archCursorStack.pop();
+  archPage = Math.max(1, archPage - 1);
+  loadArchive();
 }
 
 // ── Quick filter chips ────────────────────────────────────────────────────────
@@ -830,7 +911,7 @@ function setChip(type, val) {
     c.classList.toggle('active', c.dataset.val === val);
   });
   if (qlMode === 'live') renderQueryLog(qlEvents);
-  else renderArchiveView();
+  else resetArchiveQuery();
 }
 
 function applyFilters(events) {
@@ -946,13 +1027,12 @@ function filterChanged() {
   clearTimeout(filterTimer);
   filterTimer = setTimeout(() => {
     if (qlMode === 'live') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
-    else if (archFile) loadArchive();
+    else if (archFile) resetArchiveQuery();
   }, 250);
 }
 
 function loadMore() {
-  if (qlMode === 'archive') { archShowCount += 200; renderArchiveView(); }
-  else loadQueryLog();
+  if (qlMode === 'live') loadQueryLog();
 }
 
 async function clearLog() {

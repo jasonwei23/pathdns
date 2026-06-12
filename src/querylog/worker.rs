@@ -7,16 +7,20 @@
 //! ## File format
 //! Each active segment is `querylog-{unix_micros:020}.msgpack` — a sequence of
 //! concatenated MessagePack maps, one per event, written with named keys.
-//! On rotation the segment is gzip-compressed to `querylog-{ts}.msgpack.gz`
-//! in a blocking thread-pool task so the worker never stalls.
+//! A compact `.index.json` sidecar stores entry counts, time ranges, and sparse
+//! byte offsets. Rotated segments are written as concatenated independent gzip
+//! members, one per index block, so history queries only decompress the blocks
+//! they need.
 //!
 //! ## Reading historical files
-//! `read_history_file` decodes a `.msgpack.gz` (or plain `.msgpack`) segment
-//! and returns up to `limit` matching `DecodedEvent` values.  It is designed
-//! to be called from `tokio::task::spawn_blocking` inside the HTTP API handler.
+//! `read_history_page` queries a `.msgpack.gz` (or plain `.msgpack`) segment
+//! through its sparse sidecar index and returns one bounded result page. It is
+//! designed to run in `tokio::task::spawn_blocking` inside the HTTP API handler.
 
 use super::{DecodedEvent, QpsRing, QueryLogCounters, QueryLogEvent, QueryLogFileConfig};
 use crate::querylog::ring::{EventRing, StatsRing};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,6 +28,126 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, Duration, MissedTickBehavior};
+
+const HISTORY_INDEX_VERSION: u8 = 1;
+/// Target entries per index block; consecutive small batches are merged until
+/// this limit is reached before starting a new block.
+const HISTORY_INDEX_STRIDE: u64 = 512;
+/// Hard cap on page size returned by the history API.
+const HISTORY_PAGE_MAX: usize = 200;
+
+// ── Index structures ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryBlock {
+    offset: u64,
+    len: u64,
+    first_entry: u64,
+    entries: u32,
+    start_micros: u64,
+    end_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryIndex {
+    version: u8,
+    /// True when the segment file contains independent gzip members (one per
+    /// block) rather than plain msgpack.
+    compressed_blocks: bool,
+    total_entries: u64,
+    start_micros: Option<u64>,
+    end_micros: Option<u64>,
+    blocks: Vec<HistoryBlock>,
+}
+
+impl HistoryIndex {
+    fn empty() -> Self {
+        Self {
+            version: HISTORY_INDEX_VERSION,
+            compressed_blocks: false,
+            total_entries: 0,
+            start_micros: None,
+            end_micros: None,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Record a freshly-written batch at byte range `[offset, offset+len)`.
+    /// Small batches are merged into the last block until `HISTORY_INDEX_STRIDE`
+    /// is reached; a new block is started when the stride fills.
+    fn append_batch(&mut self, offset: u64, len: u64, batch: &[Arc<QueryLogEvent>]) {
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let end_micros = batch.last().map_or(first.unix_micros, |ev| ev.unix_micros);
+        let count = batch.len() as u64;
+        self.start_micros.get_or_insert(first.unix_micros);
+        self.end_micros = Some(end_micros);
+
+        // Merge into the last block if it is still below the stride limit and
+        // the byte ranges are contiguous (they always should be for sequential writes).
+        if let Some(last) = self.blocks.last_mut() {
+            if last.first_entry + u64::from(last.entries) == self.total_entries
+                && u64::from(last.entries) + count <= HISTORY_INDEX_STRIDE
+                && last.offset + last.len == offset
+            {
+                last.len += len;
+                last.entries += count as u32;
+                last.end_micros = end_micros;
+                self.total_entries += count;
+                return;
+            }
+        }
+
+        self.blocks.push(HistoryBlock {
+            offset,
+            len,
+            first_entry: self.total_entries,
+            entries: count as u32,
+            start_micros: first.unix_micros,
+            end_micros,
+        });
+        self.total_entries += count;
+    }
+}
+
+// ── Public types for the API layer ────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct HistoryFileInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    pub total_entries: Option<u64>,
+    pub start_micros: Option<u64>,
+    pub end_micros: Option<u64>,
+    pub indexed: bool,
+}
+
+#[derive(Debug)]
+pub struct HistoryQuery {
+    pub limit: usize,
+    /// Ordinal of the first entry to consider; `None` means start from the
+    /// beginning of the effective time window.
+    pub cursor: Option<u64>,
+    pub from_micros: Option<u64>,
+    pub to_micros: Option<u64>,
+    pub qname: Option<String>,
+    pub rcode: Option<u8>,
+    pub source: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct HistoryPage {
+    pub events: Vec<DecodedEvent>,
+    /// `None` for legacy files that have no index.
+    pub total_entries: Option<u64>,
+    pub start_micros: Option<u64>,
+    pub end_micros: Option<u64>,
+    /// The cursor to supply on the next request; `None` when `has_more` is false.
+    pub next_cursor: Option<u64>,
+    pub has_more: bool,
+    pub indexed: bool,
+}
 
 // ── QPS sampler ───────────────────────────────────────────────────────────────
 
@@ -223,6 +347,8 @@ struct MsgpackFileState {
     file: BufWriter<tokio::fs::File>,
     path: PathBuf,
     bytes_written: u64,
+    index: HistoryIndex,
+    index_dirty: bool,
 }
 
 impl MsgpackFileState {
@@ -232,8 +358,9 @@ impl MsgpackFileState {
         // Reuse the most-recent plain segment if it is still below the size
         // limit.  This avoids creating a new file on every restart, which
         // would exhaust max_segments slots with empty / tiny files.
-        let reuse_path = find_resumable_segment(&cfg.dir, cfg.max_mb).await;
-        let path = reuse_path.unwrap_or_else(|| cfg.dir.join(segment_name()));
+        let reusable = find_resumable_segment(&cfg.dir, cfg.max_mb).await;
+        let (path, index) =
+            reusable.unwrap_or_else(|| (cfg.dir.join(segment_name()), HistoryIndex::empty()));
 
         let file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -246,6 +373,8 @@ impl MsgpackFileState {
             file: BufWriter::with_capacity(64 * 1024, file),
             path,
             bytes_written,
+            index,
+            index_dirty: false,
         })
     }
 
@@ -266,8 +395,11 @@ impl MsgpackFileState {
                 .map_err(|e| anyhow::anyhow!("msgpack encode: {e}"))?;
         }
 
+        let offset = self.bytes_written;
         self.file.write_all(&buf).await?;
         self.bytes_written += buf.len() as u64;
+        self.index.append_batch(offset, buf.len() as u64, batch);
+        self.index_dirty = true;
 
         // Rotate if the active segment has grown past the size limit.
         if self.bytes_written >= cfg.max_mb * 1_048_576 {
@@ -279,7 +411,7 @@ impl MsgpackFileState {
 
     /// Flush, compress the closed segment, then open a fresh one.
     async fn rotate(&mut self, cfg: &QueryLogFileConfig) -> anyhow::Result<()> {
-        self.file.flush().await?;
+        self.flush().await?;
 
         // Fire-and-forget gzip compression in the blocking thread pool.
         let old_path = self.path.clone();
@@ -308,6 +440,8 @@ impl MsgpackFileState {
         self.file = BufWriter::with_capacity(64 * 1024, f);
         self.path = new_path;
         self.bytes_written = 0;
+        self.index = HistoryIndex::empty();
+        self.index_dirty = false;
 
         prune_old_files(cfg).await.ok();
         Ok(())
@@ -315,33 +449,87 @@ impl MsgpackFileState {
 
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.file.flush().await?;
+        if self.index_dirty {
+            let data = serde_json::to_vec(&self.index)?;
+            tokio::fs::write(index_path(&self.path), data).await?;
+            self.index_dirty = false;
+        }
         Ok(())
     }
 }
 
 // ── Gzip compression (blocking) ───────────────────────────────────────────────
 
+/// Compress `path` to `{path}.gz` using the sidecar index when available.
+///
+/// When an index exists the file is split into independent gzip members (one per
+/// block) so history reads can seek directly to the relevant block.  Falls back
+/// to a single-member gzip for legacy/unindexed files.
+///
+/// A `.tmp` intermediate prevents the reader from seeing a partial `.gz` file.
 fn compress_to_gz(path: &Path) -> std::io::Result<()> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::BufReader;
+    use std::io::{BufReader, BufWriter, Write};
 
     let gz_path = PathBuf::from(format!("{}.gz", path.display()));
-    let src = std::fs::File::open(path)?;
-    let dst = std::fs::File::create(&gz_path)?;
-    let mut encoder = GzEncoder::new(std::io::BufWriter::new(dst), Compression::default());
-    std::io::copy(&mut BufReader::new(src), &mut encoder)?;
-    encoder.finish()?;
+    let temp_path = PathBuf::from(format!("{}.tmp", gz_path.display()));
+    let index = load_index(path).ok();
+    let mut src = std::fs::File::open(path)?;
+
+    if let Some(index) = index.filter(|idx| !idx.blocks.is_empty()) {
+        let mut dst = BufWriter::new(std::fs::File::create(&temp_path)?);
+        let source_blocks = index.blocks.clone();
+        let mut compressed_index = HistoryIndex {
+            compressed_blocks: true,
+            blocks: Vec::with_capacity(source_blocks.len()),
+            ..index
+        };
+        let mut output_offset = 0u64;
+
+        for block in &source_blocks {
+            src.seek(SeekFrom::Start(block.offset))?;
+            let mut plain = vec![0u8; block.len as usize];
+            src.read_exact(&mut plain)?;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&plain)?;
+            let compressed = encoder.finish()?;
+            dst.write_all(&compressed)?;
+            compressed_index.blocks.push(HistoryBlock {
+                offset: output_offset,
+                len: compressed.len() as u64,
+                ..block.clone()
+            });
+            output_offset += compressed.len() as u64;
+        }
+        dst.flush()?;
+        write_index(&temp_path, &compressed_index)?;
+    } else {
+        let dst = BufWriter::new(std::fs::File::create(&temp_path)?);
+        let mut encoder = GzEncoder::new(dst, Compression::fast());
+        std::io::copy(&mut BufReader::new(src), &mut encoder)?;
+        encoder.finish()?;
+    }
+
+    // Atomic rename of data file, then index file (best-effort).
+    // If the process crashes between the two renames, load_index will fail on
+    // the .gz and the reader will use the MultiGzDecoder legacy path.
+    std::fs::rename(&temp_path, &gz_path)?;
+    let temp_index = index_path(&temp_path);
+    if temp_index.exists() {
+        std::fs::rename(temp_index, index_path(&gz_path))?;
+    }
     std::fs::remove_file(path)?;
+    let _ = std::fs::remove_file(index_path(path));
     Ok(())
 }
 
 // ── Segment naming ────────────────────────────────────────────────────────────
 
-/// Return the path of the most-recent plain `.msgpack` segment if it is still
-/// below the rotation threshold, so the worker can append to it on restart
-/// rather than creating a new file.
-async fn find_resumable_segment(dir: &Path, max_mb: u64) -> Option<PathBuf> {
+/// Return the path and index of the most-recent plain `.msgpack` segment if it
+/// is still below the rotation threshold, so the worker can append to it on
+/// restart rather than creating a new file.
+async fn find_resumable_segment(dir: &Path, max_mb: u64) -> Option<(PathBuf, HistoryIndex)> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     let mut candidates: Vec<String> = Vec::new();
     while let Some(e) = entries.next_entry().await.ok()? {
@@ -355,8 +543,11 @@ async fn find_resumable_segment(dir: &Path, max_mb: u64) -> Option<PathBuf> {
     let name = candidates.into_iter().next_back()?;
     let path = dir.join(&name);
     let size = tokio::fs::metadata(&path).await.ok()?.len();
+    // Only resume if the file is still below the rotation threshold and has a
+    // valid index that covers it exactly (guards against crash-truncated indexes).
+    let index = load_index(&path).ok()?;
     if size < max_mb * 1_048_576 {
-        Some(path)
+        Some((path, index))
     } else {
         None
     }
@@ -368,6 +559,47 @@ fn segment_name() -> String {
         .unwrap_or_default()
         .as_micros();
     format!("querylog-{micros:020}.msgpack")
+}
+
+// ── Index helpers ─────────────────────────────────────────────────────────────
+
+fn index_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.index.json", path.display()))
+}
+
+fn load_index(path: &Path) -> anyhow::Result<HistoryIndex> {
+    let data = std::fs::read(index_path(path))?;
+    let index: HistoryIndex = serde_json::from_slice(&data)?;
+    anyhow::ensure!(
+        index.version == HISTORY_INDEX_VERSION,
+        "unsupported history index version"
+    );
+    let file_size = std::fs::metadata(path)?.len();
+    let mut expected_offset = 0u64;
+    let mut expected_entry = 0u64;
+    for block in &index.blocks {
+        anyhow::ensure!(
+            block.offset == expected_offset && block.first_entry == expected_entry,
+            "non-contiguous history index"
+        );
+        anyhow::ensure!(block.len > 0 && block.entries > 0, "empty history block");
+        expected_offset = expected_offset
+            .checked_add(block.len)
+            .ok_or_else(|| anyhow::anyhow!("history index byte offset overflow"))?;
+        expected_entry = expected_entry
+            .checked_add(u64::from(block.entries))
+            .ok_or_else(|| anyhow::anyhow!("history index entry overflow"))?;
+    }
+    anyhow::ensure!(
+        expected_offset == file_size && expected_entry == index.total_entries,
+        "history index does not cover the complete segment"
+    );
+    Ok(index)
+}
+
+fn write_index(path: &Path, index: &HistoryIndex) -> std::io::Result<()> {
+    let data = serde_json::to_vec(index).map_err(std::io::Error::other)?;
+    std::fs::write(index_path(path), data)
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -392,7 +624,7 @@ async fn prune_old_files(cfg: &QueryLogFileConfig) -> anyhow::Result<()> {
         for name in files {
             let ts = extract_file_timestamp(&name).unwrap_or(u64::MAX);
             if ts < cutoff {
-                let _ = tokio::fs::remove_file(cfg.dir.join(&name)).await;
+                remove_segment(&cfg.dir.join(&name)).await;
             } else {
                 keep.push(name);
             }
@@ -404,11 +636,17 @@ async fn prune_old_files(cfg: &QueryLogFileConfig) -> anyhow::Result<()> {
     let max = cfg.max_segments.max(1);
     if files.len() > max {
         for old_name in &files[..files.len() - max] {
-            let _ = tokio::fs::remove_file(cfg.dir.join(old_name)).await;
+            remove_segment(&cfg.dir.join(old_name)).await;
         }
     }
 
     Ok(())
+}
+
+/// Remove a segment file and its sidecar index (best-effort).
+async fn remove_segment(path: &Path) {
+    let _ = tokio::fs::remove_file(path).await;
+    let _ = tokio::fs::remove_file(index_path(path)).await;
 }
 
 /// Extract the Unix-microsecond timestamp from a segment file name.
@@ -419,18 +657,19 @@ fn extract_file_timestamp(name: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-// ── Historical file reader ────────────────────────────────────────────────────
+// ── Historical file listing ───────────────────────────────────────────────────
 
-/// List historical segments in `dir`, newest-last.
-/// Returns `(file_name, size_bytes)` pairs.
-/// Includes both gzip-compressed (`.msgpack.gz`) and plain (`.msgpack`) segments,
-/// including the currently-active segment (safe to read; the decoder stops at the
-/// first incomplete record).
-pub fn list_history_files(dir: &Path) -> Vec<(String, u64)> {
+/// List historical segments in `dir`, sorted oldest-first.
+///
+/// Includes both gzip-compressed (`.msgpack.gz`) and plain (`.msgpack`)
+/// segments. During the compression window both forms of the same segment can
+/// briefly coexist; the plain `.msgpack` is suppressed when its `.gz`
+/// counterpart already exists.
+pub fn list_history_files(dir: &Path) -> Vec<HistoryFileInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
-    let mut files: Vec<(String, u64)> = entries
+    let mut files: Vec<HistoryFileInfo> = entries
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -438,86 +677,228 @@ pub fn list_history_files(dir: &Path) -> Vec<(String, u64)> {
                 && (name.ends_with(".msgpack.gz") || name.ends_with(".msgpack"))
             {
                 let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                Some((name, size))
+                let path = e.path();
+                let index = load_index(&path).ok();
+                Some(HistoryFileInfo {
+                    name,
+                    size_bytes: size,
+                    total_entries: index.as_ref().map(|idx| idx.total_entries),
+                    start_micros: index.as_ref().and_then(|idx| idx.start_micros),
+                    end_micros: index.as_ref().and_then(|idx| idx.end_micros),
+                    indexed: index.is_some(),
+                })
             } else {
                 None
             }
         })
         .collect();
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // During the compression window both querylog-T.msgpack and querylog-T.msgpack.gz
-    // can exist simultaneously.  Keep only the .gz to avoid exposing a partially-written
-    // compressed file or showing the same segment twice.
+    // During the compression window both querylog-T.msgpack and
+    // querylog-T.msgpack.gz can coexist.  Drop the plain form when its
+    // compressed counterpart is already visible.
     let gz_stems: std::collections::HashSet<String> = files
         .iter()
-        .filter(|(n, _)| n.ends_with(".msgpack.gz"))
-        .map(|(n, _)| n.trim_end_matches(".msgpack.gz").to_owned())
+        .filter(|f| f.name.ends_with(".msgpack.gz"))
+        .map(|f| f.name.trim_end_matches(".msgpack.gz").to_owned())
         .collect();
-    files.retain(|(n, _)| {
-        !n.ends_with(".msgpack") || !gz_stems.contains(n.trim_end_matches(".msgpack"))
+    files.retain(|f| {
+        !f.name.ends_with(".msgpack")
+            || !gz_stems.contains(f.name.trim_end_matches(".msgpack"))
     });
 
     files
 }
 
-/// Decode up to `limit` events from a historical MessagePack segment.
-/// Accepts both `.msgpack.gz` (gzip-compressed) and plain `.msgpack` files.
-/// Call this inside `tokio::task::spawn_blocking` — file I/O is synchronous.
-pub fn read_history_file(
+// ── Historical file reader ────────────────────────────────────────────────────
+
+/// Read one bounded page from a historical segment.
+///
+/// Indexed files seek directly to the relevant plain byte ranges or independent
+/// gzip members.  Legacy files remain readable through a sequential fallback
+/// that uses `MultiGzDecoder` to handle both single-member and multi-member gz.
+pub fn read_history_page(path: &Path, query: &HistoryQuery) -> anyhow::Result<HistoryPage> {
+    if let Ok(index) = load_index(path) {
+        read_indexed_history_page(path, query, &index)
+    } else {
+        read_legacy_history_page(path, query)
+    }
+}
+
+fn read_indexed_history_page(
     path: &Path,
-    limit: usize,
-    filter: Option<&str>,
-) -> anyhow::Result<Vec<DecodedEvent>> {
+    query: &HistoryQuery,
+    index: &HistoryIndex,
+) -> anyhow::Result<HistoryPage> {
+    let limit = query.limit.clamp(1, HISTORY_PAGE_MAX);
+
+    // The first block whose end_micros >= from_micros determines the starting
+    // ordinal for time-range queries.  A cursor that points further ahead wins.
+    let first_candidate = index
+        .blocks
+        .iter()
+        .find(|block| {
+            query
+                .from_micros
+                .is_none_or(|from| block.end_micros >= from)
+        })
+        .map_or(index.total_entries, |block| block.first_entry);
+    // If a cursor was supplied it must be >= first_candidate so we never move
+    // backwards relative to the time filter.
+    let cursor = query.cursor.unwrap_or(first_candidate).max(first_candidate);
+
+    let mut file = std::fs::File::open(path)?;
+    let mut events = Vec::with_capacity(limit);
+    let mut next_cursor = cursor;
+    let mut has_more = false;
+
+    'blocks: for block in &index.blocks {
+        let block_end_entry = block.first_entry + u64::from(block.entries);
+        // Skip blocks entirely before the cursor position.
+        if block_end_entry <= cursor {
+            continue;
+        }
+        // Skip blocks outside the requested time window.
+        if query
+            .from_micros
+            .is_some_and(|from| block.end_micros < from)
+        {
+            continue;
+        }
+        if query.to_micros.is_some_and(|to| block.start_micros > to) {
+            break;
+        }
+
+        file.seek(SeekFrom::Start(block.offset))?;
+        let decoded = if index.compressed_blocks {
+            let gz = flate2::read::GzDecoder::new((&mut file).take(block.len));
+            decode_msgpack_block(gz)
+        } else {
+            decode_msgpack_block((&mut file).take(block.len))
+        };
+
+        for (position, event) in decoded.into_iter().enumerate() {
+            let ordinal = block.first_entry + position as u64;
+            if ordinal < cursor {
+                continue;
+            }
+            if event_matches(&event, query) {
+                if events.len() < limit {
+                    events.push(event);
+                    next_cursor = ordinal + 1;
+                } else {
+                    has_more = true;
+                    next_cursor = ordinal;
+                    break 'blocks;
+                }
+            }
+        }
+    }
+
+    Ok(HistoryPage {
+        events,
+        total_entries: Some(index.total_entries),
+        start_micros: index.start_micros,
+        end_micros: index.end_micros,
+        next_cursor: has_more.then_some(next_cursor),
+        has_more,
+        indexed: true,
+    })
+}
+
+fn read_legacy_history_page(path: &Path, query: &HistoryQuery) -> anyhow::Result<HistoryPage> {
     use std::io::BufReader;
 
     let file = std::fs::File::open(path)?;
-    let limit = limit.clamp(1, 10_000);
-
-    let events = if path.to_str().is_some_and(|s| s.ends_with(".gz")) {
-        let gz = flate2::read::GzDecoder::new(file);
-        decode_msgpack_stream(BufReader::new(gz), limit, filter)
+    // MultiGzDecoder handles both single-member (old) and multi-member (new)
+    // gzip files transparently.
+    let reader: Box<dyn Read> = if path.to_str().is_some_and(|s| s.ends_with(".gz")) {
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
-        decode_msgpack_stream(BufReader::new(file), limit, filter)
+        Box::new(file)
+    };
+    let mut de = rmp_serde::Deserializer::new(BufReader::new(reader));
+    let limit = query.limit.clamp(1, HISTORY_PAGE_MAX);
+    let cursor = query.cursor.unwrap_or(0);
+    let mut ordinal = 0u64;
+    let mut events = Vec::with_capacity(limit);
+    let mut has_more = false;
+
+    // Cap total records scanned so a rare filter on a large legacy file does
+    // not stall the blocking thread pool indefinitely.
+    let max_scan: u64 = if query.qname.as_deref().is_some_and(|q| !q.is_empty())
+        || query.rcode.is_some()
+        || query.source.as_deref().is_some_and(|s| !s.is_empty())
+        || query.from_micros.is_some()
+        || query.to_micros.is_some()
+    {
+        (limit as u64).saturating_mul(100).max(10_000)
+    } else {
+        u64::MAX
     };
 
-    Ok(events)
-}
-
-fn decode_msgpack_stream<R: std::io::Read>(
-    reader: R,
-    limit: usize,
-    filter: Option<&str>,
-) -> Vec<DecodedEvent> {
-    // When a filter is active, the caller may want up to `limit` matches from a
-    // file that has far more total records.  Cap total records scanned so a rare
-    // filter string on a large compressed file does not block the thread pool
-    // for seconds.  The cap is generous (100× the return limit) so typical
-    // queries are not truncated prematurely.
-    let max_scan = if filter.is_some_and(|f| !f.is_empty()) {
-        limit.saturating_mul(100).max(10_000)
-    } else {
-        usize::MAX
-    };
-
-    let mut de = rmp_serde::Deserializer::new(reader);
-    let mut events = Vec::new();
-    let mut scanned = 0usize;
     loop {
-        if scanned >= max_scan {
+        if ordinal.saturating_sub(cursor) >= max_scan {
             break;
         }
         let result: Result<DecodedEvent, _> = serde::de::Deserialize::deserialize(&mut de);
-        scanned += 1;
         match result {
-            Ok(ev) => {
-                if filter.is_none_or(|f| f.is_empty() || ev.qname.contains(f)) {
-                    events.push(ev);
-                    if events.len() >= limit {
-                        break;
-                    }
+            Ok(event) => {
+                let current = ordinal;
+                ordinal += 1;
+                if current < cursor || !event_matches(&event, query) {
+                    continue;
+                }
+                if events.len() < limit {
+                    events.push(event);
+                } else {
+                    has_more = true;
+                    // current is the ordinal of the overflow event; next call
+                    // resumes from it.
+                    ordinal = current;
+                    break;
                 }
             }
+            Err(_) => break,
+        }
+    }
+
+    Ok(HistoryPage {
+        events,
+        total_entries: None,
+        start_micros: None,
+        end_micros: None,
+        next_cursor: has_more.then_some(ordinal),
+        has_more,
+        indexed: false,
+    })
+}
+
+fn event_matches(event: &DecodedEvent, query: &HistoryQuery) -> bool {
+    query
+        .from_micros
+        .is_none_or(|from| event.unix_micros >= from)
+        && query.to_micros.is_none_or(|to| event.unix_micros <= to)
+        && query
+            .qname
+            .as_deref()
+            .is_none_or(|q| q.is_empty() || event.qname.contains(q))
+        && query.rcode.is_none_or(|rcode| event.rcode == rcode)
+        && query
+            .source
+            .as_deref()
+            .is_none_or(|source| source.is_empty() || event.source == source)
+}
+
+/// Decode all msgpack events from `reader` into a `Vec`.
+/// Used for indexed reads where the block size is already bounded.
+fn decode_msgpack_block<R: Read>(reader: R) -> Vec<DecodedEvent> {
+    let mut de = rmp_serde::Deserializer::new(reader);
+    let mut events = Vec::new();
+    loop {
+        let result: Result<DecodedEvent, _> = serde::de::Deserialize::deserialize(&mut de);
+        match result {
+            Ok(ev) => events.push(ev),
             Err(_) => break,
         }
     }
@@ -551,4 +932,144 @@ fn days_to_ymd(mut days: u64) -> (u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as u32, m as u32, d as u32)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn event(seq: u64, unix_micros: u64) -> Arc<QueryLogEvent> {
+        Arc::new(QueryLogEvent {
+            seq,
+            unix_micros,
+            client: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            client_port: 53,
+            qname: Arc::from(format!("host-{seq}.example")),
+            qtype: 1,
+            rcode: if seq % 2 == 0 { 0 } else { 3 },
+            elapsed_us: seq,
+            response_bytes: 32,
+            source: if seq % 2 == 0 { "cache" } else { "upstream" },
+            group: None,
+            answer_ips: smallvec::SmallVec::new(),
+        })
+    }
+
+    fn temp_config() -> QueryLogFileConfig {
+        let unique = super::super::unix_micros_now();
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        QueryLogFileConfig {
+            dir: std::env::temp_dir().join(format!(
+                "pathdns-history-index-{}-{unique}-{id}",
+                std::process::id(),
+            )),
+            max_mb: 64,
+            max_segments: 3,
+            batch_size: 300,
+            flush_interval_ms: 100,
+            retention_days: None,
+            compress: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_history_supports_metadata_time_filter_and_gzip_paging() {
+        let cfg = temp_config();
+        tokio::fs::create_dir_all(&cfg.dir).await.unwrap();
+        let mut state = MsgpackFileState::open(&cfg).await.unwrap();
+        let first: Vec<_> = (0..300).map(|n| event(n, 1_000 + n)).collect();
+        let second: Vec<_> = (300..600).map(|n| event(n, 1_000 + n)).collect();
+        state.append_batch(&first, &cfg).await.unwrap();
+        state.append_batch(&second, &cfg).await.unwrap();
+        state.flush().await.unwrap();
+        let plain_path = state.path.clone();
+        drop(state);
+
+        let files = list_history_files(&cfg.dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].total_entries, Some(600));
+        assert_eq!(files[0].start_micros, Some(1_000));
+        assert_eq!(files[0].end_micros, Some(1_599));
+
+        let query = HistoryQuery {
+            limit: 25,
+            cursor: None,
+            from_micros: Some(1_250),
+            to_micros: Some(1_350),
+            qname: None,
+            rcode: Some(0),
+            source: Some("cache".to_string()),
+        };
+        let first_page = read_history_page(&plain_path, &query).unwrap();
+        assert_eq!(first_page.events.len(), 25);
+        assert_eq!(first_page.events[0].seq, 250);
+        assert!(first_page.has_more);
+
+        compress_to_gz(&plain_path).unwrap();
+        let gz_path = PathBuf::from(format!("{}.gz", plain_path.display()));
+        let second_page = read_history_page(
+            &gz_path,
+            &HistoryQuery {
+                cursor: first_page.next_cursor,
+                ..query
+            },
+        )
+        .unwrap();
+        assert_eq!(second_page.events[0].seq, 300);
+        assert_eq!(second_page.total_entries, Some(600));
+        assert!(second_page.indexed);
+
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn stale_sidecar_falls_back_without_hiding_persisted_events() {
+        let cfg = temp_config();
+        tokio::fs::create_dir_all(&cfg.dir).await.unwrap();
+        let mut state = MsgpackFileState::open(&cfg).await.unwrap();
+        state.append_batch(&[event(1, 1_000)], &cfg).await.unwrap();
+        state.flush().await.unwrap();
+        let path = state.path.clone();
+        drop(state);
+
+        // Append a second event directly to the file, bypassing the index.
+        let mut encoded = Vec::new();
+        rmp_serde::encode::write_named(&mut encoded, event(2, 2_000).as_ref()).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&encoded)
+            .unwrap();
+
+        // The index now covers fewer bytes than the file → load_index fails.
+        let files = list_history_files(&cfg.dir);
+        assert!(!files[0].indexed);
+        assert_eq!(files[0].total_entries, None);
+
+        let page = read_history_page(
+            &path,
+            &HistoryQuery {
+                limit: 100,
+                cursor: None,
+                from_micros: None,
+                to_micros: None,
+                qname: None,
+                rcode: None,
+                source: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert!(!page.indexed);
+
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
 }
