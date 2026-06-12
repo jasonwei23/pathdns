@@ -46,7 +46,7 @@ use quic::H3Upstream;
 use rustls::pki_types::ServerName;
 use smallvec::SmallVec;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tcp_mux::{MuxConnector, TcpMux};
@@ -71,6 +71,10 @@ const SELECT_BAND_FLOOR_US: u64 = 2_000;
 const FAILURE_RTT_FLOOR_US: u64 = 50_000;
 /// Upper bound for the failure-inflated RTT estimate (10 s).
 const FAILURE_RTT_CAP_US: u64 = 10_000_000;
+/// Score multiplier applied to a node when active_inflight ≥ its AIMD concurrency window.
+/// Deprioritises congestion-signalled nodes in banded selection without blocking them
+/// outright (the hard semaphore cap enforced by InflightRegistry handles that).
+const CONGESTION_SCORE_FACTOR: u64 = 4;
 
 /// Upper score bound for banded selection.  Nodes scoring at or below this limit
 /// are considered interchangeable with the best node: `best × SELECT_BAND_FACTOR`,
@@ -126,14 +130,29 @@ struct HealthStats {
     consecutive_failures: AtomicU32,
     /// Epoch-ms after which the penalty expires. 0 = not penalized.
     penalty_until_ms: AtomicU64,
+    /// AIMD dynamic concurrency window (soft limit on active_inflight).
+    /// Starts at max_inflight; +1 on success, /2 on timeout; bounded [1, max_inflight].
+    /// Nodes with active_inflight ≥ window are scored higher (deprioritised) by
+    /// CONGESTION_SCORE_FACTOR. The hard semaphore in InflightRegistry is unchanged.
+    concurrency_window: AtomicU64,
+    /// Half-open probe gate: true while the single probe request (after penalty expiry)
+    /// is in flight. set by the first caller that claims the probe via is_penalized_at's
+    /// CAS; cleared by record_success, record_failure, or release_probe (on cancellation).
+    probe_in_progress: AtomicBool,
+    /// Configured hard cap (upstream-max-inflight). 0 = unlimited (AIMD disabled).
+    max_inflight: u64,
 }
 
 impl HealthStats {
-    fn new() -> Self {
+    fn new(max_inflight: u64) -> Self {
+        let window = if max_inflight > 0 { max_inflight } else { u64::MAX };
         Self {
             ewma_rtt_us: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             penalty_until_ms: AtomicU64::new(0),
+            concurrency_window: AtomicU64::new(window),
+            probe_in_progress: AtomicBool::new(false),
+            max_inflight,
         }
     }
 
@@ -153,9 +172,19 @@ impl HealthStats {
         self.ewma_rtt_us.store(new_ewma, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.penalty_until_ms.store(0, Ordering::Relaxed);
+        // AIMD additive increase: window += 1, bounded by max_inflight.
+        if self.max_inflight > 0 {
+            let w = self.concurrency_window.load(Ordering::Relaxed);
+            if w < self.max_inflight {
+                self.concurrency_window.store(w + 1, Ordering::Relaxed);
+            }
+        }
+        // Release half-open probe slot.
+        self.probe_in_progress.store(false, Ordering::Relaxed);
     }
 
-    fn record_failure(&self) -> u32 {
+    /// `is_timeout` should be true when the error was a timeout (congestion signal for AIMD).
+    fn record_failure(&self, is_timeout: bool) -> u32 {
         // Unbound-style RTT backoff: each failure doubles the RTT estimate so the
         // selection score sheds load after the FIRST failure instead of keeping the
         // node attractive until the hard penalty trips.  Floor covers nodes with no
@@ -165,6 +194,14 @@ impl HealthStats {
             .saturating_mul(2)
             .clamp(FAILURE_RTT_FLOOR_US, FAILURE_RTT_CAP_US);
         self.ewma_rtt_us.store(inflated, Ordering::Relaxed);
+        // AIMD multiplicative decrease on timeout (congestion signal only).
+        if is_timeout && self.max_inflight > 0 {
+            let w = self.concurrency_window.load(Ordering::Relaxed);
+            self.concurrency_window
+                .store(w.saturating_div(2).max(1), Ordering::Relaxed);
+        }
+        // Release half-open probe slot before re-penalizing.
+        self.probe_in_progress.store(false, Ordering::Relaxed);
 
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= FAILURE_THRESHOLD {
@@ -174,9 +211,38 @@ impl HealthStats {
         n
     }
 
+    /// Returns `true` when this node should be excluded from normal selection.
+    ///
+    /// Hard penalty while `penalty_until_ms > now`.  After the penalty expires the
+    /// node enters **half-open** state: the first caller performs a CAS to claim the
+    /// probe slot (sets `probe_in_progress = true`) and is allowed through
+    /// (returns `false`).  All subsequent callers find the probe in progress and are
+    /// blocked (returns `true`) until `record_success`, `record_failure`, or
+    /// `release_probe` clears the slot.
     fn is_penalized_at(&self, now: u64) -> bool {
         let until = self.penalty_until_ms.load(Ordering::Relaxed);
-        until != 0 && now < until
+        if until == 0 {
+            return false;
+        }
+        if now < until {
+            return true; // hard penalty window active
+        }
+        // Penalty elapsed: half-open. Gate all but one probe.
+        if self.probe_in_progress.load(Ordering::Acquire) {
+            return true; // probe already in flight
+        }
+        // Atomically claim probe slot. The caller that wins CAS is allowed through;
+        // concurrent callers that lose see it as still penalized.
+        self.probe_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    }
+
+    /// Release the half-open probe slot without recording a success or failure.
+    /// Called when a probe request is cancelled mid-flight (lost the hedge race) so
+    /// the next selection can claim the slot and retry.
+    fn release_probe(&self) {
+        self.probe_in_progress.store(false, Ordering::Relaxed);
     }
 }
 
@@ -189,6 +255,10 @@ pub struct UpstreamPool {
     hedge_delay: Option<Duration>,
     /// Optional querylog counters — used to increment hedged_queries when Phase 2 fires.
     querylog_counters: Option<Arc<crate::querylog::QueryLogCounters>>,
+    /// Number of hedged requests currently in Phase 2 (awaiting a secondary response).
+    /// Capped at `max(nodes.len(), 4)` to prevent amplification storms when the primary
+    /// pool is degraded and every query would otherwise spawn a secondary.
+    active_hedges: AtomicU64,
 }
 
 pub(super) struct UpstreamRequest {
@@ -394,7 +464,7 @@ impl UpstreamPool {
             nodes.push(UpstreamNode {
                 transport,
                 client_filter: endpoint.proto.client_filter(),
-                health: HealthStats::new(),
+                health: HealthStats::new(cfg.upstream_max_inflight as u64),
                 stats: NodeStats::new(),
                 last_selected: AtomicU64::new(0),
                 addr_display: node_addr_display,
@@ -430,6 +500,7 @@ impl UpstreamPool {
             next: AtomicUsize::new(0),
             hedge_delay: cfg.hedge_delay,
             querylog_counters,
+            active_hedges: AtomicU64::new(0),
         })
     }
 
@@ -582,7 +653,17 @@ impl UpstreamPool {
             _ = tokio::time::sleep(hedge_delay) => {}
         }
 
-        // Phase 2: hedge timer fired; start a second upstream in parallel.
+        // Phase 2: hedge timer fired; check budget before starting second upstream.
+        // Limit concurrent hedges to max(nodes, 4) to prevent amplification storms when
+        // the primary pool is degraded and every query would otherwise launch a secondary.
+        let hedge_budget = (self.nodes.len() as u64).max(4);
+        if self.active_hedges.fetch_add(1, Ordering::Relaxed) >= hedge_budget {
+            self.active_hedges.fetch_sub(1, Ordering::Relaxed);
+            return primary_fut.await;
+        }
+        // Guard decrements active_hedges when Phase 2 exits (any branch, including cancel).
+        let _hedge = HedgeGuard(&self.active_hedges);
+
         if count_hedge {
             if let Some(ctr) = &self.querylog_counters {
                 ctr.hedged_queries.fetch_add(1, Ordering::Relaxed);
@@ -605,6 +686,7 @@ impl UpstreamPool {
                 if result.is_ok() {
                     // Primary recovered; secondary is dropped (cancelled by tokio::select!).
                     self.nodes[secondary_idx].stats.record_cancelled();
+                    self.nodes[secondary_idx].health.release_probe();
                     result
                 } else {
                     // Primary errored; let secondary complete.
@@ -616,6 +698,7 @@ impl UpstreamPool {
                 if result.is_ok() {
                     // Secondary succeeded first; cancel primary.
                     self.nodes[primary_idx].stats.record_cancelled();
+                    self.nodes[primary_idx].health.release_probe();
                     result
                 } else {
                     // Secondary failed first; keep waiting for primary.
@@ -667,7 +750,17 @@ struct UpstreamNode {
 /// mid-flight by `tokio::select!` (e.g., the losing side of a hedged race).
 struct ActiveInflightGuard<'a>(&'a AtomicI64);
 
+/// RAII guard that decrements `active_hedges` when Phase 2 of a hedged exchange exits,
+/// including on cancellation via `tokio::select!`.
+struct HedgeGuard<'a>(&'a AtomicU64);
+
 impl Drop for ActiveInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for HedgeGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -682,13 +775,21 @@ impl UpstreamNode {
     /// Nodes without RTT data score 0 (optimistic) so they tie for best priority and are
     /// tried immediately via round-robin.  Steady-state probing of measured-but-slow nodes
     /// is handled by the `PROBE_INTERVAL` scheduler in `UpstreamPool::exchange`.
+    /// When active_inflight ≥ the AIMD concurrency window the score is multiplied by
+    /// `CONGESTION_SCORE_FACTOR` to deprioritise the node without blocking it outright.
     fn selection_score(&self) -> u64 {
         let ewma = self.health.ewma_rtt_us.load(Ordering::Relaxed);
         let inflight = self.stats.active_inflight.load(Ordering::Relaxed).max(0) as u64;
-        if ewma == 0 {
+        let base = if ewma == 0 {
             inflight
         } else {
             ewma.saturating_mul(1 + inflight)
+        };
+        let window = self.health.concurrency_window.load(Ordering::Relaxed);
+        if window > 0 && inflight >= window {
+            base.saturating_mul(CONGESTION_SCORE_FACTOR)
+        } else {
+            base
         }
     }
 
@@ -712,8 +813,9 @@ impl UpstreamNode {
                 }
             }
             Err(err) => {
-                let n = self.health.record_failure();
-                if err.to_string().contains("timeout") {
+                let is_timeout = err.to_string().contains("timeout");
+                let n = self.health.record_failure(is_timeout);
+                if is_timeout {
                     self.stats.record_timeout();
                 } else {
                     self.stats.record_err();

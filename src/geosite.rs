@@ -155,39 +155,7 @@ impl GeoSiteDb {
 impl GeoSiteDb {
     fn load_dat(&mut self, path: &Path, requested_tags: &HashSet<String>) -> Result<()> {
         let data = std::fs::read(path)?;
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let (field_byte, n) = read_varint(&data[pos..])
-                .with_context(|| format!("truncated field tag at offset {pos}"))?;
-            pos += n;
-            let wire_type = (field_byte & 0x07) as u8;
-            if wire_type != 2 {
-                pos = skip_field(&data, pos, wire_type)?;
-                continue;
-            }
-            let (entry_len, n) = read_varint(&data[pos..])
-                .with_context(|| format!("truncated entry length at offset {pos}"))?;
-            pos += n;
-            let entry_end = pos
-                .checked_add(entry_len as usize)
-                .filter(|&e| e <= data.len())
-                .ok_or_else(|| anyhow!("entry length overflows file at offset {pos}"))?;
-
-            if field_byte == 0x0A {
-                // Field 1, length-delimited: GeoSite message.
-                let entry_data = &data[pos..entry_end];
-                // Phase 1: cheap scan to find country_code, skip if not needed.
-                if let Some(code) = find_entry_tag(entry_data)? {
-                    if requested_tags.contains(&code) {
-                        // Phase 2: full parse of domain matchers for this entry.
-                        let matchers = self.tags.entry(code).or_default();
-                        parse_entry_domains(matchers, entry_data)?;
-                    }
-                }
-            }
-            pos = entry_end;
-        }
-        Ok(())
+        self.parse_dat_bytes(&data, requested_tags)
     }
 }
 
@@ -218,16 +186,24 @@ fn parse_entry_domains(matchers: &mut TagMatchers, data: &[u8]) -> Result<()> {
             0x0A => {
                 // country_code: skip (already read in phase 1).
                 let (len, n) = read_varint(&data[pos..])?;
-                pos += n + len as usize;
+                pos = usize::try_from(len)
+                    .ok()
+                    .and_then(|l| n.checked_add(l))
+                    .and_then(|s| pos.checked_add(s))
+                    .filter(|&e| e <= data.len())
+                    .ok_or_else(|| anyhow!("country_code field overflows geosite buffer"))?;
             }
             0x12 => {
                 // Domain message (field 2, length-delimited).
                 let (len, n) = read_varint(&data[pos..])?;
-                pos += n;
-                let end = pos + len as usize;
-                if end > data.len() {
-                    return Err(anyhow!("domain message extends past entry boundary"));
-                }
+                pos = pos
+                    .checked_add(n)
+                    .ok_or_else(|| anyhow!("domain message header overflows geosite buffer"))?;
+                let end = usize::try_from(len)
+                    .ok()
+                    .and_then(|l| pos.checked_add(l))
+                    .filter(|&e| e <= data.len())
+                    .ok_or_else(|| anyhow!("domain message extends past entry boundary"))?;
                 parse_domain_message(matchers, &data[pos..end])?;
                 pos = end;
             }
@@ -359,6 +335,10 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize)> {
         if shift >= 64 {
             return Err(anyhow!("varint overflow in geosite dat"));
         }
+        // 10th byte (shift=63): only bit 63 is available; payload > 1 overflows u64.
+        if shift == 63 && b & 0x7F > 1 {
+            return Err(anyhow!("varint overflow in geosite dat"));
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Ok((result, i + 1));
@@ -370,13 +350,16 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize)> {
 
 fn read_len_str(data: &[u8]) -> Result<(&str, usize)> {
     let (len, n) = read_varint(data)?;
-    let end = n + len as usize;
-    if end > data.len() {
-        return Err(anyhow!(
-            "string length {len} extends past buffer ({} bytes)",
-            data.len()
-        ));
-    }
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|l| n.checked_add(l))
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| {
+            anyhow!(
+                "string length {len} extends past buffer ({} bytes)",
+                data.len()
+            )
+        })?;
     let s = std::str::from_utf8(&data[n..end]).context("non-UTF-8 string in geosite")?;
     Ok((s, end))
 }
@@ -412,6 +395,58 @@ fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
             .filter(|&e| e <= data.len())
             .ok_or_else(|| anyhow!("32-bit field overflows geosite buffer")),
         t => Err(anyhow!("unknown protobuf wire type {t} in geosite dat")),
+    }
+}
+
+/// Fuzz entry point: parses arbitrary bytes as a GeoSite .dat file.
+/// Accepts any input without panicking; all errors are returned, not unwrapped.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn fuzz_parse_geosite(data: &[u8]) -> Result<()> {
+    let requested: std::collections::HashSet<String> =
+        std::collections::HashSet::from(["cn".to_string(), "us".to_string()]);
+    let mut db = GeoSiteDb {
+        tags: std::collections::HashMap::new(),
+        result_cache: moka::sync::Cache::new(64),
+    };
+    db.parse_dat_bytes(data, &requested)
+}
+
+impl GeoSiteDb {
+    fn parse_dat_bytes(
+        &mut self,
+        data: &[u8],
+        requested_tags: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let (field_byte, n) = read_varint(&data[pos..])
+                .with_context(|| format!("truncated field tag at offset {pos}"))?;
+            pos += n;
+            let wire_type = (field_byte & 0x07) as u8;
+            if wire_type != 2 {
+                pos = skip_field(data, pos, wire_type)?;
+                continue;
+            }
+            let (entry_len, n) = read_varint(&data[pos..])
+                .with_context(|| format!("truncated entry length at offset {pos}"))?;
+            pos += n;
+            let entry_end = pos
+                .checked_add(entry_len as usize)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow!("entry length overflows file at offset {pos}"))?;
+            if field_byte == 0x0A {
+                let entry_data = &data[pos..entry_end];
+                if let Some(code) = find_entry_tag(entry_data)? {
+                    if requested_tags.contains(&code) {
+                        let matchers = self.tags.entry(code).or_default();
+                        parse_entry_domains(matchers, entry_data)?;
+                    }
+                }
+            }
+            pos = entry_end;
+        }
+        Ok(())
     }
 }
 
