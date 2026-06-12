@@ -428,7 +428,7 @@ fn render_stats(
     let queued = c.inflight_queued.load(Ordering::Relaxed);
     let rtt_sum = c.rtt_sum_us.load(Ordering::Relaxed);
     let rtt_n = c.rtt_count.load(Ordering::Relaxed);
-    let avg_resolution_us = if rtt_n > 0 { rtt_sum / rtt_n } else { 0 };
+    let avg_resolution_us = rtt_sum.checked_div(rtt_n).unwrap_or(0);
     let cache_rate = if total > 0 {
         cache as f64 / total as f64 * 100.0
     } else {
