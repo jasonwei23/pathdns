@@ -118,9 +118,29 @@ tr:last-child td{border-bottom:none}
 .chip.chip-warn.active{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.4);color:var(--red)}
 .chip.chip-src.active{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.4);color:var(--blue)}
 .arch-count{font-size:11px;color:var(--text2);margin-bottom:8px}
-.archive-controls{display:none;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
-.archive-controls input{padding:7px 9px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;border-radius:7px;outline:none}
-.archive-controls input:focus{border-color:var(--accent)}
+.archive-controls{display:none;margin-bottom:14px;padding:12px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
+.archive-range{width:100%;min-width:0}
+.archive-range-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}
+.archive-range-title{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.archive-range-value{font-size:12px;color:var(--text);font-variant-numeric:tabular-nums;text-align:right}
+.range-slider{height:24px;position:relative;margin:0 7px}
+.range-slider-track,.range-slider-fill{position:absolute;left:0;right:0;top:10px;height:4px;border-radius:2px}
+.range-slider-track{background:var(--border)}
+.range-slider-fill{right:auto;background:var(--accent)}
+.range-slider input[type=range]{position:absolute;inset:0;width:100%;height:24px;margin:0;background:transparent;appearance:none;-webkit-appearance:none;pointer-events:none;outline:none}
+.range-slider input[type=range]::-webkit-slider-runnable-track{height:4px;background:transparent}
+.range-slider input[type=range]::-webkit-slider-thumb{width:16px;height:16px;margin-top:-6px;border:2px solid var(--accent);border-radius:50%;background:var(--surface);box-shadow:0 1px 4px rgba(0,0,0,.5);appearance:none;-webkit-appearance:none;pointer-events:auto;cursor:grab}
+.range-slider input[type=range]:active::-webkit-slider-thumb{cursor:grabbing;background:var(--accent)}
+.range-slider input[type=range]::-moz-range-track{height:4px;background:transparent}
+.range-slider input[type=range]::-moz-range-thumb{width:12px;height:12px;border:2px solid var(--accent);border-radius:50%;background:var(--surface);box-shadow:0 1px 4px rgba(0,0,0,.5);pointer-events:auto;cursor:grab}
+.range-slider input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 3px var(--accent-dim)}
+.range-slider input[type=range]:focus-visible::-moz-range-thumb{box-shadow:0 0 0 3px var(--accent-dim)}
+.range-slider input[type=range]:disabled::-webkit-slider-thumb{border-color:var(--text2);cursor:not-allowed}
+.range-slider input[type=range]:disabled::-moz-range-thumb{border-color:var(--text2);cursor:not-allowed}
+.archive-range-limits{display:flex;justify-content:space-between;gap:12px;margin-top:4px;color:var(--text2);font-size:11px;font-variant-numeric:tabular-nums}
+.archive-range-reset{border:0;background:none;color:var(--accent);font:inherit;font-size:11px;cursor:pointer;padding:0;white-space:nowrap}
+.archive-range-reset:hover{text-decoration:underline}
+.archive-range-reset:disabled{color:var(--text2);cursor:default;text-decoration:none}
 .archive-pager{display:none;align-items:center;justify-content:center;gap:10px;margin-top:14px}
 .archive-page-label{font-size:12px;color:var(--text2);min-width:64px;text-align:center}
 
@@ -351,12 +371,24 @@ tr:last-child td{border-bottom:none}
       <!-- Archive file picker -->
       <div id="file-picker" class="file-picker" style="display:none"></div>
       <div id="archive-controls" class="archive-controls">
-        <span style="font-size:11px;color:var(--text2)">From</span>
-        <input id="arch-from" type="datetime-local" step="1">
-        <span style="font-size:11px;color:var(--text2)">To</span>
-        <input id="arch-to" type="datetime-local" step="1">
-        <button class="btn" onclick="resetArchiveQuery()">Search</button>
-        <button class="btn" onclick="clearArchiveTime()">Reset time</button>
+        <div class="archive-range">
+          <div class="archive-range-head">
+            <span class="archive-range-title">Time range</span>
+            <span id="arch-range-value" class="archive-range-value">Select an archived log</span>
+            <button id="arch-range-reset" class="archive-range-reset" onclick="resetArchiveRange()" disabled>Full range</button>
+          </div>
+          <div class="range-slider">
+            <div class="range-slider-track"></div>
+            <div id="arch-range-fill" class="range-slider-fill" style="left:0;width:100%"></div>
+            <input id="arch-range-start" type="range" min="0" max="10000" value="0" aria-label="Start time"
+              oninput="previewArchiveRange('start')" onchange="commitArchiveRange()" disabled>
+            <input id="arch-range-end" type="range" min="0" max="10000" value="10000" aria-label="End time"
+              oninput="previewArchiveRange('end')" onchange="commitArchiveRange()" disabled>
+          </div>
+          <div class="archive-range-limits">
+            <span id="arch-range-min">—</span><span id="arch-range-max">—</span>
+          </div>
+        </div>
       </div>
       <div id="arch-count" class="arch-count" style="display:none"></div>
 
@@ -406,6 +438,13 @@ let archNextCursor = null;
 let archCursorStack = [];
 let archPage = 1;
 let archMeta = null;
+let archRangeMin = null;
+let archRangeMax = null;
+let archRangeFrom = null;
+let archRangeTo = null;
+let archRangeCommittedFrom = null;
+let archRangeCommittedTo = null;
+const ARCH_RANGE_STEPS = 10000;
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -747,25 +786,19 @@ function parseFileTime(name) {
   return (us > 1e12) ? new Date(us / 1000) : null;
 }
 
-function formatDateTime(date) {
+function formatDateTime(date, includeSeconds = false) {
   if (!date) return '—';
   const p = n => String(n).padStart(2,'0');
   const now = new Date();
   const dp = date.getFullYear() === now.getFullYear()
     ? p(date.getMonth()+1) + '-' + p(date.getDate())
     : date.getFullYear() + '-' + p(date.getMonth()+1) + '-' + p(date.getDate());
-  return dp + ' ' + p(date.getHours()) + ':' + p(date.getMinutes());
+  const seconds = includeSeconds ? ':' + p(date.getSeconds()) : '';
+  return dp + ' ' + p(date.getHours()) + ':' + p(date.getMinutes()) + seconds;
 }
 
 function dateFromMicros(micros) {
   return micros ? new Date(Number(micros) / 1000) : null;
-}
-
-function localInputMicros(id) {
-  const value = document.getElementById(id).value;
-  if (!value) return null;
-  const millis = new Date(value).getTime();
-  return Number.isFinite(millis) ? Math.trunc(millis * 1000) : null;
 }
 
 function fmtBytes(n) {
@@ -822,8 +855,85 @@ function selectArchiveFile(name) {
   if (archFile === name) return;
   archFile = name;
   renderFilePicker();
-  clearArchiveTime(false);
+  const file = archFiles.find(f => f.name === name);
+  setArchiveRange(file ? fMicros(file.start_micros) : null, file ? fMicros(file.end_micros) : null);
   resetArchiveQuery();
+}
+
+function fMicros(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+function setArchiveRange(min, max) {
+  const valid = min !== null && max !== null && max >= min;
+  archRangeMin = valid ? min : null;
+  archRangeMax = valid ? max : null;
+  archRangeFrom = archRangeMin;
+  archRangeTo = archRangeMax;
+  archRangeCommittedFrom = archRangeFrom;
+  archRangeCommittedTo = archRangeTo;
+  const start = document.getElementById('arch-range-start');
+  const end = document.getElementById('arch-range-end');
+  start.value = 0;
+  end.value = ARCH_RANGE_STEPS;
+  start.disabled = !valid || min === max;
+  end.disabled = !valid || min === max;
+  document.getElementById('arch-range-reset').disabled = !valid;
+  renderArchiveRange();
+}
+
+function sliderMicros(value) {
+  if (archRangeMin === null || archRangeMax === null) return null;
+  const ratio = Number(value) / ARCH_RANGE_STEPS;
+  return Math.round(archRangeMin + (archRangeMax - archRangeMin) * ratio);
+}
+
+function previewArchiveRange(handle) {
+  const start = document.getElementById('arch-range-start');
+  const end = document.getElementById('arch-range-end');
+  if (handle === 'start' && Number(start.value) > Number(end.value)) start.value = end.value;
+  if (handle === 'end' && Number(end.value) < Number(start.value)) end.value = start.value;
+  archRangeFrom = sliderMicros(start.value);
+  archRangeTo = sliderMicros(end.value);
+  renderArchiveRange();
+}
+
+function renderArchiveRange() {
+  const value = document.getElementById('arch-range-value');
+  const min = document.getElementById('arch-range-min');
+  const max = document.getElementById('arch-range-max');
+  const fill = document.getElementById('arch-range-fill');
+  if (archRangeMin === null || archRangeMax === null) {
+    value.textContent = 'Time range unavailable for this legacy log';
+    min.textContent = '—'; max.textContent = '—';
+    fill.style.left = '0'; fill.style.width = '100%';
+    return;
+  }
+  const startValue = Number(document.getElementById('arch-range-start').value);
+  const endValue = Number(document.getElementById('arch-range-end').value);
+  value.textContent = formatDateTime(dateFromMicros(archRangeFrom), true) + '  →  ' + formatDateTime(dateFromMicros(archRangeTo), true);
+  min.textContent = formatDateTime(dateFromMicros(archRangeMin), true);
+  max.textContent = formatDateTime(dateFromMicros(archRangeMax), true);
+  fill.style.left = (startValue / ARCH_RANGE_STEPS * 100) + '%';
+  fill.style.width = ((endValue - startValue) / ARCH_RANGE_STEPS * 100) + '%';
+}
+
+function commitArchiveRange() {
+  if (archRangeFrom === archRangeCommittedFrom && archRangeTo === archRangeCommittedTo) return;
+  archRangeCommittedFrom = archRangeFrom;
+  archRangeCommittedTo = archRangeTo;
+  resetArchiveQuery();
+}
+
+function resetArchiveRange() {
+  if (archRangeMin === null || archRangeMax === null) return;
+  document.getElementById('arch-range-start').value = 0;
+  document.getElementById('arch-range-end').value = ARCH_RANGE_STEPS;
+  archRangeFrom = archRangeMin;
+  archRangeTo = archRangeMax;
+  renderArchiveRange();
+  commitArchiveRange();
 }
 
 function resetArchiveQuery() {
@@ -834,12 +944,6 @@ function resetArchiveQuery() {
   loadArchive();
 }
 
-function clearArchiveTime(reload = true) {
-  document.getElementById('arch-from').value = '';
-  document.getElementById('arch-to').value = '';
-  if (reload && archFile) resetArchiveQuery();
-}
-
 async function loadArchive() {
   if (!archFile) return;
   const filter = document.getElementById('ql-filter').value.trim();
@@ -848,10 +952,8 @@ async function loadArchive() {
   if (filter) url += '&q=' + encodeURIComponent(filter);
   if (activeRcode !== '*') url += '&rcode=' + encodeURIComponent(activeRcode);
   if (activeSource !== '*') url += '&source=' + encodeURIComponent(activeSource);
-  const from = localInputMicros('arch-from');
-  const to = localInputMicros('arch-to');
-  if (from !== null) url += '&from=' + from;
-  if (to !== null) url += '&to=' + to;
+  if (archRangeFrom !== null && archRangeFrom > archRangeMin) url += '&from=' + archRangeFrom;
+  if (archRangeTo !== null && archRangeTo < archRangeMax) url += '&to=' + archRangeTo;
   document.getElementById('ql-tbody').innerHTML =
     '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Loading…</td></tr>';
   document.getElementById('ql-more').style.display = 'none';
