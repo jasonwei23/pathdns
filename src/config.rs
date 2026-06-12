@@ -427,7 +427,7 @@ impl Config {
                 .cache
                 .as_ref()
                 .and_then(|c| c.stale_client_timeout_ms)
-                .unwrap_or(0),
+                .unwrap_or(1800),
             cache_nodata_ttl: json.cache.as_ref().and_then(|c| c.nodata_ttl).unwrap_or(60),
             cache_min_ttl,
             cache_max_ttl,
