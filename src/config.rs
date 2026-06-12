@@ -322,7 +322,10 @@ impl Config {
         }
 
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
-        let udp_pool_size = json.upstream_udp_sockets.unwrap_or(worker_threads.max(32)).max(1);
+        let udp_pool_size = json
+            .upstream_udp_sockets
+            .unwrap_or(worker_threads.max(32))
+            .max(1);
 
         // Parse querylog section.
         let querylog = if let Some(ql) = json.querylog {
@@ -517,10 +520,7 @@ fn print_help() {
 ///   IPs are in the configured ipset, the primary's answer is used, otherwise
 ///   the secondary's. This is IP-policy routing, not a latency race, so at least
 ///   one of `ipset-name4`/`ipset-name6` is required.
-fn parse_fallback_config(
-    value: serde_json::Value,
-    groups: &[GroupSpec],
-) -> Result<FallbackConfig> {
+fn parse_fallback_config(value: serde_json::Value, groups: &[GroupSpec]) -> Result<FallbackConfig> {
     let group_exists = |name: &str| groups.iter().any(|g| g.name == name);
 
     // String shorthand: a group name, or "null" for empty responses.
@@ -540,8 +540,8 @@ fn parse_fallback_config(
     }
 
     // Object form: always ipset-test mode.
-    let jf: crate::config_json::JsonFallbackSection = serde_json::from_value(value)
-        .map_err(|e| anyhow!("invalid fallback section: {e}"))?;
+    let jf: crate::config_json::JsonFallbackSection =
+        serde_json::from_value(value).map_err(|e| anyhow!("invalid fallback section: {e}"))?;
 
     let primary = jf.primary.ok_or_else(|| {
         anyhow!(
@@ -788,7 +788,10 @@ fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
         ));
     }
     let (upstream, fixed_rcode) = if rcode_count == 1 {
-        let rcode_url = urls.iter().find(|u| u.to_ascii_uppercase().starts_with("RCODE://")).unwrap();
+        let rcode_url = urls
+            .iter()
+            .find(|u| u.to_ascii_uppercase().starts_with("RCODE://"))
+            .unwrap();
         let rcode_name = rcode_url.split_once("://").unwrap().1;
         let rcode = parse_rcode_name(rcode_name)
             .with_context(|| format!("group \"{name}\": invalid RCODE upstream \"{rcode_url}\""))?;
@@ -897,8 +900,8 @@ fn parse_bind_endpoint(raw: &str) -> Result<BindEndpoint> {
     let (udp, tcp) = resolve_bind_proto(raw)?;
     let addr_part = raw.split_once('@').map_or(raw, |(a, _)| a);
     let normalized = normalize_addr_with_default_port(addr_part, 65353);
-    let addr = parse_addr(&normalized)
-        .with_context(|| format!("invalid bind address: {addr_part}"))?;
+    let addr =
+        parse_addr(&normalized).with_context(|| format!("invalid bind address: {addr_part}"))?;
     Ok(BindEndpoint { addr, udp, tcp })
 }
 
@@ -1094,7 +1097,14 @@ fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
 
     let Some((scheme, rest)) = raw.split_once("://") else {
         let addr = parse_addr_with_default_port(raw, 53)?;
-        return Ok(vec![endpoint(UpstreamProto::Udp, addr, None, None, false, None)]);
+        return Ok(vec![endpoint(
+            UpstreamProto::Udp,
+            addr,
+            None,
+            None,
+            false,
+            None,
+        )]);
     };
 
     let proto = parse_upstream_scheme(scheme)?;
@@ -1356,23 +1366,14 @@ mod querylog_tests {
 
     #[test]
     fn invalid_querylog_limits_are_rejected() {
-        assert!(
-            parse(r#"{"fallback":"null","querylog":{"channel":0}}"#).is_err()
-        );
-        assert!(
-            parse(r#"{"fallback":"null","querylog":{"file":{"max-mb":0}}}"#)
-                .is_err()
-        );
-        assert!(parse(
-            r#"{"fallback":"null","querylog":{"file":{"max-segments":0}}}"#
-        )
-        .is_err());
+        assert!(parse(r#"{"fallback":"null","querylog":{"channel":0}}"#).is_err());
+        assert!(parse(r#"{"fallback":"null","querylog":{"file":{"max-mb":0}}}"#).is_err());
+        assert!(parse(r#"{"fallback":"null","querylog":{"file":{"max-segments":0}}}"#).is_err());
     }
 
     #[test]
     fn bind_string_with_proto_suffix() {
-        let cfg = parse(r#"{"fallback":"null","bind":"0.0.0.0:53@udp"}"#)
-            .unwrap();
+        let cfg = parse(r#"{"fallback":"null","bind":"0.0.0.0:53@udp"}"#).unwrap();
         assert_eq!(cfg.bind.len(), 1);
         assert!(cfg.bind[0].udp);
         assert!(!cfg.bind[0].tcp);
@@ -1388,7 +1389,10 @@ mod querylog_tests {
         assert_eq!(cfg.bind.len(), 2);
         assert!(cfg.bind[0].addr.is_ipv4());
         assert!(cfg.bind[0].udp);
-        assert!(!cfg.bind[0].tcp, "@udp suffix in a bind array must disable tcp");
+        assert!(
+            !cfg.bind[0].tcp,
+            "@udp suffix in a bind array must disable tcp"
+        );
         assert!(cfg.bind[1].addr.is_ipv6());
         assert!(cfg.bind[1].udp);
         assert!(cfg.bind[1].tcp);
@@ -1396,10 +1400,7 @@ mod querylog_tests {
 
     #[test]
     fn bind_array_rejects_invalid_proto_suffix() {
-        assert!(parse(
-            r#"{"fallback":"null","bind":["0.0.0.0:53@bogus"]}"#
-        )
-        .is_err());
+        assert!(parse(r#"{"fallback":"null","bind":["0.0.0.0:53@bogus"]}"#).is_err());
     }
 
     #[test]
@@ -1410,10 +1411,8 @@ mod querylog_tests {
 
     #[test]
     fn fallback_string_shorthand_group() {
-        let cfg = parse(
-            r#"{"group":[{"name":"a","upstream":["1.1.1.1"]}],"fallback":"a"}"#,
-        )
-        .unwrap();
+        let cfg =
+            parse(r#"{"group":[{"name":"a","upstream":["1.1.1.1"]}],"fallback":"a"}"#).unwrap();
         assert!(matches!(&cfg.fallback.target, FallbackTarget::Group(g) if g == "a"));
     }
 

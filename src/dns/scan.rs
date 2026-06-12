@@ -1,6 +1,9 @@
 use smallvec::SmallVec;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// `(byte_offset_of_ttl_field, original_clamped_ttl)` pairs collected from all RR sections.
+pub type TtlOffsets = SmallVec<[(usize, u32); 8]>;
+
 pub fn rcode(packet: &[u8]) -> u8 {
     if packet.len() < 4 {
         0
@@ -78,7 +81,7 @@ pub fn effective_ttl_and_offsets(
     nodata_ttl: u32,
     min_ttl: u32,
     max_ttl: u32,
-) -> Option<(u32, SmallVec<[(usize, u32); 8]>)> {
+) -> Option<(u32, TtlOffsets)> {
     if !is_good_reply(packet) {
         return None;
     }
@@ -92,7 +95,11 @@ pub fn effective_ttl_and_offsets(
     // Apply per-RR min/max clamping.
     let clamp = |raw: u32| -> u32 {
         let v = raw.max(min_ttl);
-        if max_ttl > 0 { v.min(max_ttl) } else { v }
+        if max_ttl > 0 {
+            v.min(max_ttl)
+        } else {
+            v
+        }
     };
 
     if an == 0 {
@@ -100,12 +107,17 @@ pub fn effective_ttl_and_offsets(
         let soa = soa_ttl.unwrap_or(nodata_ttl).min(10800);
         let effective = clamp(soa);
         // All RRs in the authority/additional sections share the SOA-derived TTL.
-        let offsets = offset_ttl_pairs.iter().map(|&(off, _)| (off, effective)).collect();
+        let offsets = offset_ttl_pairs
+            .iter()
+            .map(|&(off, _)| (off, effective))
+            .collect();
         Some((effective, offsets))
     } else {
         // Positive response: clamp each RR independently.
-        let offsets: SmallVec<[(usize, u32); 8]> =
-            offset_ttl_pairs.iter().map(|&(off, raw)| (off, clamp(raw))).collect();
+        let offsets: TtlOffsets = offset_ttl_pairs
+            .iter()
+            .map(|&(off, raw)| (off, clamp(raw)))
+            .collect();
         // Entry lifetime is driven by the minimum of the answer-section TTLs.
         let entry_ttl = offsets[..an_offsets]
             .iter()
@@ -150,9 +162,9 @@ fn ttl_offsets_and_soa(
     an: usize,
     ns: usize,
     ar: usize,
-) -> Option<(SmallVec<[(usize, u32); 8]>, usize, Option<u32>)> {
+) -> Option<(TtlOffsets, usize, Option<u32>)> {
     let total = an + ns + ar;
-    let mut offsets: SmallVec<[(usize, u32); 8]> = SmallVec::new();
+    let mut offsets: TtlOffsets = SmallVec::new();
     let mut an_offsets = 0usize;
     let mut soa_ttl: Option<u32> = None;
 

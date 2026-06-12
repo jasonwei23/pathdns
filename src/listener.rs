@@ -10,11 +10,11 @@
 //! allocating a Tokio task. Only cache misses spawn a task for full async upstream resolution.
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
+use crate::dns;
 use crate::pipeline::{
     handle_packet_bytes, handle_packet_slow_preparsed, spawn_cache_refresh, try_fast_path_into,
     FastPathOutcome,
 };
-use crate::dns;
 use crate::server::AppState;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};
 use anyhow::{anyhow, Context, Result};
@@ -171,15 +171,14 @@ async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) ->
         let (stream, peer) = listener.accept().await?;
         // Acquire a connection slot before spawning. When the limit is reached, drop
         // the stream immediately (RST) rather than leaving clients waiting.
-        let conn_permit: Option<OwnedSemaphorePermit> =
-            if let Some(sem) = &state.tcp_conn_limit {
-                match sem.clone().try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => continue, // stream dropped here → client receives RST
-                }
-            } else {
-                None
-            };
+        let conn_permit: Option<OwnedSemaphorePermit> = if let Some(sem) = &state.tcp_conn_limit {
+            match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => continue, // stream dropped here → client receives RST
+            }
+        } else {
+            None
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let _ = handle_tcp_conn(stream, peer, state, conn_permit).await;

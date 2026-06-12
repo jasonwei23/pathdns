@@ -49,7 +49,7 @@ impl EventRing {
         let Ok(buf) = self.buf.read() else {
             return vec![];
         };
-        let limit = limit.min(1000).max(1);
+        let limit = limit.clamp(1, 1000);
         buf.iter()
             .rev()
             .filter(|ev| {
@@ -199,7 +199,11 @@ impl StatsRing {
         let mut result = Vec::with_capacity(buckets);
         for b in 0..buckets {
             let start = b * n / buckets;
-            let end = if b + 1 == buckets { n } else { (b + 1) * n / buckets };
+            let end = if b + 1 == buckets {
+                n
+            } else {
+                (b + 1) * n / buckets
+            };
             let mut agg = PerSecondSnapshot::default();
             for snap in &snaps[start..end] {
                 agg.queries += snap.queries;

@@ -57,4 +57,3 @@ macro_rules! warn_rate_limited {
         $crate::log::warn_rate_limited($last, $interval, format_args!($($arg)*))
     };
 }
-

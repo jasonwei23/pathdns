@@ -77,6 +77,6 @@ pub fn notimp_opcode_reply(query: &[u8]) -> Vec<u8> {
     buf[0] = query[0];
     buf[1] = query[1];
     buf[2] = 0x80 | (query[2] & 0x79); // QR=1, OPCODE and RD copied, AA=0, TC=0
-    buf[3] = 0x84;                       // RA=1, RCODE=4 (NOTIMP)
+    buf[3] = 0x84; // RA=1, RCODE=4 (NOTIMP)
     buf.to_vec()
 }

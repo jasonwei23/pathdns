@@ -83,7 +83,15 @@ pub struct EcsSrc {
 
 impl QueryVariant {
     fn no_edns(rd: bool, ad: bool, cd: bool) -> Self {
-        Self { has_opt: false, do_bit: false, edns_version: 0, rd, ad, cd, ecs_src: None }
+        Self {
+            has_opt: false,
+            do_bit: false,
+            edns_version: 0,
+            rd,
+            ad,
+            cd,
+            ecs_src: None,
+        }
     }
 }
 
@@ -110,7 +118,9 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
     // Walk additional records looking for OPT (type 41).
     let mut pos = question_end;
     for _ in 0..arcount {
-        let Some(name_end) = skip_name(packet, pos) else { break };
+        let Some(name_end) = skip_name(packet, pos) else {
+            break;
+        };
         // OPT fixed header: type(2) class(2) ttl(4) rdlen(2) = 10 bytes
         if name_end + 10 > packet.len() {
             break;
@@ -118,7 +128,10 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
         let rr_type = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
         let rdlen = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
         let rdata_start = name_end + 10;
-        let Some(rdata_end) = rdata_start.checked_add(rdlen).filter(|&e| e <= packet.len()) else {
+        let Some(rdata_end) = rdata_start
+            .checked_add(rdlen)
+            .filter(|&e| e <= packet.len())
+        else {
             break;
         };
 
@@ -127,7 +140,15 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
             let edns_version = packet[name_end + 5];
             let do_bit = (packet[name_end + 6] & 0x80) != 0;
             let ecs_src = extract_ecs_src(packet.get(rdata_start..rdata_end).unwrap_or(&[]));
-            return QueryVariant { has_opt: true, do_bit, edns_version, rd, ad, cd, ecs_src };
+            return QueryVariant {
+                has_opt: true,
+                do_bit,
+                edns_version,
+                rd,
+                ad,
+                cd,
+                ecs_src,
+            };
         }
 
         pos = rdata_end;
@@ -160,7 +181,11 @@ fn extract_ecs_src(rdata: &[u8]) -> Option<EcsSrc> {
                     buf[..n].copy_from_slice(&addr_data[..n]);
                     let plen = prefix_len.min(32);
                     let raw = u32::from_be_bytes(buf);
-                    let mask = if plen == 0 { 0u32 } else { !0u32 << (32 - plen) };
+                    let mask = if plen == 0 {
+                        0u32
+                    } else {
+                        !0u32 << (32 - plen)
+                    };
                     (u128::from(raw & mask), plen)
                 }
                 2 => {
@@ -169,7 +194,11 @@ fn extract_ecs_src(rdata: &[u8]) -> Option<EcsSrc> {
                     buf[..n].copy_from_slice(&addr_data[..n]);
                     let plen = prefix_len.min(128);
                     let raw = u128::from_be_bytes(buf);
-                    let mask = if plen == 0 { 0u128 } else { !0u128 << (128 - plen) };
+                    let mask = if plen == 0 {
+                        0u128
+                    } else {
+                        !0u128 << (128 - plen)
+                    };
                     (raw & mask, plen)
                 }
                 _ => return None,
@@ -210,14 +239,17 @@ pub fn client_udp_payload_size(packet: &[u8], question_end: usize) -> u16 {
     }
     let mut pos = question_end;
     for _ in 0..arcount {
-        let Some(name_end) = skip_name(packet, pos) else { break };
+        let Some(name_end) = skip_name(packet, pos) else {
+            break;
+        };
         if name_end + 10 > packet.len() {
             break;
         }
         let rr_type = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
         let rdlen = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
-        let Some(rdata_end) =
-            (name_end + 10).checked_add(rdlen).filter(|&e| e <= packet.len())
+        let Some(rdata_end) = (name_end + 10)
+            .checked_add(rdlen)
+            .filter(|&e| e <= packet.len())
         else {
             break;
         };
@@ -253,10 +285,13 @@ pub fn maybe_truncate_for_udp(resp: Bytes, query: &[u8]) -> Bytes {
     }
     let mut stub = BytesMut::with_capacity(qe);
     stub.extend_from_slice(&resp[..qe]);
-    stub[2] |= 0x02;                   // set TC (truncated) bit
-    stub[6] = 0; stub[7] = 0;          // ANCOUNT = 0
-    stub[8] = 0; stub[9] = 0;          // NSCOUNT = 0
-    stub[10] = 0; stub[11] = 0;        // ARCOUNT = 0
+    stub[2] |= 0x02; // set TC (truncated) bit
+    stub[6] = 0;
+    stub[7] = 0; // ANCOUNT = 0
+    stub[8] = 0;
+    stub[9] = 0; // NSCOUNT = 0
+    stub[10] = 0;
+    stub[11] = 0; // ARCOUNT = 0
     stub.freeze()
 }
 
@@ -368,11 +403,8 @@ pub fn verify_qname_case_echo(
     }
 
     let mut pos = 0usize;
-    loop {
-        let len = match sent_q.get(pos) {
-            Some(&v) => v as usize,
-            None => break,
-        };
+    while let Some(&v) = sent_q.get(pos) {
+        let len = v as usize;
         if len == 0 {
             break;
         }
@@ -389,10 +421,8 @@ pub fn verify_qname_case_echo(
                 Some(&v) => v,
                 None => return true,
             };
-            if s != r {
-                if r != s.to_ascii_lowercase() {
-                    return false;
-                }
+            if s != r && r != s.to_ascii_lowercase() {
+                return false;
             }
         }
         pos += len;
@@ -449,9 +479,9 @@ mod tests {
         q[11] = 1; // ARCOUNT = 1
         let [hi, lo] = payload_size.to_be_bytes();
         q.extend_from_slice(&[
-            0x00,       // root owner name
+            0x00, // root owner name
             0x00, 0x29, // type OPT (41)
-            hi, lo,     // UDP payload size
+            hi, lo, // UDP payload size
             0x00, 0x00, // ext-rcode, version
             0x00, 0x00, // flags
             0x00, 0x00, // RDLEN = 0
@@ -508,7 +538,11 @@ mod tests {
         // TC bit must be set (byte 2, bit 1).
         assert_ne!(stub[2] & 0x02, 0, "TC bit not set");
         // Record counts must be zeroed.
-        assert_eq!(&stub[6..12], &[0, 0, 0, 0, 0, 0], "record counts not zeroed");
+        assert_eq!(
+            &stub[6..12],
+            &[0, 0, 0, 0, 0, 0],
+            "record counts not zeroed"
+        );
     }
 
     #[test]
@@ -540,7 +574,10 @@ mod tests {
         mix_qname_case(&mut q, qe, 12345678u64);
         // At least some bytes in the QNAME should differ from original
         let changed = q[12..qe].iter().zip(original.iter()).any(|(a, b)| a != b);
-        assert!(changed, "mix_qname_case should toggle at least some letters");
+        assert!(
+            changed,
+            "mix_qname_case should toggle at least some letters"
+        );
     }
 
     #[test]

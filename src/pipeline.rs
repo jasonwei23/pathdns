@@ -155,9 +155,10 @@ pub(crate) fn try_fast_path(
     }
 
     // Fast cache read: no qname allocation needed.
-    if let Some(hit) = state
-        .cache
-        .get_with_ecs_fallback(packet, fast_info.question_end, fast_info.id)
+    if let Some(hit) =
+        state
+            .cache
+            .get_with_ecs_fallback(packet, fast_info.question_end, fast_info.id)
     {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
@@ -237,10 +238,12 @@ pub(crate) fn try_fast_path_into(
     }
 
     // Cache hit: write directly into the caller-provided send buffer.
-    if let Some(meta) = state
-        .cache
-        .get_into_with_ecs_fallback(packet, fast_info.question_end, fast_info.id, send_buf)
-    {
+    if let Some(meta) = state.cache.get_into_with_ecs_fallback(
+        packet,
+        fast_info.question_end,
+        fast_info.id,
+        send_buf,
+    ) {
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
         if meta.is_stale && state.stale_client_timeout_ms > 0 {

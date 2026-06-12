@@ -95,7 +95,15 @@ impl InflightRegistry {
                         client_id,
                         question,
                     });
-                    return Ok((id, rx, InflightGuard { registry: self, id, _permit: permit }));
+                    return Ok((
+                        id,
+                        rx,
+                        InflightGuard {
+                            registry: self,
+                            id,
+                            _permit: permit,
+                        },
+                    ));
                 }
                 dashmap::mapref::entry::Entry::Occupied(_) => continue,
             }
@@ -148,6 +156,23 @@ impl InflightRegistry {
     }
 }
 
+/// RAII guard: removes the registered entry on drop (timeout / error paths).
+/// A delivered response removes the entry first via `complete`, making the
+/// removal here a no-op.  The optional semaphore permit is also released on
+/// drop, returning capacity to the inflight cap.
+pub(super) struct InflightGuard<'a> {
+    registry: &'a InflightRegistry,
+    id: u16,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.entries.remove(&self.id);
+        // _permit drops here, atomically returning one slot to the semaphore
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +184,12 @@ mod tests {
 
     /// Build a DNS response with the given upstream ID, opcode, and QDCOUNT.
     /// When qdcount > 0, `question` is repeated that many times in the question section.
-    fn build_response(upstream_id: u16, opcode: u8, qdcount: u16, question: &[u8]) -> (BytesMut, usize) {
+    fn build_response(
+        upstream_id: u16,
+        opcode: u8,
+        qdcount: u16,
+        question: &[u8],
+    ) -> (BytesMut, usize) {
         let mut pkt = BytesMut::new();
         pkt.extend_from_slice(&upstream_id.to_be_bytes());
         pkt.extend_from_slice(&[0x80 | (opcode << 3), 0x80]); // QR=1, opcode, RA=1
@@ -226,22 +256,5 @@ mod tests {
         drop(_r3);
         // All released: should accept again.
         assert!(reg.register("t", 6, q.clone()).is_ok());
-    }
-}
-
-/// RAII guard: removes the registered entry on drop (timeout / error paths).
-/// A delivered response removes the entry first via `complete`, making the
-/// removal here a no-op.  The optional semaphore permit is also released on
-/// drop, returning capacity to the inflight cap.
-pub(super) struct InflightGuard<'a> {
-    registry: &'a InflightRegistry,
-    id: u16,
-    _permit: Option<OwnedSemaphorePermit>,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.registry.entries.remove(&self.id);
-        // _permit drops here, atomically returning one slot to the semaphore
     }
 }

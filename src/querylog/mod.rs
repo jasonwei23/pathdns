@@ -369,7 +369,7 @@ mod tests {
         });
         let _worker = worker.unwrap();
         for _ in 0..65 {
-            handle.try_emit_with(|seq| event(seq));
+            handle.try_emit_with(event);
         }
         assert_eq!(handle.counters.events_enqueued.load(Ordering::Relaxed), 64);
         assert_eq!(
@@ -397,9 +397,9 @@ mod tests {
             worker.file_cfg,
             worker.shutdown,
         ));
-        handle.try_emit_with(|seq| event(seq));
-        handle.try_emit_with(|seq| event(seq));
-        handle.try_emit_with(|seq| event(seq));
+        handle.try_emit_with(event);
+        handle.try_emit_with(event);
+        handle.try_emit_with(event);
         shutdown.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(ring.len(), 3);

@@ -100,7 +100,6 @@ impl VerdictCache {
         self.inner.is_some()
     }
 
-
     /// `true` when an entry inserted at `inserted_unix` is past its deadline.
     /// Only relevant for reloaded entries: in-process entries are expired by the
     /// moka TTL at the same boundary, but a reload restarts the moka clock, so the

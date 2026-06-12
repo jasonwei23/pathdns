@@ -268,11 +268,10 @@ async fn mux_reader_loop(
         // stalls (half-frame deadlock) would otherwise hold the connection open indefinitely
         // while all per-query timeouts fire but the connection is never torn down.
         let mut len_buf = [0u8; 2];
-        let len_ok = match tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await
-        {
-            Ok(Ok(_)) => true,
-            _ => false,
-        };
+        let len_ok = matches!(
+            tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await,
+            Ok(Ok(_))
+        );
         if !len_ok {
             disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;
@@ -288,10 +287,10 @@ async fn mux_reader_loop(
         buf.clear();
         buf.resize(resp_len, 0);
         // Body read also guarded by the same timeout.
-        let body_ok = match tokio::time::timeout(read_timeout, reader.read_exact(&mut buf)).await {
-            Ok(Ok(_)) => true,
-            _ => false,
-        };
+        let body_ok = matches!(
+            tokio::time::timeout(read_timeout, reader.read_exact(&mut buf)).await,
+            Ok(Ok(_))
+        );
         if !body_ok {
             disconnect(&write_conn, &pending, &global_gen, my_gen).await;
             return;

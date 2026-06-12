@@ -221,7 +221,10 @@ fn format_upstream_addr(ep: &UpstreamEndpoint) -> String {
         UpstreamProto::Udp => format!("udp://{host}"),
         UpstreamProto::Tcp => format!("tcp://{host}"),
         UpstreamProto::Tls => format!("tls://{host}"),
-        UpstreamProto::Https => format!("https://{host}{}", ep.path.as_deref().unwrap_or("/dns-query")),
+        UpstreamProto::Https => format!(
+            "https://{host}{}",
+            ep.path.as_deref().unwrap_or("/dns-query")
+        ),
         UpstreamProto::Quic => format!("quic://{host}"),
         UpstreamProto::H3 => format!("h3://{host}{}", ep.path.as_deref().unwrap_or("/dns-query")),
     }
@@ -267,17 +270,15 @@ impl UpstreamPool {
                     .await?;
                     UpstreamTransport::Udp(udp_upstream)
                 }
-                UpstreamProto::Tcp => {
-                    UpstreamTransport::Tcp(Arc::new(TcpMux::new(
-                        node_name,
-                        endpoint.addr,
-                        cfg.timeout,
-                        MuxConnector::Tcp,
-                        cfg.upstream_max_inflight,
-                        endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
-                        cfg.upstream_max_response_bytes,
-                    )))
-                }
+                UpstreamProto::Tcp => UpstreamTransport::Tcp(Arc::new(TcpMux::new(
+                    node_name,
+                    endpoint.addr,
+                    cfg.timeout,
+                    MuxConnector::Tcp,
+                    cfg.upstream_max_inflight,
+                    endpoint.ecs_mode.clone().unwrap_or(EcsMode::Strip),
+                    cfg.upstream_max_response_bytes,
+                ))),
                 UpstreamProto::Tls => {
                     let tls_config = make_tls_config();
                     let server_name = if endpoint.no_sni {
@@ -629,7 +630,10 @@ impl UpstreamPool {
         self.nodes
             .iter()
             .enumerate()
-            .map(|(i, n)| n.stats.snapshot(&format!("{pool_name}-{i}"), &n.addr_display))
+            .map(|(i, n)| {
+                n.stats
+                    .snapshot(&format!("{pool_name}-{i}"), &n.addr_display)
+            })
             .collect()
     }
 }

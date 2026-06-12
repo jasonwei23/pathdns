@@ -42,7 +42,6 @@ impl SetPair {
             IpAddr::V6(_) => self.v6.as_ref(),
         }
     }
-
 }
 
 impl SetName {
@@ -64,7 +63,6 @@ impl SetName {
             Ok(Self::IpSet(raw.to_string()))
         }
     }
-
 }
 
 fn parse_nft_family(value: &str) -> Result<NftFamily> {

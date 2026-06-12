@@ -239,26 +239,12 @@ impl DnsCache {
     /// was still within the stale window; the caller should spawn a background refresh.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, query: &[u8], question_end: usize, client_id: u16) -> Option<CacheLookup> {
-        self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, false)
-    }
-
-    /// Look up and write the response packet into a caller-provided buffer.
-    /// Returns metadata without allocating a new `Bytes` for the packet.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn get_into(
-        &self,
-        query: &[u8],
-        question_end: usize,
-        client_id: u16,
-        out: &mut BytesMut,
-    ) -> Option<CacheLookupMeta> {
-        self.lookup_into(
+        self.lookup(
             query,
             question_end,
             client_id,
             self.stale_expire_ttl > 0,
             false,
-            out,
         )
     }
 
@@ -281,11 +267,23 @@ impl DnsCache {
         question_end: usize,
         client_id: u16,
     ) -> Option<CacheLookup> {
-        if let Some(hit) = self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, false) {
+        if let Some(hit) = self.lookup(
+            query,
+            question_end,
+            client_id,
+            self.stale_expire_ttl > 0,
+            false,
+        ) {
             return Some(hit);
         }
         if dns::extract_variant(query, question_end).ecs_src.is_some() {
-            self.lookup(query, question_end, client_id, self.stale_expire_ttl > 0, true)
+            self.lookup(
+                query,
+                question_end,
+                client_id,
+                self.stale_expire_ttl > 0,
+                true,
+            )
         } else {
             None
         }
@@ -299,11 +297,25 @@ impl DnsCache {
         client_id: u16,
         out: &mut BytesMut,
     ) -> Option<CacheLookupMeta> {
-        if let Some(hit) = self.lookup_into(query, question_end, client_id, self.stale_expire_ttl > 0, false, out) {
+        if let Some(hit) = self.lookup_into(
+            query,
+            question_end,
+            client_id,
+            self.stale_expire_ttl > 0,
+            false,
+            out,
+        ) {
             return Some(hit);
         }
         if dns::extract_variant(query, question_end).ecs_src.is_some() {
-            self.lookup_into(query, question_end, client_id, self.stale_expire_ttl > 0, true, out)
+            self.lookup_into(
+                query,
+                question_end,
+                client_id,
+                self.stale_expire_ttl > 0,
+                true,
+                out,
+            )
         } else {
             None
         }
@@ -374,7 +386,6 @@ impl DnsCache {
         cache.insert(ins.key, entry);
     }
 
-
     /// Discard all cached entries. Called when the routing policy changes (GeoSite reload)
     /// so that stale responses produced under the old group decisions are not returned.
     pub fn invalidate_all(&self) {
@@ -409,7 +420,10 @@ impl DnsCache {
         }
 
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(entry.inserted).as_secs().min(u32::MAX as u64) as u32;
+        let elapsed = now
+            .saturating_duration_since(entry.inserted)
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
             EntryFreshness::Fresh { remaining } => (remaining, false),
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
@@ -468,7 +482,10 @@ impl DnsCache {
         }
 
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(entry.inserted).as_secs().min(u32::MAX as u64) as u32;
+        let elapsed = now
+            .saturating_duration_since(entry.inserted)
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
         let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
             EntryFreshness::Fresh { remaining } => (remaining, false),
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
@@ -1047,12 +1064,12 @@ mod tests {
         query[11] = 1; // ARCOUNT = 1
         let do_byte: u8 = if do_bit { 0x80 } else { 0x00 };
         query.extend_from_slice(&[
-            0x00,             // root owner name
-            0x00, 0x29,       // type OPT (41)
-            0x10, 0x00,       // UDP payload size = 4096
-            0x00, 0x00,       // ext-rcode, EDNS version 0
-            do_byte, 0x00,    // flags — DO bit in high byte
-            0x00, 0x00,       // RDLEN = 0
+            0x00, // root owner name
+            0x00, 0x29, // type OPT (41)
+            0x10, 0x00, // UDP payload size = 4096
+            0x00, 0x00, // ext-rcode, EDNS version 0
+            do_byte, 0x00, // flags — DO bit in high byte
+            0x00, 0x00, // RDLEN = 0
         ]);
         (query, question_end)
     }
@@ -1063,22 +1080,25 @@ mod tests {
         let (_, mut query, question_end) = make_test_packets(100);
         // ECS OPTION-DATA: FAMILY=1 (IPv4), SOURCE-PREFIX-LENGTH=24, SCOPE=0, ADDRESS=1.2.X.0
         let ecs_data: [u8; 7] = [
-            0x00, 0x01,          // FAMILY = 1
-            24,                  // SOURCE-PREFIX-LENGTH
-            0x00,                // SCOPE-PREFIX-LENGTH
-            1, 2, src_ip_last_octet, // Address — 3 bytes for /24
+            0x00,
+            0x01, // FAMILY = 1
+            24,   // SOURCE-PREFIX-LENGTH
+            0x00, // SCOPE-PREFIX-LENGTH
+            1,
+            2,
+            src_ip_last_octet, // Address — 3 bytes for /24
         ];
         let opt_rdata_len: u16 = 4 + ecs_data.len() as u16; // code(2) + len(2) + data
         query[11] = 1; // ARCOUNT = 1
         query.extend_from_slice(&[
-            0x00,       // root owner name
+            0x00, // root owner name
             0x00, 0x29, // type OPT
             0x10, 0x00, // UDP payload size
             0x00, 0x00, // ext-rcode, version
             0x00, 0x00, // flags
         ]);
         query.extend_from_slice(&opt_rdata_len.to_be_bytes()); // RDLEN
-        query.extend_from_slice(&[0x00, 0x0b]);                // OPTION-CODE = 11 (ECS)
+        query.extend_from_slice(&[0x00, 0x0b]); // OPTION-CODE = 11 (ECS)
         query.extend_from_slice(&(ecs_data.len() as u16).to_be_bytes()); // OPTION-LENGTH
         query.extend_from_slice(&ecs_data);
         (query, question_end)
@@ -1167,7 +1187,10 @@ mod tests {
     fn cache_key_strip_ecs_matches_no_ecs_query() {
         // With no ECS, strip_ecs key should equal normal key
         let (_, query, question_end) = make_test_packets(100);
-        assert_eq!(cache_key(&query, question_end), cache_key_strip_ecs(&query, question_end));
+        assert_eq!(
+            cache_key(&query, question_end),
+            cache_key_strip_ecs(&query, question_end)
+        );
     }
 
     #[test]
@@ -1195,7 +1218,9 @@ mod tests {
         // A different ECS subnet should find the strip_ecs cached entry via fallback
         let (query_b, _) = make_ecs_query(77);
         assert!(
-            cache.get_with_ecs_fallback(&query_b, question_end, 1).is_some(),
+            cache
+                .get_with_ecs_fallback(&query_b, question_end, 1)
+                .is_some(),
             "ECS fallback should find the strip-ecs cached entry"
         );
     }

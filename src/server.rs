@@ -164,7 +164,9 @@ impl AppState {
                 if vpath.exists() {
                     let fp = crate::config::cache_fingerprint(&cfg);
                     match verdict_cache.load_from_file(&vpath, fp) {
-                        Ok(n) if n > 0 => crate::startup!("verdict_cache persist=loaded entries={n}"),
+                        Ok(n) if n > 0 => {
+                            crate::startup!("verdict_cache persist=loaded entries={n}")
+                        }
                         Ok(_) => {}
                         Err(e) => crate::startup!("verdict_cache persist=load_failed error={e:#}"),
                     }

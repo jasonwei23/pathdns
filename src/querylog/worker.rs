@@ -39,16 +39,18 @@ pub async fn run_qps_sampler(
     ticker.tick().await;
 
     macro_rules! load {
-        ($field:ident) => { counters.$field.load(Ordering::Relaxed) };
+        ($field:ident) => {
+            counters.$field.load(Ordering::Relaxed)
+        };
     }
     // Capture initial absolute values; deltas are computed each tick.
-    let mut prev_queries    = load!(queries_total);
-    let mut prev_cache      = load!(cache_hits);
-    let mut prev_up_ok      = load!(upstream_ok);
-    let mut prev_up_err     = load!(upstream_err);
-    let mut prev_null       = load!(null_responses);
-    let mut prev_stale      = load!(stale_served);
-    let mut prev_filtered   = load!(filtered);
+    let mut prev_queries = load!(queries_total);
+    let mut prev_cache = load!(cache_hits);
+    let mut prev_up_ok = load!(upstream_ok);
+    let mut prev_up_err = load!(upstream_err);
+    let mut prev_null = load!(null_responses);
+    let mut prev_stale = load!(stale_served);
+    let mut prev_filtered = load!(filtered);
 
     loop {
         tokio::select! {
@@ -150,9 +152,8 @@ pub async fn run(
                         file_state = None;
                     }
                 } else if let Some(cfg) = &file_cfg {
-                    match MsgpackFileState::open(cfg).await {
-                        Ok(fs) => file_state = Some(fs),
-                        Err(_) => {}
+                    if let Ok(fs) = MsgpackFileState::open(cfg).await {
+                        file_state = Some(fs);
                     }
                 }
             }
@@ -197,10 +198,8 @@ async fn process_batch(
     let mut arc_batch: Vec<Arc<QueryLogEvent>> = Vec::with_capacity(batch.len());
     for ev in batch {
         let ev = Arc::new(ev);
-        if ring.enabled() {
-            if ring.push(ev.clone()) {
-                counters.ring_evictions.fetch_add(1, Ordering::Relaxed);
-            }
+        if ring.enabled() && ring.push(ev.clone()) {
+            counters.ring_evictions.fetch_add(1, Ordering::Relaxed);
         }
         arc_batch.push(ev);
     }
@@ -378,9 +377,7 @@ async fn prune_old_files(cfg: &QueryLogFileConfig) -> anyhow::Result<()> {
     let mut files: Vec<String> = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let n = entry.file_name().to_string_lossy().into_owned();
-        if n.starts_with("querylog-")
-            && (n.ends_with(".msgpack") || n.ends_with(".msgpack.gz"))
-        {
+        if n.starts_with("querylog-") && (n.ends_with(".msgpack") || n.ends_with(".msgpack.gz")) {
             files.push(n);
         }
     }
@@ -462,9 +459,9 @@ pub fn read_history_file(
     use std::io::BufReader;
 
     let file = std::fs::File::open(path)?;
-    let limit = limit.min(10_000).max(1);
+    let limit = limit.clamp(1, 10_000);
 
-    let events = if path.to_str().map_or(false, |s| s.ends_with(".gz")) {
+    let events = if path.to_str().is_some_and(|s| s.ends_with(".gz")) {
         let gz = flate2::read::GzDecoder::new(file);
         decode_msgpack_stream(BufReader::new(gz), limit, filter)
     } else {
@@ -485,7 +482,7 @@ fn decode_msgpack_stream<R: std::io::Read>(
         let result: Result<DecodedEvent, _> = serde::de::Deserialize::deserialize(&mut de);
         match result {
             Ok(ev) => {
-                if filter.map_or(true, |f| f.is_empty() || ev.qname.contains(f)) {
+                if filter.is_none_or(|f| f.is_empty() || ev.qname.contains(f)) {
                     events.push(ev);
                     if events.len() >= limit {
                         break;

@@ -50,8 +50,16 @@ pub async fn serve(
                 return;
             };
 
-            let (status, body, content_type) =
-                dispatch(req, &ring, &qps_ring, &stats_ring, &handle, &state, token.as_deref()).await;
+            let (status, body, content_type) = dispatch(
+                req,
+                &ring,
+                &qps_ring,
+                &stats_ring,
+                &handle,
+                &state,
+                token.as_deref(),
+            )
+            .await;
 
             let header = format!(
                 "HTTP/1.1 {status}\r\n\
@@ -310,13 +318,11 @@ async fn dispatch(
             let seconds = parse_query_param(&req.query, "seconds")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3600)
-                .min(86400)
-                .max(1);
+                .clamp(1, 86400);
             let buckets = parse_query_param(&req.query, "buckets")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(12)
-                .min(1440)
-                .max(1);
+                .clamp(1, 1440);
             let snaps = stats_ring.bucket_aggregate(seconds, buckets);
             let json_buckets: Vec<serde_json::Value> = snaps
                 .iter()
@@ -346,8 +352,7 @@ async fn dispatch(
             let seconds = parse_query_param(&req.query, "seconds")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3600)
-                .min(86400)
-                .max(1);
+                .clamp(1, 86400);
             let (agg, from_secs) = stats_ring.aggregate(seconds);
             let to_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -370,7 +375,8 @@ async fn dispatch(
                 "null_responses": agg.null_responses,
                 "stale_served": agg.stale_served,
                 "filtered": agg.filtered,
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
             ("200 OK", body, "application/json")
         }
 
@@ -407,7 +413,12 @@ fn safe_history_filename(name: &str) -> bool {
 
 // ── JSON renderers ────────────────────────────────────────────────────────────
 
-fn render_stats(handle: &QueryLogHandle, qps_ring: &QpsRing, ring: &EventRing, state: &AppState) -> Vec<u8> {
+fn render_stats(
+    handle: &QueryLogHandle,
+    qps_ring: &QpsRing,
+    ring: &EventRing,
+    state: &AppState,
+) -> Vec<u8> {
     let c = &handle.counters;
     let total = c.queries_total.load(Ordering::Relaxed);
     let cache = c.cache_hits.load(Ordering::Relaxed);
@@ -644,7 +655,11 @@ mod tests {
         assert!(!safe_history_filename("../etc/passwd"));
         assert!(!safe_history_filename("other-1234.msgpack.gz")); // wrong prefix
         assert!(!safe_history_filename("querylog-1234/x.msgpack.gz")); // slash
-        assert!(safe_history_filename("querylog-00001749000000000000.msgpack.gz"));
-        assert!(safe_history_filename("querylog-00001749000000000000.msgpack"));
+        assert!(safe_history_filename(
+            "querylog-00001749000000000000.msgpack.gz"
+        ));
+        assert!(safe_history_filename(
+            "querylog-00001749000000000000.msgpack"
+        ));
     }
 }
