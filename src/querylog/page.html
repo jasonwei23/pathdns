@@ -132,6 +132,7 @@ tr:last-child td{border-bottom:none}
 .tag-pill{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;margin:1px 2px}
 .tag-include{background:rgba(34,197,94,.12);color:var(--green)}
 .tag-exclude{background:rgba(239,68,68,.12);color:var(--red)}
+.tag-ip{background:rgba(99,102,241,.12);color:#818cf8;font-family:monospace;font-weight:500}
 .tag-catchall{color:var(--text2);font-style:italic}
 
 /* Mode toggle */
@@ -894,8 +895,16 @@ function modalItem(lbl, val) {
     '<span class="modal-val' + (isNil ? ' nil' : '') + '">' + esc(isNil ? '—' : String(val)) + '</span></div>';
 }
 
+function modalItemHtml(lbl, html) {
+  return '<div class="modal-item"><span class="modal-lbl">' + esc(lbl) + '</span>' +
+    '<span class="modal-val" style="display:flex;flex-wrap:wrap;gap:3px 0;">' + html + '</span></div>';
+}
+
 function openModal(ev) {
-  const ips = Array.isArray(ev.answer_ips) && ev.answer_ips.length ? ev.answer_ips.join(', ') : null;
+  const hasIps = Array.isArray(ev.answer_ips) && ev.answer_ips.length;
+  const ipsHtml = hasIps
+    ? ev.answer_ips.map(ip => '<span class="tag-pill tag-ip">' + esc(ip) + '</span>').join('')
+    : '<span style="color:var(--text2)">—</span>';
   document.getElementById('modal-title').textContent = ev.qname;
   document.getElementById('modal-grid').innerHTML =
     modalItem('Client', ev.client + ':' + (ev.client_port || 0)) +
@@ -906,7 +915,7 @@ function openModal(ev) {
     modalItem('Source', ev.source) +
     modalItem('Group', ev.group) +
     modalItem('Response', (ev.response_bytes || 0) + ' bytes') +
-    modalItem('Answer IPs', ips);
+    modalItemHtml('Answer IPs', ipsHtml);
   document.getElementById('detail-modal').style.display = 'flex';
 }
 
