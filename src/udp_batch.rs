@@ -235,18 +235,12 @@ fn send_batch(socket: &Arc<UdpSocket>, bs: &mut BatchState, items: &[(Bytes, Soc
         libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0)
     };
 
-    // sendmmsg returns -1 only when msgs[0] fails (nothing sent).
+    // sendmmsg returns -1 when msgs[0] fails — nothing was sent.
     // A return value 0 ≤ k < n means msgs[0..k] were sent; msgs[k..n] were not.
-    let first_unsent = if sent < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            0 // kernel buffer full: fall back for all
-        } else {
-            1 // permanent error on msgs[0]: skip it, fall back for the rest
-        }
-    } else {
-        sent as usize
-    };
+    // On any error (WouldBlock or otherwise) fall back for ALL items: we cannot
+    // know whether the error is permanent, and dropping msgs[0] without a retry
+    // silently discards a valid DNS response.
+    let first_unsent = if sent < 0 { 0 } else { sent as usize };
 
     // Spawn async fallback for each unsent response.
     for (resp, peer) in &items[first_unsent..] {
