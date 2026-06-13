@@ -146,7 +146,11 @@ struct HealthStats {
 
 impl HealthStats {
     fn new(max_inflight: u64) -> Self {
-        let window = if max_inflight > 0 { max_inflight } else { u64::MAX };
+        let window = if max_inflight > 0 {
+            max_inflight
+        } else {
+            u64::MAX
+        };
         Self {
             ewma_rtt_us: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),

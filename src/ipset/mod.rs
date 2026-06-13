@@ -97,7 +97,13 @@ impl IpSetManager {
         let mut interval_nft_sets: HashSet<SetName> = HashSet::new();
         for (_, pair) in &add_groups {
             for set in [pair.v4.as_ref(), pair.v6.as_ref()].into_iter().flatten() {
-                if let SetName::NftSet { family, table, set: set_name, mask: Some(_) } = set {
+                if let SetName::NftSet {
+                    family,
+                    table,
+                    set: set_name,
+                    mask: Some(_),
+                } = set
+                {
                     match netfilter_client.query_nft_interval_flag(*family, table, set_name) {
                         Ok(true) => {
                             interval_nft_sets.insert(set.clone());

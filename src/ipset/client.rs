@@ -34,7 +34,9 @@ impl NetfilterClient {
         let seq = self.sock.alloc_seq();
         let req = match set {
             SetName::IpSet { name, .. } => NetfilterRequest::IpsetTest { name, ip },
-            SetName::NftSet { family, table, set, .. } => NetfilterRequest::NftSetTest {
+            SetName::NftSet {
+                family, table, set, ..
+            } => NetfilterRequest::NftSetTest {
                 family: *family,
                 table,
                 set,
@@ -59,9 +61,8 @@ impl NetfilterClient {
         set: &str,
     ) -> Result<bool> {
         let seq = self.sock.alloc_seq();
-        self.sock.send_raw(
-            &NetfilterRequest::NftSetGetMeta { family, table, set }.encode(seq),
-        )?;
+        self.sock
+            .send_raw(&NetfilterRequest::NftSetGetMeta { family, table, set }.encode(seq))?;
         let msg = match self.sock.recv_for_seq(seq) {
             Ok(msg) => msg,
             Err(e) if is_timeout(&e) => return Ok(false),
@@ -85,9 +86,12 @@ impl NetfilterClient {
         }
         match set {
             SetName::IpSet { name, mask } => self.add_ipset(name, ips, *mask),
-            SetName::NftSet { family, table, set: set_name, mask } => {
-                self.add_nftset(*family, table, set_name, ips, *mask, interval)
-            }
+            SetName::NftSet {
+                family,
+                table,
+                set: set_name,
+                mask,
+            } => self.add_nftset(*family, table, set_name, ips, *mask, interval),
         }
     }
 

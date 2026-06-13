@@ -46,8 +46,7 @@ impl DoHUpstream {
             .to_owned();
         let url = format!("https://{server_name}{path}");
 
-        let roots: rustls::RootCertStore =
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+        let roots: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
         let mut tls_cfg = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -152,22 +151,17 @@ impl DoHUpstream {
             .map_err(|e| anyhow!("upstream {}: DoH build request: {e}", self.name))?;
 
         // Connect + send headers/body within the configured timeout.
-        let response_fut = tokio::time::timeout(
-            self.timeout,
-            self.send_request(http_req, body),
-        )
-        .await
-        .map_err(|e| {
-            anyhow::Error::from(e)
-                .context(format!("upstream {}: DoH timeout", self.name))
-        })??;
+        let response_fut = tokio::time::timeout(self.timeout, self.send_request(http_req, body))
+            .await
+            .map_err(|e| {
+                anyhow::Error::from(e).context(format!("upstream {}: DoH timeout", self.name))
+            })??;
 
         // Wait for response headers.
         let response = tokio::time::timeout(self.timeout, response_fut)
             .await
             .map_err(|e| {
-                anyhow::Error::from(e)
-                    .context(format!("upstream {}: DoH timeout", self.name))
+                anyhow::Error::from(e).context(format!("upstream {}: DoH timeout", self.name))
             })?
             .map_err(|e| anyhow!("upstream {}: DoH response: {e}", self.name))?;
 

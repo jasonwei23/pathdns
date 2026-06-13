@@ -384,9 +384,7 @@ impl ReloadWatcher {
     fn reload(&self, state: &AppState) -> Result<()> {
         match self {
             Self::Geosite { tags, .. } => reload_geosite(state, tags),
-            Self::Config { handle, .. } => {
-                handle.block_on(reload_config(state))
-            }
+            Self::Config { handle, .. } => handle.block_on(reload_config(state)),
         }
     }
 }
@@ -436,6 +434,7 @@ fn reload_geosite(state: &AppState, needed_tags: &HashSet<String>) -> Result<()>
     // the old generation will skip the cache write and not re-pollute the fresh cache.
     state.routing_generation.fetch_add(1, Ordering::Release);
     state.cache.invalidate_all();
+    state.verdict_cache.invalidate_all();
     crate::startup!(
         "reload event=geosite status=ok files={} tags={}",
         geosite_files_len,
@@ -471,6 +470,7 @@ async fn reload_config(state: &AppState) -> Result<()> {
     state.geosite.store(geosite);
     state.routing_generation.fetch_add(1, Ordering::Release);
     state.cache.invalidate_all();
+    state.verdict_cache.invalidate_all();
     crate::startup!("reload event=config status=ok");
     Ok(())
 }
@@ -619,16 +619,12 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
             if ep.udp {
                 let s = state.clone();
                 let iface = iface.clone();
-                set.spawn(async move {
-                    listener::serve_udp(ep.addr, iface.as_deref(), s).await
-                });
+                set.spawn(async move { listener::serve_udp(ep.addr, iface.as_deref(), s).await });
             }
             if ep.tcp {
                 let s = state.clone();
                 let iface = iface.clone();
-                set.spawn(async move {
-                    listener::serve_tcp(ep.addr, iface.as_deref(), s).await
-                });
+                set.spawn(async move { listener::serve_tcp(ep.addr, iface.as_deref(), s).await });
             }
         }
     }
@@ -639,4 +635,3 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
         None => Ok(()),
     }
 }
-

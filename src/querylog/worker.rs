@@ -703,8 +703,7 @@ pub fn list_history_files(dir: &Path) -> Vec<HistoryFileInfo> {
         .map(|f| f.name.trim_end_matches(".msgpack.gz").to_owned())
         .collect();
     files.retain(|f| {
-        !f.name.ends_with(".msgpack")
-            || !gz_stems.contains(f.name.trim_end_matches(".msgpack"))
+        !f.name.ends_with(".msgpack") || !gz_stems.contains(f.name.trim_end_matches(".msgpack"))
     });
 
     files
@@ -953,10 +952,14 @@ mod tests {
             client_port: 53,
             qname: Arc::from(format!("host-{seq}.example")),
             qtype: 1,
-            rcode: if seq % 2 == 0 { 0 } else { 3 },
+            rcode: if seq.is_multiple_of(2) { 0 } else { 3 },
             elapsed_us: seq,
             response_bytes: 32,
-            source: if seq % 2 == 0 { "cache" } else { "upstream" },
+            source: if seq.is_multiple_of(2) {
+                "cache"
+            } else {
+                "upstream"
+            },
             group: None,
             answer_ips: smallvec::SmallVec::new(),
         })

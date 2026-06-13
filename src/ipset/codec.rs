@@ -122,9 +122,7 @@ impl<'a> NetfilterRequest<'a> {
     pub(super) fn encode(&self, seq: u32) -> Vec<u8> {
         match *self {
             Self::IpsetTest { name, ip } => encode_ipset_test(name, ip, seq),
-            Self::IpsetAddBatch { name, ips, mask } => {
-                encode_ipset_add_batch(name, ips, mask, seq)
-            }
+            Self::IpsetAddBatch { name, ips, mask } => encode_ipset_add_batch(name, ips, mask, seq),
             Self::NftSetTest {
                 family,
                 table,
@@ -377,7 +375,11 @@ pub(super) fn prefix_end(network: IpAddr, prefix: u8) -> IpAddr {
     match network {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let size = if prefix >= 32 { 1u32 } else { 1u32 << (32 - prefix) };
+            let size = if prefix >= 32 {
+                1u32
+            } else {
+                1u32 << (32 - prefix)
+            };
             IpAddr::V4(Ipv4Addr::from(bits.wrapping_add(size)))
         }
         IpAddr::V6(v6) => {
@@ -491,9 +493,8 @@ impl<'a> Iterator for NlaIter<'a> {
         if end > self.data.len() {
             return None;
         }
-        let nla_type =
-            u16::from_ne_bytes(self.data[self.pos + 2..self.pos + 4].try_into().ok()?)
-                & NLA_TYPE_MASK;
+        let nla_type = u16::from_ne_bytes(self.data[self.pos + 2..self.pos + 4].try_into().ok()?)
+            & NLA_TYPE_MASK;
         let value = &self.data[self.pos + 4..end];
         self.pos = (end + 3) & !3; // advance to next 4-byte boundary
         Some((nla_type, value))

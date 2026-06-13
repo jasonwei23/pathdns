@@ -251,7 +251,14 @@ async fn dispatch(
 
         // List available historical segments and their index metadata.
         ("GET", "/api/querylog/files") => {
-            let dir = state.hot.load().cfg.querylog.file.as_ref().map(|f| f.dir.clone());
+            let dir = state
+                .hot
+                .load()
+                .cfg
+                .querylog
+                .file
+                .as_ref()
+                .map(|f| f.dir.clone());
             match dir {
                 None => {
                     let body = b"[]".to_vec();
@@ -281,14 +288,20 @@ async fn dispatch(
                 parse_query_param(&req.query, "cursor").and_then(|v| v.parse::<u64>().ok());
             let from_micros =
                 parse_query_param(&req.query, "from").and_then(|v| v.parse::<u64>().ok());
-            let to_micros =
-                parse_query_param(&req.query, "to").and_then(|v| v.parse::<u64>().ok());
+            let to_micros = parse_query_param(&req.query, "to").and_then(|v| v.parse::<u64>().ok());
             let qname = parse_query_param(&req.query, "q");
-            let rcode =
-                parse_query_param(&req.query, "rcode").and_then(|v| v.parse::<u8>().ok());
+            let rcode = parse_query_param(&req.query, "rcode").and_then(|v| v.parse::<u8>().ok());
             let source = parse_query_param(&req.query, "source");
 
-            let Some(dir) = state.hot.load().cfg.querylog.file.as_ref().map(|f| f.dir.clone()) else {
+            let Some(dir) = state
+                .hot
+                .load()
+                .cfg
+                .querylog
+                .file
+                .as_ref()
+                .map(|f| f.dir.clone())
+            else {
                 return (
                     "404 Not Found",
                     br#"{"error":"file logging disabled"}"#.to_vec(),
@@ -454,8 +467,9 @@ fn render_stats(
     let up_ok = c.upstream_ok.load(Ordering::Relaxed);
     let up_err = c.upstream_err.load(Ordering::Relaxed);
     let drops = c.inflight_drops.load(Ordering::Relaxed);
-    let udp_truncated  = c.udp_truncated.load(Ordering::Relaxed);
+    let udp_truncated = c.udp_truncated.load(Ordering::Relaxed);
     let udp_send_drops = c.udp_send_drops.load(Ordering::Relaxed);
+    let udp_send_errors = c.udp_send_errors.load(Ordering::Relaxed);
     let queued = c.inflight_queued.load(Ordering::Relaxed);
     let rtt_sum = c.rtt_sum_us.load(Ordering::Relaxed);
     let rtt_n = c.rtt_count.load(Ordering::Relaxed);
@@ -493,6 +507,7 @@ fn render_stats(
         "inflight_drops": drops,
         "udp_truncated": udp_truncated,
         "udp_send_drops": udp_send_drops,
+        "udp_send_errors": udp_send_errors,
         "inflight_queued": queued,
         "avg_resolution_us": avg_resolution_us,
         "qps_now": qps_now,
@@ -679,7 +694,10 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]

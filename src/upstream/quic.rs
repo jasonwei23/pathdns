@@ -53,7 +53,6 @@ pub(super) struct DoQUpstream {
     server_name: String,
     timeout: Duration,
     ecs_mode: EcsMode,
-    next_id: AtomicU32,
     inflight: Arc<tokio::sync::Semaphore>,
     /// Active QUIC connection; `None` when not connected or after error.
     connection: tokio::sync::Mutex<Option<quinn::Connection>>,
@@ -82,7 +81,6 @@ impl DoQUpstream {
             server_name,
             timeout,
             ecs_mode,
-            next_id: AtomicU32::new(random_id_seed()),
             inflight: Arc::new(tokio::sync::Semaphore::new(permits)),
             connection: tokio::sync::Mutex::new(None),
         })
@@ -101,7 +99,10 @@ impl DoQUpstream {
             .map_err(|e| anyhow!("upstream {}: DoQ connect error: {e}", self.name))?;
         let conn = tokio::time::timeout(self.timeout, connecting)
             .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: DoQ connect timeout", self.name)))?
+            .map_err(|e| {
+                anyhow::Error::from(e)
+                    .context(format!("upstream {}: DoQ connect timeout", self.name))
+            })?
             .with_context(|| format!("upstream {}: DoQ QUIC handshake failed", self.name))?;
         *guard = Some(conn.clone());
         Ok(conn)
@@ -110,7 +111,10 @@ impl DoQUpstream {
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
         let _permit = tokio::time::timeout(self.timeout, self.inflight.clone().acquire_owned())
             .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: inflight wait timeout", self.name)))?
+            .map_err(|e| {
+                anyhow::Error::from(e)
+                    .context(format!("upstream {}: inflight wait timeout", self.name))
+            })?
             .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
 
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
@@ -161,9 +165,9 @@ impl DoQUpstream {
             })?;
             Ok(resp)
         };
-        tokio::time::timeout(self.timeout, fut)
-            .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: DoQ timeout", self.name)))?
+        tokio::time::timeout(self.timeout, fut).await.map_err(|e| {
+            anyhow::Error::from(e).context(format!("upstream {}: DoQ timeout", self.name))
+        })?
     }
 }
 
@@ -258,7 +262,10 @@ impl H3Upstream {
 
         let (quic_conn, send_req) = tokio::time::timeout(self.timeout, setup_fut)
             .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: H3 connect timeout", self.name)))??;
+            .map_err(|e| {
+                anyhow::Error::from(e)
+                    .context(format!("upstream {}: H3 connect timeout", self.name))
+            })??;
 
         let cloned = send_req.clone();
         *guard = Some(H3Conn {
@@ -271,7 +278,10 @@ impl H3Upstream {
     pub(super) async fn exchange(&self, req: UpstreamRequest) -> Result<Bytes> {
         let _permit = tokio::time::timeout(self.timeout, self.inflight.clone().acquire_owned())
             .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: inflight wait timeout", self.name)))?
+            .map_err(|e| {
+                anyhow::Error::from(e)
+                    .context(format!("upstream {}: inflight wait timeout", self.name))
+            })?
             .map_err(|_| anyhow!("upstream {}: inflight semaphore closed", self.name))?;
 
         let raw = apply_ecs_mode(&req.packet, &self.ecs_mode);
@@ -351,9 +361,9 @@ impl H3Upstream {
             Ok(body)
         };
 
-        let result = tokio::time::timeout(self.timeout, fut)
-            .await
-            .map_err(|e| anyhow::Error::from(e).context(format!("upstream {}: H3 timeout", self.name)))?;
+        let result = tokio::time::timeout(self.timeout, fut).await.map_err(|e| {
+            anyhow::Error::from(e).context(format!("upstream {}: H3 timeout", self.name))
+        })?;
 
         // On connection-level failure, evict the stored connection so the next query
         // reconnects.  Stream/HTTP errors do not evict the connection.

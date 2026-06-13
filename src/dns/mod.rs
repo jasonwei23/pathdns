@@ -230,7 +230,11 @@ fn parse_ecs_src(opt_data: &[u8]) -> Option<EcsSrc> {
             buf[..n].copy_from_slice(&addr_data[..n]);
             let plen = prefix_len.min(32);
             let raw = u32::from_be_bytes(buf);
-            let mask = if plen == 0 { 0u32 } else { !0u32 << (32 - plen) };
+            let mask = if plen == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - plen)
+            };
             (u128::from(raw & mask), plen)
         }
         2 => {
@@ -239,7 +243,11 @@ fn parse_ecs_src(opt_data: &[u8]) -> Option<EcsSrc> {
             buf[..n].copy_from_slice(&addr_data[..n]);
             let plen = prefix_len.min(128);
             let raw = u128::from_be_bytes(buf);
-            let mask = if plen == 0 { 0u128 } else { !0u128 << (128 - plen) };
+            let mask = if plen == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - plen)
+            };
             (raw & mask, plen)
         }
         _ => return None,

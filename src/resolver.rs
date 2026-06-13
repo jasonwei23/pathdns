@@ -408,9 +408,9 @@ async fn resolve_query(ctx: QueryContext, state: &Arc<AppState>) -> Result<Bytes
     } else {
         None
     };
-    if let Some(group) =
-        hot.routing_index
-            .route(&hot.groups, &ctx.info.qname, geosite.as_deref())
+    if let Some(group) = hot
+        .routing_index
+        .route(&hot.groups, &ctx.info.qname, geosite.as_deref())
     {
         if let Some(target) = group.target() {
             return exchange_with_dedupe(ctx, state, target).await;
@@ -660,7 +660,11 @@ async fn exchange_with_dedupe(
     }
     // If the leader task is cancelled while awaiting upstream I/O, Drop removes
     // the table entry so later callers can become the new leader instead of waiting forever.
-    let mut _leader = SingleflightLeader { state, key: sf_ck, published: false };
+    let mut _leader = SingleflightLeader {
+        state,
+        key: sf_ck,
+        published: false,
+    };
 
     // Leader path: compute skip_cache before consuming packet, clone for cache use.
     let skip_cache = target.skip_cache();
@@ -1183,8 +1187,13 @@ async fn do_cache_refresh(refresh: CacheRefresh, state: &Arc<AppState>) {
         question_end: refresh.question_end,
     };
     let hot = state.hot.load_full();
-    let geosite = if hot.needs_geosite { state.geosite_snapshot() } else { None };
-    let Some(target) = router::choose_refresh_target(&hot, geosite, &refresh.qname, refresh.qtype) else {
+    let geosite = if hot.needs_geosite {
+        state.geosite_snapshot()
+    } else {
+        None
+    };
+    let Some(target) = router::choose_refresh_target(&hot, geosite, &refresh.qname, refresh.qtype)
+    else {
         state.refresh_gate.end(&refresh.key);
         return;
     };
