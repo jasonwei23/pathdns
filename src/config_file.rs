@@ -81,6 +81,11 @@ pub(crate) struct JsonConfig {
     // Query log / dashboard
     pub(crate) querylog: Option<JsonQueryLogSection>,
 
+    // Bootstrap DNS — used only during startup to resolve DoH/DoT/DoQ upstream
+    // hostnames when PathDNS is the system resolver.  Must be plain IP:port
+    // addresses (never hostnames) so they work before any DNS is available.
+    pub(crate) bootstrap_dns: Option<Vec<String>>,
+
     // Upstreams / transport
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) udp_buf_size: Option<usize>,

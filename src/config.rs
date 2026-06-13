@@ -260,6 +260,9 @@ pub struct Config {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
+    /// Plain UDP resolvers used at startup to resolve DoH/DoT/DoQ upstream hostnames.
+    /// Must be IP:port literals so they work before any DNS service is available.
+    pub bootstrap_dns: Vec<SocketAddr>,
 }
 
 impl Config {
@@ -312,7 +315,10 @@ impl Config {
         let upstream_max_inflight = json.upstream_max_inflight.unwrap_or(256);
         let hedge_delay_ms = json.hedge_delay_ms.unwrap_or(0);
 
-        let mut groups = parse_groups(json.group.unwrap_or_default())?;
+        // Parse bootstrap-dns before groups so it can be passed to upstream resolution.
+        let bootstrap_dns = parse_bootstrap_dns(json.bootstrap_dns.unwrap_or_default())?;
+
+        let mut groups = parse_groups(json.group.unwrap_or_default(), &bootstrap_dns)?;
 
         // Apply ECS strip default to all group upstreams.
         for spec in groups.iter_mut() {
@@ -499,6 +505,7 @@ impl Config {
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
             upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
+            bootstrap_dns,
         })
     }
 }
@@ -791,7 +798,7 @@ fn parse_group_filter_qtype(value: Option<serde_json::Value>) -> Result<Vec<u16>
     }
 }
 
-fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
+fn parse_json_group(jg: JsonGroupEntry, bootstrap: &[SocketAddr]) -> Result<GroupSpec> {
     let name = jg.name.trim();
     if name.is_empty() {
         return Err(anyhow!("group name cannot be empty"));
@@ -835,7 +842,7 @@ fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
             .with_context(|| format!("group \"{name}\": invalid RCODE upstream \"{rcode_url}\""))?;
         (Vec::new(), Some(rcode))
     } else {
-        (parse_upstreams(urls)?, None)
+        (parse_upstreams(urls, bootstrap)?, None)
     };
     let cache_policy = parse_group_cache_policy(jg.cache)?;
     let filter_qtype = parse_group_filter_qtype(jg.filter_qtype)?;
@@ -851,10 +858,10 @@ fn parse_json_group(jg: JsonGroupEntry) -> Result<GroupSpec> {
     })
 }
 
-fn parse_groups(json_groups: Vec<JsonGroupEntry>) -> Result<Vec<GroupSpec>> {
+fn parse_groups(json_groups: Vec<JsonGroupEntry>, bootstrap: &[SocketAddr]) -> Result<Vec<GroupSpec>> {
     let mut groups = Vec::new();
     for jg in json_groups {
-        groups.push(parse_json_group(jg)?);
+        groups.push(parse_json_group(jg, bootstrap)?);
     }
 
     // Reject duplicate group names.
@@ -1020,10 +1027,10 @@ fn parse_addr(s: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("failed to resolve address: {s}"))
 }
 
-fn parse_upstreams(items: &[String]) -> Result<Vec<UpstreamEndpoint>> {
+fn parse_upstreams(items: &[String], bootstrap: &[SocketAddr]) -> Result<Vec<UpstreamEndpoint>> {
     let mut out = Vec::new();
     for item in items {
-        out.extend(parse_upstream(item)?);
+        out.extend(parse_upstream(item, bootstrap)?);
     }
     if out.is_empty() {
         return Err(anyhow!("at least one upstream DNS is required"));
@@ -1148,7 +1155,7 @@ fn normalize_ipset_name(value: &str) -> Option<String> {
     }
 }
 
-fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
+fn parse_upstream(raw: &str, bootstrap: &[SocketAddr]) -> Result<Vec<UpstreamEndpoint>> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(anyhow!("upstream cannot be empty"));
@@ -1165,7 +1172,12 @@ fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
     }
 
     let Some((scheme, rest)) = raw.split_once("://") else {
-        let addr = parse_addr_with_default_port(raw, 53)?;
+        // Schemaless: plain IP or hostname, default UDP/53.
+        let normalized = normalize_addr_with_default_port(raw, 53);
+        let host = authority_host(&normalized)?;
+        let port = authority_port(&normalized, 53);
+        let addr = resolve_host(host, port, bootstrap)
+            .with_context(|| format!("upstream '{raw}'"))?;
         return Ok(vec![endpoint(
             UpstreamProto::Udp,
             addr,
@@ -1214,7 +1226,8 @@ fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
 
     let (authority, path) = split_upstream_path(rest_no_query)?;
     let port = proto.default_port();
-    let (host, addr) = parse_authority(authority, port)?;
+    let (host, addr) = resolve_authority(authority, port, bootstrap)
+        .with_context(|| format!("upstream '{raw}'"))?;
     let server_name = sni_override.or_else(|| {
         proto
             .uses_tls_name()
@@ -1321,12 +1334,6 @@ fn split_upstream_path(rest: &str) -> Result<(&str, Option<&str>)> {
     Ok((authority, path))
 }
 
-fn parse_authority(authority: &str, default_port: u16) -> Result<(&str, SocketAddr)> {
-    let addr = parse_addr_with_default_port(authority, default_port)?;
-    let host = authority_host(authority)?;
-    Ok((host, addr))
-}
-
 fn authority_host(authority: &str) -> Result<&str> {
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, tail)) = rest.split_once(']') else {
@@ -1354,6 +1361,201 @@ fn parse_addr_with_default_port(s: &str, default_port: u16) -> Result<SocketAddr
     s.to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("failed to resolve address: {s}"))
+}
+
+// ── Bootstrap DNS — hostname resolution at startup ────────────────────────────
+
+/// Parse `bootstrap-dns` entries.  Must be IP:port literals — hostnames are
+/// rejected to prevent the same chicken-and-egg problem bootstrap DNS solves.
+fn parse_bootstrap_dns(items: Vec<String>) -> Result<Vec<SocketAddr>> {
+    items
+        .into_iter()
+        .map(|s| {
+            let normalized = normalize_addr_with_default_port(&s, 53);
+            // parse::<SocketAddr>() only accepts IP literals, not hostnames.
+            normalized.parse::<SocketAddr>().with_context(|| {
+                format!(
+                    "bootstrap-dns '{s}': must be a literal IP address \
+                     (e.g. \"8.8.8.8\" or \"8.8.8.8:53\"), not a hostname"
+                )
+            })
+        })
+        .collect()
+}
+
+/// Extract the port from a `host:port` or `[ipv6]:port` authority string.
+fn authority_port(authority: &str, default_port: u16) -> u16 {
+    if authority.starts_with('[') {
+        authority
+            .rsplit_once(']')
+            .and_then(|(_, tail)| tail.strip_prefix(':')?.parse::<u16>().ok())
+            .unwrap_or(default_port)
+    } else {
+        authority
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(default_port)
+    }
+}
+
+/// Resolve an upstream `host` to a `SocketAddr`.
+///
+/// IP literals are returned directly.  Hostnames are resolved via `bootstrap`
+/// servers when configured (one-shot UDP queries), or fall back to the system
+/// resolver (`getaddrinfo`).  When PathDNS is the system resolver, set
+/// `bootstrap-dns` to avoid the startup deadlock.
+fn resolve_host(host: &str, port: u16, bootstrap: &[SocketAddr]) -> Result<SocketAddr> {
+    let bare = strip_ipv6_brackets(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    if bootstrap.is_empty() {
+        let target = format!("{host}:{port}");
+        return target
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow!("failed to resolve upstream host '{host}'"));
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for &server in bootstrap {
+        for qtype in [1u16, 28u16] {
+            match bootstrap_udp_query(host, qtype, server) {
+                Ok(ip) => return Ok(SocketAddr::new(ip, port)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no bootstrap servers configured")))
+        .with_context(|| format!("bootstrap DNS: failed to resolve '{host}'"))
+}
+
+/// Like `parse_authority`, but resolves hostnames using bootstrap DNS.
+fn resolve_authority<'a>(
+    authority: &'a str,
+    default_port: u16,
+    bootstrap: &[SocketAddr],
+) -> Result<(&'a str, SocketAddr)> {
+    let host = authority_host(authority)?;
+    let port = authority_port(authority, default_port);
+    let addr = resolve_host(host, port, bootstrap)?;
+    Ok((host, addr))
+}
+
+/// Send a one-shot UDP DNS query and return the first IP of the requested type.
+fn bootstrap_udp_query(hostname: &str, qtype: u16, server: SocketAddr) -> Result<std::net::IpAddr> {
+    use std::net::UdpSocket as StdUdp;
+    let query = build_bootstrap_query(hostname, qtype)?;
+    let bind = if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = StdUdp::bind(bind).context("bootstrap: bind UDP socket")?;
+    sock.set_read_timeout(Some(Duration::from_secs(3)))
+        .context("bootstrap: set read timeout")?;
+    sock.send_to(&query, server)
+        .with_context(|| format!("bootstrap: send query to {server}"))?;
+    let mut buf = [0u8; 512];
+    let (n, _) = sock
+        .recv_from(&mut buf)
+        .with_context(|| format!("bootstrap: no response from {server}"))?;
+    parse_bootstrap_answer(&buf[..n], qtype)
+}
+
+fn build_bootstrap_query(hostname: &str, qtype: u16) -> Result<Vec<u8>> {
+    let mut pkt: Vec<u8> = Vec::with_capacity(64);
+    // Header: ID=0x1000, QR=0 RD=1, QDCOUNT=1, rest=0
+    pkt.extend_from_slice(&[
+        0x10, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    for label in hostname.trim_end_matches('.').split('.') {
+        if label.len() > 63 {
+            return Err(anyhow!(
+                "bootstrap: label too long in hostname '{hostname}'"
+            ));
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0); // root label
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    Ok(pkt)
+}
+
+fn parse_bootstrap_answer(resp: &[u8], qtype: u16) -> Result<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if resp.len() < 12 {
+        return Err(anyhow!("bootstrap: response too short"));
+    }
+    if resp[2] & 0x80 == 0 {
+        return Err(anyhow!("bootstrap: not a response packet"));
+    }
+    let rcode = resp[3] & 0x0f;
+    if rcode != 0 {
+        return Err(anyhow!("bootstrap: RCODE={rcode}"));
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    if ancount == 0 {
+        return Err(anyhow!("bootstrap: NODATA (no answer records)"));
+    }
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_dns_name(resp, pos)?;
+        pos = pos
+            .checked_add(4)
+            .filter(|&p| p <= resp.len())
+            .ok_or_else(|| anyhow!("bootstrap: question section truncated"))?;
+    }
+    for _ in 0..ancount {
+        pos = skip_dns_name(resp, pos)?;
+        if pos + 10 > resp.len() {
+            return Err(anyhow!("bootstrap: answer section truncated"));
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > resp.len() {
+            return Err(anyhow!("bootstrap: RDATA truncated"));
+        }
+        if rtype == qtype {
+            if qtype == 1 && rdlen == 4 {
+                return Ok(IpAddr::V4(Ipv4Addr::new(
+                    resp[pos],
+                    resp[pos + 1],
+                    resp[pos + 2],
+                    resp[pos + 3],
+                )));
+            } else if qtype == 28 && rdlen == 16 {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&resp[pos..pos + 16]);
+                return Ok(IpAddr::V6(Ipv6Addr::from(o)));
+            }
+        }
+        pos += rdlen;
+    }
+    Err(anyhow!(
+        "bootstrap: no {} records in answer",
+        if qtype == 1 { "A" } else { "AAAA" }
+    ))
+}
+
+/// Skip a DNS label sequence (with optional pointer compression) at `pos`.
+/// Returns the position immediately after the name.
+fn skip_dns_name(buf: &[u8], mut pos: usize) -> Result<usize> {
+    loop {
+        if pos >= buf.len() {
+            return Err(anyhow!("bootstrap: name extends past end of packet"));
+        }
+        match buf[pos] >> 6 {
+            0 => {
+                let len = buf[pos] as usize;
+                if len == 0 {
+                    return Ok(pos + 1);
+                }
+                pos += 1 + len;
+            }
+            3 => return Ok(pos + 2), // compression pointer
+            _ => return Err(anyhow!("bootstrap: unsupported label type 0x{:02x}", buf[pos])),
+        }
+    }
 }
 
 impl UpstreamProto {
@@ -1607,5 +1809,80 @@ mod querylog_tests {
     #[test]
     fn interface_empty_name_rejected() {
         assert!(parse(r#"{"fallback":"null","interface":[""]}"#).is_err());
+    }
+
+    // ── bootstrap-dns tests ────────────────────────���──────────────────────────
+
+    #[test]
+    fn bootstrap_dns_ip_only_accepted() {
+        let cfg = parse(r#"{"fallback":"null","bootstrap-dns":["8.8.8.8","1.1.1.1:53","[::1]:5353"]}"#).unwrap();
+        assert_eq!(cfg.bootstrap_dns.len(), 3);
+        assert_eq!(cfg.bootstrap_dns[0].port(), 53);
+        assert_eq!(cfg.bootstrap_dns[1].port(), 53);
+        assert_eq!(cfg.bootstrap_dns[2].port(), 5353);
+    }
+
+    #[test]
+    fn bootstrap_dns_hostname_rejected() {
+        let err = parse(r#"{"fallback":"null","bootstrap-dns":["dns.google"]}"#).unwrap_err();
+        assert!(err.to_string().contains("bootstrap-dns"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_bootstrap_dns_empty_is_ok() {
+        let servers = parse_bootstrap_dns(vec![]).unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn authority_port_returns_default_when_absent() {
+        assert_eq!(authority_port("dns.google", 443), 443);
+        assert_eq!(authority_port("8.8.8.8", 53), 53);
+    }
+
+    #[test]
+    fn authority_port_reads_explicit_port() {
+        assert_eq!(authority_port("dns.google:853", 443), 853);
+        assert_eq!(authority_port("[::1]:5353", 53), 5353);
+    }
+
+    #[test]
+    fn resolve_host_ip_literal_no_dns() {
+        let addr = resolve_host("8.8.8.8", 53, &[]).unwrap();
+        assert_eq!(addr.to_string(), "8.8.8.8:53");
+        let addr6 = resolve_host("::1", 443, &[]).unwrap();
+        assert_eq!(addr6.port(), 443);
+    }
+
+    #[test]
+    fn build_bootstrap_query_produces_valid_header() {
+        let pkt = build_bootstrap_query("example.com", 1).unwrap();
+        // Byte 2 = 0x01 (RD=1), byte 3 = 0x00, QDCOUNT big-endian = 1
+        assert_eq!(pkt[2], 0x01);
+        assert_eq!(pkt[5], 0x01);
+        // QTYPE A at the end (before QCLASS)
+        let qtype = u16::from_be_bytes([pkt[pkt.len() - 4], pkt[pkt.len() - 3]]);
+        assert_eq!(qtype, 1);
+    }
+
+    #[test]
+    fn skip_dns_name_handles_root_label() {
+        let buf = [0u8]; // single root label
+        assert_eq!(skip_dns_name(&buf, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_dns_name_handles_pointer() {
+        let buf = [0xC0, 0x0C]; // pointer to offset 12
+        assert_eq!(skip_dns_name(&buf, 0).unwrap(), 2);
+    }
+
+    #[test]
+    fn bootstrap_dns_upstream_uses_ip_directly() {
+        // An upstream with an IP literal must parse without needing bootstrap servers.
+        let ep = parse_upstream("https://8.8.8.8/dns-query?sni=dns.google", &[]).unwrap();
+        assert_eq!(ep.len(), 1);
+        assert_eq!(ep[0].addr, "8.8.8.8:443".parse().unwrap());
+        assert_eq!(ep[0].server_name.as_deref(), Some("dns.google"));
     }
 }
