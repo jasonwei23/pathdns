@@ -32,7 +32,11 @@ use tokio::task::JoinSet;
 pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
     let (buf_size, n, batch_size) = {
         let hot = state.hot.load();
-        (hot.cfg.udp_buf_size, hot.cfg.worker_threads.max(1), hot.cfg.udp_batch_size)
+        (
+            hot.cfg.udp_buf_size,
+            hot.cfg.worker_threads.max(1),
+            hot.cfg.udp_batch_size,
+        )
     };
     let mut sockets = Vec::with_capacity(n);
     for _ in 0..n {
@@ -105,7 +109,6 @@ pub async fn serve_tcp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
         None => Ok(()),
     }
 }
-
 
 async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) -> Result<()> {
     loop {
@@ -292,7 +295,9 @@ fn create_reuse_port_socket(
         if let Err(e) = set_bindtodevice(fd, name) {
             unsafe { libc::close(fd) };
             return Err(e).with_context(|| {
-                format!("failed to bind socket to interface {name:?} (requires root or CAP_NET_RAW)")
+                format!(
+                    "failed to bind socket to interface {name:?} (requires root or CAP_NET_RAW)"
+                )
             });
         }
     }

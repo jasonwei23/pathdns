@@ -226,8 +226,10 @@ impl TcpMux {
                 "upstream {} tcp response channel closed",
                 self.name
             )),
-            Err(elapsed) => Err(anyhow::Error::from(elapsed)
-                .context(format!("upstream {} tcp timeout", self.name))),
+            Err(elapsed) => {
+                Err(anyhow::Error::from(elapsed)
+                    .context(format!("upstream {} tcp timeout", self.name)))
+            }
         }
     }
 }

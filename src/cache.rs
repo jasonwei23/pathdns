@@ -639,10 +639,7 @@ impl DnsCache {
                 w.write_all(&stale_until_unix.to_le_bytes())?;
                 w.write_all(&entry.ttl.to_le_bytes())?;
 
-                let question = entry
-                    .query
-                    .get(12..entry.question_end)
-                    .unwrap_or_default();
+                let question = entry.query.get(12..entry.question_end).unwrap_or_default();
                 w.write_all(&(question.len() as u32).to_le_bytes())?;
                 w.write_all(question)?;
 

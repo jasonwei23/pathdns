@@ -62,6 +62,69 @@ pub fn parse_query_fast(packet: &[u8]) -> Result<FastQueryInfo> {
     })
 }
 
+fn skip_query_question(packet: &[u8], mut pos: usize) -> Result<usize> {
+    let start = pos;
+    while pos < packet.len() {
+        let len = packet[pos] as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if (len & 0xc0) != 0 {
+            return Err(anyhow!("compressed qname is invalid in query question"));
+        }
+        if len > 63 || pos + len > packet.len() {
+            return Err(anyhow!("invalid dns query question"));
+        }
+        pos += len;
+        // RFC 1035 §2.3.4: full QNAME wire encoding must not exceed 255 bytes.
+        if (pos - start) + 1 > 255 {
+            return Err(anyhow!("qname exceeds 255-byte wire limit"));
+        }
+    }
+    question_tail(packet, pos)
+}
+
+fn question_tail(packet: &[u8], pos: usize) -> Result<usize> {
+    if pos + 4 > packet.len() {
+        return Err(anyhow!("failed to parse dns query question"));
+    }
+    Ok(pos + 4)
+}
+
+fn qname_from_question(packet: &[u8], question_end: usize) -> Result<Arc<str>> {
+    if !is_query(packet) || question_end > packet.len() {
+        return Err(anyhow!("invalid dns query"));
+    }
+    let mut pos = 12usize;
+    let mut qname = String::with_capacity(question_end.saturating_sub(17));
+
+    while pos < packet.len() && pos < question_end {
+        let len = packet[pos] as usize;
+        pos += 1;
+
+        if len == 0 {
+            break;
+        }
+        if (len & 0xc0) != 0 {
+            return Err(anyhow!("compressed qname is invalid in query question"));
+        }
+        if len > 63 || pos + len > question_end {
+            return Err(anyhow!("invalid dns query question"));
+        }
+
+        if !qname.is_empty() {
+            qname.push('.');
+        }
+        for &b in &packet[pos..pos + len] {
+            qname.push((b as char).to_ascii_lowercase());
+        }
+        pos += len;
+    }
+
+    Ok(Arc::from(qname.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,7 +187,7 @@ mod tests {
             ];
             for _ in 0..num_labels {
                 p.push(label_len as u8);
-                p.extend(std::iter::repeat(b'a').take(label_len));
+                p.extend(std::iter::repeat_n(b'a', label_len));
             }
             p.push(0); // root label
             p.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // type A, class IN
@@ -145,67 +208,4 @@ mod tests {
             "4×63-byte label query should be rejected"
         );
     }
-}
-
-fn skip_query_question(packet: &[u8], mut pos: usize) -> Result<usize> {
-    let start = pos;
-    while pos < packet.len() {
-        let len = packet[pos] as usize;
-        pos += 1;
-        if len == 0 {
-            break;
-        }
-        if (len & 0xc0) != 0 {
-            return Err(anyhow!("compressed qname is invalid in query question"));
-        }
-        if len > 63 || pos + len > packet.len() {
-            return Err(anyhow!("invalid dns query question"));
-        }
-        pos += len;
-        // RFC 1035 §2.3.4: full QNAME wire encoding must not exceed 255 bytes.
-        if (pos - start) + 1 > 255 {
-            return Err(anyhow!("qname exceeds 255-byte wire limit"));
-        }
-    }
-    question_tail(packet, pos)
-}
-
-fn question_tail(packet: &[u8], pos: usize) -> Result<usize> {
-    if pos + 4 > packet.len() {
-        return Err(anyhow!("failed to parse dns query question"));
-    }
-    Ok(pos + 4)
-}
-
-fn qname_from_question(packet: &[u8], question_end: usize) -> Result<Arc<str>> {
-    if !is_query(packet) || question_end > packet.len() {
-        return Err(anyhow!("invalid dns query"));
-    }
-    let mut pos = 12usize;
-    let mut qname = String::with_capacity(question_end.saturating_sub(17));
-
-    while pos < packet.len() && pos < question_end {
-        let len = packet[pos] as usize;
-        pos += 1;
-
-        if len == 0 {
-            break;
-        }
-        if (len & 0xc0) != 0 {
-            return Err(anyhow!("compressed qname is invalid in query question"));
-        }
-        if len > 63 || pos + len > question_end {
-            return Err(anyhow!("invalid dns query question"));
-        }
-
-        if !qname.is_empty() {
-            qname.push('.');
-        }
-        for &b in &packet[pos..pos + len] {
-            qname.push((b as char).to_ascii_lowercase());
-        }
-        pos += len;
-    }
-
-    Ok(Arc::from(qname.as_str()))
 }

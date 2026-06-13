@@ -7,20 +7,20 @@ mod config;
 mod config_file;
 mod dns;
 mod domain;
-mod hasher;
 mod geosite;
+mod hasher;
 mod ipset;
 mod listener;
-mod udp_batch;
 mod log;
 mod persist;
-mod resolver;
 mod querylog;
-mod router;
+mod resolver;
 mod route_table;
+mod router;
 mod server;
 mod singleflight;
 mod stats;
+mod udp_batch;
 mod upstream;
 mod verdict_cache;
 
@@ -71,15 +71,17 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
     };
     let (ql_handle, ql_worker, qps_ring, stats_ring, ql_shutdown) = crate::querylog::build(ql_cfg);
 
-    let (app_state, refresh_rx) = server::AppState::new(cfg, Some(config_path), ql_handle.clone()).await?;
+    let (app_state, refresh_rx) =
+        server::AppState::new(cfg, Some(config_path), ql_handle.clone()).await?;
     let state = Arc::new(app_state);
     let (querylog_bind, querylog_token) = {
         let hot = state.hot.load();
-        (hot.cfg.querylog.bind.clone(), hot.cfg.querylog.token.clone())
+        (
+            hot.cfg.querylog.bind.clone(),
+            hot.cfg.querylog.token.clone(),
+        )
     };
-    if querylog_bind.iter().any(|addr| !addr.ip().is_loopback())
-        && querylog_token.is_none()
-    {
+    if querylog_bind.iter().any(|addr| !addr.ip().is_loopback()) && querylog_token.is_none() {
         eprintln!("warn: web dashboard is exposed without authentication");
     }
     resolver::spawn_refresh_worker(state.clone(), refresh_rx);
@@ -148,9 +150,8 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
             let fp = config::cache_fingerprint(&s.hot.load().cfg);
             let vpath = verdict_cache::persist_path_for(&path);
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                    cache_persist_interval,
-                ));
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(cache_persist_interval));
                 ticker.tick().await; // skip immediate first tick
                 loop {
                     ticker.tick().await;

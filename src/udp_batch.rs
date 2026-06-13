@@ -34,8 +34,10 @@ use tokio::net::UdpSocket;
 
 /// Hard upper bound on batch size; user value is clamped to this.
 pub const MAX_BATCH: usize = 64;
-/// Per-slot receive buffer size — DNS queries fit comfortably; EDNS max is 4096.
+/// Fast-path receive slot size. Larger datagrams are detected via MSG_TRUNC and dropped.
 const MAX_PKT: usize = 4096;
+/// Maximum receive batches processed before yielding to Tokio's cooperative scheduler.
+const MAX_RECV_BATCHES_PER_TURN: usize = 32;
 /// Maximum responses queued while the kernel send buffer is saturated.
 /// Once full, excess responses are dropped and counted in `udp_send_drops`.
 const PENDING_SEND_CAP: usize = 256;
@@ -47,19 +49,19 @@ struct BatchState {
     batch_size: usize,
 
     // Recv side — pointers in recv_msgs are pre-wired into these Vecs.
-    recv_bufs:  Vec<Vec<u8>>,                  // [batch_size][MAX_PKT]
-    recv_addrs: Vec<libc::sockaddr_storage>,   // sender addresses filled by recvmmsg
+    recv_bufs: Vec<Vec<u8>>,                 // [batch_size][MAX_PKT]
+    recv_addrs: Vec<libc::sockaddr_storage>, // sender addresses filled by recvmmsg
     // SAFETY-CRITICAL: recv_msgs[i].msg_hdr.msg_iov points into this Vec.
     // Removing this field would leave those pointers dangling → silent memory
     // corruption on the next recvmmsg call.  Do not remove.
     #[allow(dead_code)]
     recv_iovecs: Vec<libc::iovec>,
-    recv_msgs:   Vec<libc::mmsghdr>,
+    recv_msgs: Vec<libc::mmsghdr>,
 
     // Send side — pointers in send_msgs are pre-wired into send_names/send_iovecs.
-    send_names:  Vec<libc::sockaddr_storage>,  // dest addresses written before sendmmsg
-    send_iovecs: Vec<libc::iovec>,             // iov_base/len updated before sendmmsg
-    send_msgs:   Vec<libc::mmsghdr>,
+    send_names: Vec<libc::sockaddr_storage>, // dest addresses written before sendmmsg
+    send_iovecs: Vec<libc::iovec>,           // iov_base/len updated before sendmmsg
+    send_msgs: Vec<libc::mmsghdr>,
 }
 
 // SAFETY: BatchState owns all memory it points to.  The raw pointers in the
@@ -70,51 +72,51 @@ unsafe impl Send for BatchState {}
 
 impl BatchState {
     fn new(batch_size: usize) -> Self {
-        let batch_size = batch_size.min(MAX_BATCH).max(1);
+        let batch_size = batch_size.clamp(1, MAX_BATCH);
         let namelen_full = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
         // ── Recv side ────────────────────────────────────────────────────────
-        let mut recv_bufs: Vec<Vec<u8>> =
-            (0..batch_size).map(|_| vec![0u8; MAX_PKT]).collect();
+        let mut recv_bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; MAX_PKT]).collect();
         let mut recv_addrs: Vec<libc::sockaddr_storage> =
             (0..batch_size).map(|_| unsafe { mem::zeroed() }).collect();
 
         // Allocate all Vecs to final capacity BEFORE storing any raw pointers,
         // so that the heap addresses are stable when we wire them up below.
-        let mut recv_iovecs: Vec<libc::iovec> =
-            vec![unsafe { mem::zeroed() }; batch_size];
-        let mut recv_msgs: Vec<libc::mmsghdr> =
-            vec![unsafe { mem::zeroed() }; batch_size];
+        let mut recv_iovecs: Vec<libc::iovec> = vec![unsafe { mem::zeroed() }; batch_size];
+        let mut recv_msgs: Vec<libc::mmsghdr> = vec![unsafe { mem::zeroed() }; batch_size];
 
         for i in 0..batch_size {
             recv_iovecs[i].iov_base = recv_bufs[i].as_mut_ptr() as *mut libc::c_void;
-            recv_iovecs[i].iov_len  = MAX_PKT;
-            recv_msgs[i].msg_hdr.msg_name    = &mut recv_addrs[i] as *mut _ as *mut libc::c_void;
+            recv_iovecs[i].iov_len = MAX_PKT;
+            recv_msgs[i].msg_hdr.msg_name = &mut recv_addrs[i] as *mut _ as *mut libc::c_void;
             recv_msgs[i].msg_hdr.msg_namelen = namelen_full;
-            recv_msgs[i].msg_hdr.msg_iov     = &mut recv_iovecs[i] as *mut _;
-            recv_msgs[i].msg_hdr.msg_iovlen  = 1 as _; // c_int on musl, size_t on glibc
+            recv_msgs[i].msg_hdr.msg_iov = &mut recv_iovecs[i] as *mut _;
+            recv_msgs[i].msg_hdr.msg_iovlen = 1 as _; // c_int on musl, size_t on glibc
         }
 
         // ── Send side ─────────────────────────────────────────────────────────
         let mut send_names: Vec<libc::sockaddr_storage> =
             (0..batch_size).map(|_| unsafe { mem::zeroed() }).collect();
-        let mut send_iovecs: Vec<libc::iovec> =
-            vec![unsafe { mem::zeroed() }; batch_size];
-        let mut send_msgs: Vec<libc::mmsghdr> =
-            vec![unsafe { mem::zeroed() }; batch_size];
+        let mut send_iovecs: Vec<libc::iovec> = vec![unsafe { mem::zeroed() }; batch_size];
+        let mut send_msgs: Vec<libc::mmsghdr> = vec![unsafe { mem::zeroed() }; batch_size];
 
         for i in 0..batch_size {
             // msg_name and msg_iov are pre-wired; only msg_namelen, iov_base, iov_len
             // need updating before each sendmmsg call (they depend on packet content).
-            send_msgs[i].msg_hdr.msg_name   = &mut send_names[i] as *mut _ as *mut libc::c_void;
-            send_msgs[i].msg_hdr.msg_iov    = &mut send_iovecs[i] as *mut _;
+            send_msgs[i].msg_hdr.msg_name = &mut send_names[i] as *mut _ as *mut libc::c_void;
+            send_msgs[i].msg_hdr.msg_iov = &mut send_iovecs[i] as *mut _;
             send_msgs[i].msg_hdr.msg_iovlen = 1 as _;
         }
 
         Self {
             batch_size,
-            recv_bufs, recv_addrs, recv_iovecs, recv_msgs,
-            send_names, send_iovecs, send_msgs,
+            recv_bufs,
+            recv_addrs,
+            recv_iovecs,
+            recv_msgs,
+            send_names,
+            send_iovecs,
+            send_msgs,
         }
     }
 
@@ -145,7 +147,7 @@ fn write_sockaddr(peer: SocketAddr, sa: &mut libc::sockaddr_storage) -> libc::so
             let p = sa as *mut _ as *mut libc::sockaddr_in;
             unsafe {
                 (*p).sin_family = libc::AF_INET as libc::sa_family_t;
-                (*p).sin_port   = v4.port().to_be();
+                (*p).sin_port = v4.port().to_be();
                 (*p).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
             }
             mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
@@ -153,8 +155,8 @@ fn write_sockaddr(peer: SocketAddr, sa: &mut libc::sockaddr_storage) -> libc::so
         SocketAddr::V6(v6) => {
             let p = sa as *mut _ as *mut libc::sockaddr_in6;
             unsafe {
-                (*p).sin6_family   = libc::AF_INET6 as libc::sa_family_t;
-                (*p).sin6_port     = v6.port().to_be();
+                (*p).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*p).sin6_port = v6.port().to_be();
                 (*p).sin6_addr.s6_addr = v6.ip().octets();
                 (*p).sin6_flowinfo = v6.flowinfo();
                 (*p).sin6_scope_id = v6.scope_id();
@@ -168,10 +170,7 @@ fn write_sockaddr(peer: SocketAddr, sa: &mut libc::sockaddr_storage) -> libc::so
 ///
 /// # Safety
 /// `sa` must have been filled by recvmmsg with `salen > 0`.
-unsafe fn read_sockaddr(
-    sa: &libc::sockaddr_storage,
-    salen: libc::socklen_t,
-) -> Option<SocketAddr> {
+unsafe fn read_sockaddr(sa: &libc::sockaddr_storage, salen: libc::socklen_t) -> Option<SocketAddr> {
     if salen == 0 {
         return None;
     }
@@ -230,27 +229,45 @@ fn fill_send_slot(bs: &mut BatchState, i: usize, resp: &Bytes, peer: SocketAddr)
     let salen = write_sockaddr(peer, &mut bs.send_names[i]);
     bs.send_msgs[i].msg_hdr.msg_namelen = salen;
     bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
-    bs.send_iovecs[i].iov_len  = resp.len();
-    bs.send_msgs[i].msg_len    = 0; // ignored on input by the kernel
+    bs.send_iovecs[i].iov_len = resp.len();
+    bs.send_msgs[i].msg_len = 0; // ignored on input by the kernel
+}
+
+/// Call non-blocking sendmmsg, transparently retrying when interrupted by a signal.
+fn sendmmsg_nonblocking(
+    fd: libc::c_int,
+    msgs: *mut libc::mmsghdr,
+    n: usize,
+) -> std::io::Result<usize> {
+    loop {
+        let sent = unsafe { libc::sendmmsg(fd, msgs, n as libc::c_uint, libc::MSG_DONTWAIT) };
+        if sent >= 0 {
+            return Ok(sent as usize);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Attempt to send `items` via sendmmsg using pre-allocated buffers in `bs`.
 ///
-/// Returns the index of the first item that was NOT sent: `0` if nothing was
-/// sent, `items.len()` if all were sent.  Does NOT spawn any tasks; the caller
-/// queues unsent items into the pending-send deque.
-fn try_send_items(fd: libc::c_int, bs: &mut BatchState, items: &[(Bytes, SocketAddr)]) -> usize {
+/// Returns the number of items sent: `0` if nothing was sent, `items.len()` if
+/// all were sent. Does not spawn tasks; the caller queues unsent items.
+fn try_send_items(
+    fd: libc::c_int,
+    bs: &mut BatchState,
+    items: &[(Bytes, SocketAddr)],
+) -> std::io::Result<usize> {
     let n = items.len();
     if n == 0 {
-        return 0;
+        return Ok(0);
     }
     for (i, (resp, peer)) in items.iter().enumerate() {
         fill_send_slot(bs, i, resp, *peer);
     }
-    // sendmmsg returns -1 when msgs[0] fails (nothing sent); otherwise the
-    // number of messages actually sent.  On any error treat as nothing sent.
-    let sent = unsafe { libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0) };
-    if sent < 0 { 0 } else { sent as usize }
+    sendmmsg_nonblocking(fd, bs.send_msgs.as_mut_ptr(), n)
 }
 
 /// Drain as much of `pending` as possible without blocking.
@@ -259,14 +276,21 @@ fn try_send_items(fd: libc::c_int, bs: &mut BatchState, items: &[(Bytes, SocketA
 /// bit is cleared on WouldBlock, preventing a busy-spin in the outer select.
 /// Stops as soon as the kernel buffer is full (WouldBlock); remaining items stay
 /// in `pending` and are retried when the writable arm fires next.
+#[inline]
+fn pending_send_batch_len(pending_len: usize, active_batch_size: usize, capacity: usize) -> usize {
+    pending_len.min(active_batch_size).min(capacity)
+}
+
 fn drain_pending_sends(
     socket: &UdpSocket,
     fd: libc::c_int,
     bs: &mut BatchState,
+    active_batch_size: usize,
     pending: &mut VecDeque<(Bytes, SocketAddr)>,
+    state: &AppState,
 ) {
     while !pending.is_empty() {
-        let n = pending.len().min(bs.batch_size);
+        let n = pending_send_batch_len(pending.len(), active_batch_size, bs.batch_size);
         // Use as_slices() to get the two contiguous segments of the VecDeque
         // without the O(n) memmove that make_contiguous() would perform when
         // the ring buffer has wrapped.
@@ -276,14 +300,7 @@ fn drain_pending_sends(
         }
 
         let result = socket.try_io(Interest::WRITABLE, || {
-            let sent = unsafe {
-                libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0)
-            };
-            if sent < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(sent as usize)
-            }
+            sendmmsg_nonblocking(fd, bs.send_msgs.as_mut_ptr(), n)
         });
 
         match result {
@@ -300,10 +317,25 @@ fn drain_pending_sends(
             Err(_) => {
                 // Permanent error on msgs[0]: discard it so the deque makes progress.
                 // The DNS client will retry after its own timeout.
+                state
+                    .querylog
+                    .counters
+                    .udp_send_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                state
+                    .querylog
+                    .counters
+                    .udp_send_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 pending.pop_front();
             }
         }
     }
+}
+
+#[inline]
+fn configured_batch_size(state: &AppState) -> usize {
+    state.hot.load().cfg.udp_batch_size.clamp(1, MAX_BATCH)
 }
 
 // ── Main async loop ───────────────────────────────────────────────────────────
@@ -316,7 +348,7 @@ fn drain_pending_sends(
 ///  3. Drain recv: call recvmmsg in a try_io loop until EAGAIN.
 ///     - The effective vlen is re-read from hot config each iteration.
 ///     - If the configured size is larger than the current BatchState capacity,
-///       BatchState is rebuilt in-place (Option B hot-reload: full up/down scaling).
+///       BatchState is rebuilt in-place when growing; shrinking lowers effective vlen.
 ///  4. For each received packet, run try_fast_path_into synchronously.
 ///  5. Send fast-path responses via sendmmsg (zero allocations).
 ///  6. Unsent responses are pushed into a bounded pending-send queue
@@ -324,13 +356,13 @@ fn drain_pending_sends(
 ///     Overflow is dropped and counted in `udp_send_drops`.
 ///  7. Spawn tasks only for slow-path misses (cache miss → upstream).
 pub(crate) async fn serve_udp_batch(
-    socket:     Arc<UdpSocket>,
-    state:      Arc<AppState>,
+    socket: Arc<UdpSocket>,
+    state: Arc<AppState>,
     batch_size: usize,
 ) -> Result<()> {
-    let batch_size = batch_size.min(MAX_BATCH).max(1);
+    let batch_size = batch_size.clamp(1, MAX_BATCH);
     let mut bs = BatchState::new(batch_size);
-    let mut resp_buf   = BytesMut::with_capacity(512);
+    let mut resp_buf = BytesMut::with_capacity(512);
     let mut send_items: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(batch_size);
     let mut pending_sends: VecDeque<(Bytes, SocketAddr)> = VecDeque::new();
 
@@ -351,20 +383,29 @@ pub(crate) async fn serve_udp_batch(
             }
         }
 
-        // Attempt to drain the pending-send queue (kernel buffer may have room now).
-        drain_pending_sends(&socket, fd, &mut bs, &mut pending_sends);
+        // Apply hot-reloaded batch size before sending or receiving. Growing requires
+        // rebuilding the pointer-wired BatchState; shrinking reduces effective vlen.
+        let configured = configured_batch_size(&state);
+        if configured > bs.batch_size {
+            bs = BatchState::new(configured);
+            if configured > send_items.capacity() {
+                send_items.reserve(configured - send_items.len());
+            }
+        }
 
-        // Drain recv: keep calling recvmmsg until EAGAIN.
-        // try_io clears the readiness bit on WouldBlock so tokio re-arms the
-        // edge-triggered notification; calling recvmmsg outside try_io causes
-        // a busy-spin.
+        // Attempt to drain the pending-send queue (kernel buffer may have room now).
+        drain_pending_sends(&socket, fd, &mut bs, configured, &mut pending_sends, &state);
+
+        // Drain recv until EAGAIN, but periodically yield so a sustained UDP flood
+        // cannot monopolize one Tokio worker thread.
+        let mut batches_this_turn = 0usize;
         loop {
             // Re-read batch size from config on each iteration.
             // If the configured size exceeds current BatchState capacity, rebuild it
             // so that hot-reload can scale up as well as down.
             let configured = {
                 let h = state.hot.load();
-                h.cfg.udp_batch_size.min(MAX_BATCH).max(1)
+                h.cfg.udp_batch_size.clamp(1, MAX_BATCH)
             };
             if configured > bs.batch_size {
                 bs = BatchState::new(configured);
@@ -444,11 +485,11 @@ pub(crate) async fn serve_udp_batch(
                             }
                         };
 
-                        let state2  = state.clone();
+                        let state2 = state.clone();
                         let socket2 = socket.clone();
                         tokio::spawn(async move {
                             let query = packet.clone();
-                            match handle_packet_slow_preparsed(
+                            if let Ok(Some(resp)) = handle_packet_slow_preparsed(
                                 packet,
                                 peer,
                                 ClientProto::Udp,
@@ -458,11 +499,8 @@ pub(crate) async fn serve_udp_batch(
                             )
                             .await
                             {
-                                Ok(Some(resp)) => {
-                                    let resp = dns::maybe_truncate_for_udp(resp, &query);
-                                    let _ = socket2.send_to(&resp, peer).await;
-                                }
-                                Ok(None) | Err(_) => {}
+                                let resp = dns::maybe_truncate_for_udp(resp, &query);
+                                let _ = socket2.send_to(&resp, peer).await;
                             }
                         });
                     }
@@ -470,7 +508,19 @@ pub(crate) async fn serve_udp_batch(
             }
 
             if !send_items.is_empty() {
-                let first_unsent = try_send_items(fd, &mut bs, &send_items);
+                let first_unsent = match try_send_items(fd, &mut bs, &send_items) {
+                    Ok(sent) => sent,
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::WouldBlock {
+                            state
+                                .querylog
+                                .counters
+                                .udp_send_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        0
+                    }
+                };
                 // Push unsent items into the bounded pending-send queue instead of
                 // spawning one task per message.  If the queue is full, drop newest
                 // (oldest are more likely to still be within the client's timeout).
@@ -496,7 +546,13 @@ pub(crate) async fn serve_udp_batch(
             // progress even when the outer select! always resolves the readable arm
             // and the writable future is never polled to re-arm EPOLLOUT.
             if !pending_sends.is_empty() {
-                drain_pending_sends(&socket, fd, &mut bs, &mut pending_sends);
+                drain_pending_sends(&socket, fd, &mut bs, configured, &mut pending_sends, &state);
+            }
+
+            batches_this_turn += 1;
+            if batches_this_turn >= MAX_RECV_BATCHES_PER_TURN {
+                tokio::task::yield_now().await;
+                batches_this_turn = 0;
             }
         }
     }
@@ -511,13 +567,13 @@ mod tests {
 
     fn make_dns_query(id: u8) -> Vec<u8> {
         vec![
-            id, 0,             // ID
-            0x01, 0x00,        // QR=0 RD=1
-            0x00, 0x01,        // QDCOUNT=1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // AN/NS/AR = 0
-            4, b't', b'e', b's', b't', 0,         // QNAME: "test"
-            0x00, 0x01,        // QTYPE A
-            0x00, 0x01,        // QCLASS IN
+            id, 0, // ID
+            0x01, 0x00, // QR=0 RD=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR = 0
+            4, b't', b'e', b's', b't', 0, // QNAME: "test"
+            0x00, 0x01, // QTYPE A
+            0x00, 0x01, // QCLASS IN
         ]
     }
 
@@ -551,7 +607,10 @@ mod tests {
             assert!(idx < 32, "unexpected first byte {idx}");
             seen[idx] = true;
         }
-        assert!(seen.iter().all(|&b| b), "not all 32 distinct packets received");
+        assert!(
+            seen.iter().all(|&b| b),
+            "not all 32 distinct packets received"
+        );
     }
 
     #[test]
@@ -582,6 +641,13 @@ mod tests {
             0,
             "MSG_TRUNC was not set for a datagram larger than MAX_PKT"
         );
+    }
+
+    #[test]
+    fn pending_send_batch_respects_hot_reloaded_limit() {
+        assert_eq!(pending_send_batch_len(200, 64, 64), 64);
+        assert_eq!(pending_send_batch_len(200, 1, 64), 1);
+        assert_eq!(pending_send_batch_len(4, 32, 64), 4);
     }
 
     #[test]

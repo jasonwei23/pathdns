@@ -351,7 +351,13 @@ impl Config {
         }
 
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
-        let udp_batch_size = json.udp_batch_size.unwrap_or(32).max(1);
+        let udp_batch_size = json.udp_batch_size.unwrap_or(32);
+        if !(1..=crate::udp_batch::MAX_BATCH).contains(&udp_batch_size) {
+            return Err(anyhow!(
+                "udp-batch-size must be between 1 and {}",
+                crate::udp_batch::MAX_BATCH
+            ));
+        }
         let udp_pool_size = json
             .upstream_udp_sockets
             .unwrap_or(worker_threads.max(32))
@@ -880,10 +886,7 @@ fn parse_interface_filter(names: Vec<String>) -> Result<InterfaceFilter> {
         ));
     }
     if n_deny == names.len() {
-        let excluded: Vec<String> = names
-            .into_iter()
-            .map(|n| n[1..].to_string())
-            .collect();
+        let excluded: Vec<String> = names.into_iter().map(|n| n[1..].to_string()).collect();
         if excluded.iter().any(|n| n.is_empty()) {
             return Err(anyhow!("interface deny entry must not be just '!'"));
         }
@@ -1543,6 +1546,21 @@ mod querylog_tests {
     }
 
     #[test]
+    fn udp_batch_size_accepts_valid_bounds() {
+        let min = parse(r#"{"fallback":"null","udp-batch-size":1}"#).unwrap();
+        assert_eq!(min.udp_batch_size, 1);
+
+        let max = parse(r#"{"fallback":"null","udp-batch-size":64}"#).unwrap();
+        assert_eq!(max.udp_batch_size, 64);
+    }
+
+    #[test]
+    fn udp_batch_size_rejects_out_of_range_values() {
+        assert!(parse(r#"{"fallback":"null","udp-batch-size":0}"#).is_err());
+        assert!(parse(r#"{"fallback":"null","udp-batch-size":65}"#).is_err());
+    }
+
+    #[test]
     fn interface_omitted_defaults_to_all() {
         let cfg = parse(r#"{"fallback":"null"}"#).unwrap();
         assert!(matches!(cfg.interface, InterfaceFilter::All));
@@ -1556,8 +1574,7 @@ mod querylog_tests {
 
     #[test]
     fn interface_allow_list_parsed() {
-        let cfg =
-            parse(r#"{"fallback":"null","interface":["eth0","br-lan"]}"#).unwrap();
+        let cfg = parse(r#"{"fallback":"null","interface":["eth0","br-lan"]}"#).unwrap();
         match &cfg.interface {
             InterfaceFilter::Only(ifaces) => {
                 assert_eq!(ifaces, &["eth0", "br-lan"]);

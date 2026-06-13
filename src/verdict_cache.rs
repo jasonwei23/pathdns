@@ -119,6 +119,17 @@ impl VerdictCache {
         Some(entry.is_primary)
     }
 
+    /// Invalidate all cached routing decisions.
+    ///
+    /// Routing configuration and ipset-backed policy can change independently of
+    /// the cached DNS responses, so callers must clear verdicts whenever routing
+    /// state is reloaded.
+    pub fn invalidate_all(&self) {
+        if let Some(cache) = &self.inner {
+            cache.invalidate_all();
+        }
+    }
+
     pub fn add(&self, qname: &str, is_primary_domain: bool) {
         let Some(cache) = &self.inner else {
             return;
@@ -301,6 +312,17 @@ mod tests {
         assert_eq!(loaded, 1);
         assert_eq!(b.get("example.com"), Some(false));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidate_all_removes_cached_verdicts() {
+        let cache = make_cache(0);
+        cache.add("example.com", true);
+        assert_eq!(cache.get("example.com"), Some(true));
+
+        cache.invalidate_all();
+
+        assert_eq!(cache.get("example.com"), None);
     }
 
     #[test]
