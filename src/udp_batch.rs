@@ -240,7 +240,7 @@ fn sendmmsg_nonblocking(
     n: usize,
 ) -> std::io::Result<usize> {
     loop {
-        let sent = unsafe { libc::sendmmsg(fd, msgs, n as libc::c_uint, libc::MSG_DONTWAIT) };
+        let sent = unsafe { libc::sendmmsg(fd, msgs, n as libc::c_uint, libc::MSG_DONTWAIT as _) };
         if sent >= 0 {
             return Ok(sent as usize);
         }
