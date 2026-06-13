@@ -106,6 +106,8 @@ pub struct QueryLogCounters {
     pub inflight_drops: AtomicU64,
     /// UDP datagrams silently dropped because they exceeded MAX_PKT (MSG_TRUNC).
     pub udp_truncated: AtomicU64,
+    /// UDP responses dropped because the pending-send queue was full (send backpressure).
+    pub udp_send_drops: AtomicU64,
     /// Cumulative upstream RTT sum (µs) — for average latency computation.
     pub rtt_sum_us: AtomicU64,
     pub rtt_count: AtomicU64,
@@ -142,6 +144,7 @@ impl QueryLogCounters {
             inflight_queued: AtomicU64::new(0),
             inflight_drops: AtomicU64::new(0),
             udp_truncated: AtomicU64::new(0),
+            udp_send_drops: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
             rtt_count: AtomicU64::new(0),
             singleflight_hits: AtomicU64::new(0),

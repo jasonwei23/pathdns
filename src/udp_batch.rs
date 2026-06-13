@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use bytes::BytesMut;
 use std::{
+    collections::VecDeque,
     mem,
     net::SocketAddr,
     os::fd::AsRawFd,
@@ -35,6 +36,9 @@ use tokio::net::UdpSocket;
 pub const MAX_BATCH: usize = 64;
 /// Per-slot receive buffer size — DNS queries fit comfortably; EDNS max is 4096.
 const MAX_PKT: usize = 4096;
+/// Maximum responses queued while the kernel send buffer is saturated.
+/// Once full, excess responses are dropped and counted in `udp_send_drops`.
+const PENDING_SEND_CAP: usize = 256;
 
 // ── Pre-allocated per-socket batch state ─────────────────────────────────────
 
@@ -208,20 +212,18 @@ unsafe fn recv_batch(fd: libc::c_int, bs: &mut BatchState, n: usize) -> std::io:
     }
 }
 
-// ── sendmmsg helper ───────────────────────────────────────────────────────────
+// ── sendmmsg helpers ──────────────────────────────────────────────────────────
 
-/// Send `items` via sendmmsg using pre-allocated buffers in `bs`.
+/// Attempt to send `items` via sendmmsg using pre-allocated buffers in `bs`.
 ///
-/// Any messages not sent (partial send or error) fall back to individual
-/// `socket.send_to` async tasks.  Zero heap allocations — all buffers come
-/// from the pre-allocated `BatchState`.
-fn send_batch(socket: &Arc<UdpSocket>, bs: &mut BatchState, items: &[(Bytes, SocketAddr)]) {
+/// Returns the index of the first item that was NOT sent: `0` if nothing was
+/// sent, `items.len()` if all were sent.  Does NOT spawn any tasks; the caller
+/// queues unsent items into the pending-send deque.
+fn try_send_items(fd: libc::c_int, bs: &mut BatchState, items: &[(Bytes, SocketAddr)]) -> usize {
     let n = items.len();
     if n == 0 {
-        return;
+        return 0;
     }
-
-    // Fill in address and payload pointers for this batch.
     for (i, (resp, peer)) in items.iter().enumerate() {
         let salen = write_sockaddr(*peer, &mut bs.send_names[i]);
         bs.send_msgs[i].msg_hdr.msg_namelen = salen;
@@ -229,27 +231,65 @@ fn send_batch(socket: &Arc<UdpSocket>, bs: &mut BatchState, items: &[(Bytes, Soc
         bs.send_iovecs[i].iov_len  = resp.len();
         bs.send_msgs[i].msg_len    = 0; // ignored on input by the kernel
     }
+    // sendmmsg returns -1 when msgs[0] fails (nothing sent); otherwise the
+    // number of messages actually sent.  On any error treat as nothing sent.
+    let sent = unsafe { libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0) };
+    if sent < 0 { 0 } else { sent as usize }
+}
 
-    let fd = socket.as_raw_fd();
-    let sent = unsafe {
-        libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0)
-    };
+/// Drain as much of `pending` as possible without blocking.
+///
+/// Uses `socket.try_io(Interest::WRITABLE, ...)` so tokio's writable-readiness
+/// bit is cleared on WouldBlock, preventing a busy-spin in the outer select.
+/// Stops as soon as the kernel buffer is full (WouldBlock); remaining items stay
+/// in `pending` and are retried when the writable arm fires next.
+fn drain_pending_sends(
+    socket: &UdpSocket,
+    fd: libc::c_int,
+    bs: &mut BatchState,
+    pending: &mut VecDeque<(Bytes, SocketAddr)>,
+) {
+    while !pending.is_empty() {
+        let n = pending.len().min(bs.batch_size);
+        // make_contiguous() avoids allocation: it reorganises the deque storage
+        // so the first `n` elements form a contiguous slice.
+        let slice = pending.make_contiguous();
+        for (i, (resp, peer)) in slice[..n].iter().enumerate() {
+            let salen = write_sockaddr(*peer, &mut bs.send_names[i]);
+            bs.send_msgs[i].msg_hdr.msg_namelen = salen;
+            bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
+            bs.send_iovecs[i].iov_len  = resp.len();
+            bs.send_msgs[i].msg_len    = 0;
+        }
 
-    // sendmmsg returns -1 when msgs[0] fails — nothing was sent.
-    // A return value 0 ≤ k < n means msgs[0..k] were sent; msgs[k..n] were not.
-    // On any error (WouldBlock or otherwise) fall back for ALL items: we cannot
-    // know whether the error is permanent, and dropping msgs[0] without a retry
-    // silently discards a valid DNS response.
-    let first_unsent = if sent < 0 { 0 } else { sent as usize };
-
-    // Spawn async fallback for each unsent response.
-    for (resp, peer) in &items[first_unsent..] {
-        let socket = socket.clone();
-        let resp   = resp.clone();
-        let peer   = *peer;
-        tokio::spawn(async move {
-            let _ = socket.send_to(&resp, peer).await;
+        let result = socket.try_io(Interest::WRITABLE, || {
+            let sent = unsafe {
+                libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0)
+            };
+            if sent < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
+            }
         });
+
+        match result {
+            Ok(sent) => {
+                for _ in 0..sent {
+                    pending.pop_front();
+                }
+                if sent < n {
+                    // Partial: kernel buffer is now full; stop until next writable.
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                // Permanent error on msgs[0]: discard it so the deque makes progress.
+                // The DNS client will retry after its own timeout.
+                pending.pop_front();
+            }
+        }
     }
 }
 
@@ -257,15 +297,19 @@ fn send_batch(socket: &Arc<UdpSocket>, bs: &mut BatchState, items: &[(Bytes, Soc
 
 /// Batch UDP receive/send loop using recvmmsg(2)/sendmmsg(2).
 ///
-/// Each iteration:
-///  1. Await readability.
-///  2. Drain: call recvmmsg in a try_io loop until EAGAIN.  The effective vlen
-///     is read from the hot config each iteration so that a hot-reload of
-///     `udp-batch-size` (scaling down) takes effect without restarting the socket.
-///  3. For each received packet, run try_fast_path_into synchronously.
-///  4. Collect fast-path responses into a send list.
-///  5. Spawn tasks for slow-path misses (cache miss → upstream).
-///  6. Send all fast-path responses in one sendmmsg call (zero allocations).
+/// Each outer-loop iteration:
+///  1. Park until readable; if there are pending sends, also wake on writable.
+///  2. Drain pending-send queue (kernel buffer may have freed up).
+///  3. Drain recv: call recvmmsg in a try_io loop until EAGAIN.
+///     - The effective vlen is re-read from hot config each iteration.
+///     - If the configured size is larger than the current BatchState capacity,
+///       BatchState is rebuilt in-place (Option B hot-reload: full up/down scaling).
+///  4. For each received packet, run try_fast_path_into synchronously.
+///  5. Send fast-path responses via sendmmsg (zero allocations).
+///  6. Unsent responses are pushed into a bounded pending-send queue
+///     (capacity = PENDING_SEND_CAP) rather than spawning per-message tasks.
+///     Overflow is dropped and counted in `udp_send_drops`.
+///  7. Spawn tasks only for slow-path misses (cache miss → upstream).
 pub(crate) async fn serve_udp_batch(
     socket:     Arc<UdpSocket>,
     state:      Arc<AppState>,
@@ -273,26 +317,47 @@ pub(crate) async fn serve_udp_batch(
 ) -> Result<()> {
     let batch_size = batch_size.min(MAX_BATCH).max(1);
     let mut bs = BatchState::new(batch_size);
-    let mut resp_buf  = BytesMut::with_capacity(512);
+    let mut resp_buf   = BytesMut::with_capacity(512);
     let mut send_items: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(batch_size);
+    let mut pending_sends: VecDeque<(Bytes, SocketAddr)> = VecDeque::new();
 
     let fd = socket.as_raw_fd();
 
     loop {
-        // Park until the socket has at least one datagram.
-        socket.readable().await?;
+        // Park until readable, or until writable if we have pending sends to drain.
+        if pending_sends.is_empty() {
+            socket.readable().await?;
+        } else {
+            tokio::select! {
+                biased; // prefer recv to maximise throughput when both are ready
+                r = socket.readable()  => r?,
+                w = socket.writable()  => w?,
+            }
+        }
 
-        // Drain: keep calling recvmmsg until EAGAIN.
+        // Attempt to drain the pending-send queue (kernel buffer may have room now).
+        drain_pending_sends(&socket, fd, &mut bs, &mut pending_sends);
+
+        // Drain recv: keep calling recvmmsg until EAGAIN.
         // try_io clears the readiness bit on WouldBlock so tokio re-arms the
         // edge-triggered notification; calling recvmmsg outside try_io causes
         // a busy-spin.
         loop {
-            // Re-read batch size from config on each drain iteration so that a
-            // hot-reload decreasing udp-batch-size takes effect immediately.
-            let n = {
+            // Re-read batch size from config on each iteration.
+            // If the configured size exceeds current BatchState capacity, rebuild it
+            // so that hot-reload can scale up as well as down.
+            let configured = {
                 let h = state.hot.load();
-                h.cfg.udp_batch_size.min(bs.batch_size).max(1)
+                h.cfg.udp_batch_size.min(MAX_BATCH).max(1)
             };
+            if configured > bs.batch_size {
+                bs = BatchState::new(configured);
+                // Grow send_items capacity to match the new batch size.
+                if configured > send_items.capacity() {
+                    send_items.reserve(configured - send_items.len());
+                }
+            }
+            let n = configured;
 
             bs.reset_recv_namelen(n);
 
@@ -389,7 +454,26 @@ pub(crate) async fn serve_udp_batch(
             }
 
             if !send_items.is_empty() {
-                send_batch(&socket, &mut bs, &send_items);
+                let first_unsent = try_send_items(fd, &mut bs, &send_items);
+                // Push unsent items into the bounded pending-send queue instead of
+                // spawning one task per message.  If the queue is full, drop newest
+                // (oldest are more likely to still be within the client's timeout).
+                let unsent = &send_items[first_unsent..];
+                if !unsent.is_empty() {
+                    let space = PENDING_SEND_CAP.saturating_sub(pending_sends.len());
+                    let to_queue = unsent.len().min(space);
+                    let drop_count = unsent.len() - to_queue;
+                    if drop_count > 0 {
+                        state
+                            .querylog
+                            .counters
+                            .udp_send_drops
+                            .fetch_add(drop_count as u64, Ordering::Relaxed);
+                    }
+                    for (resp, peer) in &unsent[..to_queue] {
+                        pending_sends.push_back((resp.clone(), *peer));
+                    }
+                }
             }
         }
     }

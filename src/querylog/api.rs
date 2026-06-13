@@ -454,7 +454,8 @@ fn render_stats(
     let up_ok = c.upstream_ok.load(Ordering::Relaxed);
     let up_err = c.upstream_err.load(Ordering::Relaxed);
     let drops = c.inflight_drops.load(Ordering::Relaxed);
-    let udp_truncated = c.udp_truncated.load(Ordering::Relaxed);
+    let udp_truncated  = c.udp_truncated.load(Ordering::Relaxed);
+    let udp_send_drops = c.udp_send_drops.load(Ordering::Relaxed);
     let queued = c.inflight_queued.load(Ordering::Relaxed);
     let rtt_sum = c.rtt_sum_us.load(Ordering::Relaxed);
     let rtt_n = c.rtt_count.load(Ordering::Relaxed);
@@ -491,6 +492,7 @@ fn render_stats(
         "upstream_err": up_err,
         "inflight_drops": drops,
         "udp_truncated": udp_truncated,
+        "udp_send_drops": udp_send_drops,
         "inflight_queued": queued,
         "avg_resolution_us": avg_resolution_us,
         "qps_now": qps_now,

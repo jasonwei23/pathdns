@@ -206,6 +206,16 @@ pub struct BindEndpoint {
     pub tcp: bool,
 }
 
+/// Configuration fields are grouped into two hot-reload categories:
+///
+/// **Truly hot-reloadable** (take effect on next request without restarting):
+/// upstreams, routing rules, cache TTL knobs, inflight limits, querylog settings,
+/// `udp-batch-size` (BatchState is rebuilt when size increases).
+///
+/// **Listener-start-only** (ignored by hot-reload; require a full restart):
+/// `bind`, `worker-threads`, `udp-buf-size`, `udp-pool-size`.
+/// These are read once when sockets are created and cannot be changed without
+/// closing and re-opening the sockets.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: Vec<BindEndpoint>,
@@ -214,6 +224,7 @@ pub struct Config {
     pub max_inflight: usize,
     /// 0 = hard-drop immediately; >0 = queue for up to this many ms before dropping.
     pub inflight_queue_ms: u64,
+    /// Listener-start-only: changing this requires a restart.
     pub worker_threads: usize,
     pub fallback: FallbackConfig,
     pub cache_size: usize,
@@ -228,9 +239,11 @@ pub struct Config {
     pub cache_refresh_min_ttl: Option<u32>,
     pub cache_persist_path: Option<PathBuf>,
     pub cache_persist_interval: u64,
+    /// Listener-start-only: changing this requires a restart.
     pub udp_buf_size: usize,
+    /// Listener-start-only: changing this requires a restart.
     pub udp_pool_size: usize,
-    /// Number of UDP datagrams per recvmmsg/sendmmsg batch (Linux only, default 32).
+    /// Hot-reloadable: BatchState is rebuilt in-place when the value increases.
     pub udp_batch_size: usize,
     /// Maximum concurrent TCP client connections. 0 = unlimited.
     pub tcp_max_connections: usize,
