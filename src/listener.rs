@@ -11,7 +11,7 @@
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
 use crate::resolver::{
-    handle_packet_bytes, spawn_cache_refresh, try_fast_path_into, FastPathOutcome,
+    handle_packet_slow_preparsed, spawn_cache_refresh, try_fast_path_into, FastPathOutcome,
 };
 use crate::server::AppState;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};
@@ -212,9 +212,20 @@ async fn handle_tcp_conn(
                 write_tcp_response(&mut stream, &resp, &mut framing_buf).await?;
             }
             FastPathOutcome::Drop => {}
-            FastPathOutcome::Miss { .. } => {
+            FastPathOutcome::Miss { info } => {
                 let packet = Bytes::copy_from_slice(pkt);
-                match handle_packet_bytes(packet, peer, ClientProto::Tcp, state.clone()).await {
+                // Pass pre-parsed fast_info directly; avoids a second parse_query_fast
+                // call that handle_packet_bytes would otherwise perform internally.
+                match handle_packet_slow_preparsed(
+                    packet,
+                    peer,
+                    ClientProto::Tcp,
+                    state.clone(),
+                    info,
+                    None,
+                )
+                .await
+                {
                     Ok(Some(resp)) => {
                         write_tcp_response(&mut stream, &resp, &mut framing_buf).await?
                     }
