@@ -84,6 +84,7 @@ pub(crate) struct JsonConfig {
     // Upstreams / transport
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) udp_buf_size: Option<usize>,
+    pub(crate) udp_batch_size: Option<usize>,
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
     pub(crate) upstream_max_response_bytes: Option<usize>,

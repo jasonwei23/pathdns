@@ -12,6 +12,8 @@ mod geosite;
 mod ipset;
 #[cfg(unix)]
 mod listener;
+#[cfg(target_os = "linux")]
+mod udp_batch;
 mod log;
 mod persist;
 mod resolver;

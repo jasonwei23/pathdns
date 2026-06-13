@@ -230,6 +230,8 @@ pub struct Config {
     pub cache_persist_interval: u64,
     pub udp_buf_size: usize,
     pub udp_pool_size: usize,
+    /// Number of UDP datagrams per recvmmsg/sendmmsg batch (Linux only, default 32).
+    pub udp_batch_size: usize,
     /// Maximum concurrent TCP client connections. 0 = unlimited.
     pub tcp_max_connections: usize,
     /// Timeout for reading the DNS message body. 0 = disabled.
@@ -336,6 +338,7 @@ impl Config {
         }
 
         let udp_buf_size = json.udp_buf_size.unwrap_or(4 * 1024 * 1024);
+        let udp_batch_size = json.udp_batch_size.unwrap_or(32).max(1);
         let udp_pool_size = json
             .upstream_udp_sockets
             .unwrap_or(worker_threads.max(32))
@@ -464,6 +467,7 @@ impl Config {
                 .unwrap_or(0),
             udp_buf_size,
             udp_pool_size,
+            udp_batch_size,
             groups,
             ipset,
             verdict_cache,

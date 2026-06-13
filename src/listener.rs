@@ -5,16 +5,12 @@
 //! and run them in a `JoinSet`. The kernel distributes incoming packets/connections across
 //! the socket group with no central bottleneck.
 //!
-//! UDP fast path: `serve_udp_socket` calls `pipeline::try_fast_path` inline (no `tokio::spawn`)
-//! for every packet. Cache hits and filter hits are processed and sent back without ever
-//! allocating a Tokio task. Only cache misses spawn a task for full async upstream resolution.
+//! UDP fast path: `serve_udp_batch` uses recvmmsg/sendmmsg to process up to 32 packets
+//! per syscall pair. Cache hits and filter hits are batched and sent in one sendmmsg call.
+//! Only cache misses spawn a task for full async upstream resolution.
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
-use crate::dns;
-use crate::resolver::{
-    handle_packet_bytes, handle_packet_slow_preparsed, spawn_cache_refresh, try_fast_path_into,
-    FastPathOutcome,
-};
+use crate::resolver::handle_packet_bytes;
 use crate::server::AppState;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};
 use anyhow::{anyhow, Context, Result};
@@ -28,17 +24,15 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
-const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
-
 /// Bind `worker_threads` SO_REUSEPORT UDP sockets and race them in a `JoinSet`.
 ///
 /// `iface` — when `Some`, each socket is additionally bound to that network
 /// interface via `SO_BINDTODEVICE` so the kernel discards packets from other
 /// interfaces before they reach userspace.
 pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppState>) -> Result<()> {
-    let (buf_size, n) = {
+    let (buf_size, n, batch_size) = {
         let hot = state.hot.load();
-        (hot.cfg.udp_buf_size, hot.cfg.worker_threads.max(1))
+        (hot.cfg.udp_buf_size, hot.cfg.worker_threads.max(1), hot.cfg.udp_batch_size)
     };
     let mut sockets = Vec::with_capacity(n);
     for _ in 0..n {
@@ -54,7 +48,7 @@ pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
         } else {
             crate::startup!("listen udp://{}", addr);
         }
-        return serve_udp_socket(sockets.remove(0), state).await;
+        return crate::udp_batch::serve_udp_batch(sockets.remove(0), state, batch_size).await;
     }
     if let Some(iface) = iface {
         crate::startup!("listen udp://{} shards={} (iface={})", addr, n, iface);
@@ -64,7 +58,7 @@ pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
     let mut set = JoinSet::new();
     for socket in sockets {
         let s = state.clone();
-        set.spawn(serve_udp_socket(socket, s));
+        set.spawn(crate::udp_batch::serve_udp_batch(socket, s, batch_size));
     }
     match set.join_next().await {
         Some(Ok(r)) => r,
@@ -112,84 +106,6 @@ pub async fn serve_tcp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
     }
 }
 
-async fn serve_udp_socket(socket: Arc<UdpSocket>, state: Arc<AppState>) -> Result<()> {
-    let mut recv_buf = BytesMut::with_capacity(MAX_DNS_MESSAGE);
-    let mut send_buf = BytesMut::with_capacity(4096);
-    loop {
-        recv_buf.clear();
-        let (_n, peer) = socket.recv_buf_from(&mut recv_buf).await?;
-
-        match try_fast_path_into(&recv_buf, peer, &state, &mut send_buf) {
-            FastPathOutcome::Response { resp, refresh } => {
-                if let Some(r) = refresh {
-                    spawn_cache_refresh(r, &state);
-                }
-                // Enforce the client's EDNS UDP payload limit (512 for non-EDNS).
-                let resp = crate::dns::maybe_truncate_for_udp(resp, &recv_buf);
-                // Try non-blocking send first; only spawn if the kernel buffer is momentarily full.
-                if let Err(e) = socket.try_send_to(&resp, peer) {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        let socket = socket.clone();
-                        tokio::spawn(async move {
-                            let _ = socket.send_to(&resp, peer).await;
-                        });
-                    }
-                }
-            }
-            FastPathOutcome::Drop => {}
-            FastPathOutcome::Miss { info } => {
-                // Acquire the inflight semaphore permit BEFORE spawning to bound the number
-                // of in-flight tasks. Without this, a UDP flood creates unlimited waiting
-                // tasks that consume memory even while the semaphore is saturated.
-                let permit = match state.limit.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // Semaphore full: reply with SERVFAIL immediately, do not spawn.
-                        state
-                            .querylog
-                            .counters
-                            .inflight_drops
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Ok(sf) = dns::servfail_reply(&recv_buf, info.question_end) {
-                            let _ = socket.try_send_to(&sf, peer);
-                        }
-                        continue;
-                    }
-                };
-                // Cache miss: upstream resolution is async I/O, spawn a task for it.
-                // Materialize the packet only for the async slow path; cache/filter hits
-                // are answered directly from the reusable BytesMut receive buffer.
-                let packet =
-                    std::mem::replace(&mut recv_buf, BytesMut::with_capacity(MAX_DNS_MESSAGE))
-                        .freeze();
-                let state = state.clone();
-                let socket = socket.clone();
-                tokio::spawn(async move {
-                    // Clone is O(1) (Bytes refcount bump); needed to enforce UDP size after
-                    // handle_packet_slow_preparsed takes ownership of `packet`.
-                    let query = packet.clone();
-                    match handle_packet_slow_preparsed(
-                        packet,
-                        peer,
-                        ClientProto::Udp,
-                        state,
-                        info,
-                        Some(permit),
-                    )
-                    .await
-                    {
-                        Ok(Some(resp)) => {
-                            let resp = crate::dns::maybe_truncate_for_udp(resp, &query);
-                            let _ = socket.send_to(&resp, peer).await;
-                        }
-                        Ok(None) => {}
-                        Err(_) => {}
-                    }
-                });
-            }
-        }
-    }
-}
 
 async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) -> Result<()> {
     loop {
