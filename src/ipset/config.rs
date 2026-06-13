@@ -95,14 +95,6 @@ impl SetName {
             })
         }
     }
-
-    /// Prefix-length mask, if one was specified.
-    #[allow(dead_code)]
-    pub(super) fn mask(&self) -> Option<u8> {
-        match self {
-            Self::IpSet { mask, .. } | Self::NftSet { mask, .. } => *mask,
-        }
-    }
 }
 
 fn parse_mask(s: &str) -> Result<Option<u8>> {

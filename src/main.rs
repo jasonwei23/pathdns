@@ -180,23 +180,6 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
         }
     }
 
-    // Load verdict cache from disk on startup if DNS cache persistence is configured.
-    {
-        let hot = state.hot.load();
-        if let Some(path) = &hot.cfg.cache_persist_path {
-            if state.verdict_cache.enabled() {
-                let fp = config::cache_fingerprint(&hot.cfg);
-                let vpath = verdict_cache::persist_path_for(path);
-                if vpath.exists() {
-                    match state.verdict_cache.load_from_file(&vpath, fp) {
-                        Ok(n) => startup!("verdict_cache persist=loaded entries={n}"),
-                        Err(e) => startup!("verdict_cache persist=load_failed error={e:#}"),
-                    }
-                }
-            }
-        }
-    }
-
     // Capture the listener result without `?` so the cache save below always runs,
     // even when the listener exits with an error.
     let serve_result: Result<()> = tokio::select! {
