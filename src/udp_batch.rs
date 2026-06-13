@@ -49,7 +49,9 @@ struct BatchState {
     // Recv side — pointers in recv_msgs are pre-wired into these Vecs.
     recv_bufs:  Vec<Vec<u8>>,                  // [batch_size][MAX_PKT]
     recv_addrs: Vec<libc::sockaddr_storage>,   // sender addresses filled by recvmmsg
-    // Kept alive: recv_msgs[i].msg_hdr.msg_iov points into this Vec.
+    // SAFETY-CRITICAL: recv_msgs[i].msg_hdr.msg_iov points into this Vec.
+    // Removing this field would leave those pointers dangling → silent memory
+    // corruption on the next recvmmsg call.  Do not remove.
     #[allow(dead_code)]
     recv_iovecs: Vec<libc::iovec>,
     recv_msgs:   Vec<libc::mmsghdr>,
@@ -206,13 +208,31 @@ unsafe fn recv_batch(fd: libc::c_int, bs: &mut BatchState, n: usize) -> std::io:
         std::ptr::null_mut(),
     );
     if ret < 0 {
-        Err(std::io::Error::last_os_error())
+        let e = std::io::Error::last_os_error();
+        // EINTR: a signal interrupted the syscall before it ran.  Treat as
+        // WouldBlock so the caller breaks from the drain loop and re-arms at
+        // the top — rather than propagating a fatal error that kills this task.
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        Err(e)
     } else {
         Ok(ret as usize)
     }
 }
 
 // ── sendmmsg helpers ──────────────────────────────────────────────────────────
+
+/// Fill one pre-allocated send slot with address and payload pointers.
+/// Shared by `try_send_items` and `drain_pending_sends`.
+#[inline]
+fn fill_send_slot(bs: &mut BatchState, i: usize, resp: &Bytes, peer: SocketAddr) {
+    let salen = write_sockaddr(peer, &mut bs.send_names[i]);
+    bs.send_msgs[i].msg_hdr.msg_namelen = salen;
+    bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
+    bs.send_iovecs[i].iov_len  = resp.len();
+    bs.send_msgs[i].msg_len    = 0; // ignored on input by the kernel
+}
 
 /// Attempt to send `items` via sendmmsg using pre-allocated buffers in `bs`.
 ///
@@ -225,11 +245,7 @@ fn try_send_items(fd: libc::c_int, bs: &mut BatchState, items: &[(Bytes, SocketA
         return 0;
     }
     for (i, (resp, peer)) in items.iter().enumerate() {
-        let salen = write_sockaddr(*peer, &mut bs.send_names[i]);
-        bs.send_msgs[i].msg_hdr.msg_namelen = salen;
-        bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
-        bs.send_iovecs[i].iov_len  = resp.len();
-        bs.send_msgs[i].msg_len    = 0; // ignored on input by the kernel
+        fill_send_slot(bs, i, resp, *peer);
     }
     // sendmmsg returns -1 when msgs[0] fails (nothing sent); otherwise the
     // number of messages actually sent.  On any error treat as nothing sent.
@@ -251,15 +267,12 @@ fn drain_pending_sends(
 ) {
     while !pending.is_empty() {
         let n = pending.len().min(bs.batch_size);
-        // make_contiguous() avoids allocation: it reorganises the deque storage
-        // so the first `n` elements form a contiguous slice.
-        let slice = pending.make_contiguous();
-        for (i, (resp, peer)) in slice[..n].iter().enumerate() {
-            let salen = write_sockaddr(*peer, &mut bs.send_names[i]);
-            bs.send_msgs[i].msg_hdr.msg_namelen = salen;
-            bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
-            bs.send_iovecs[i].iov_len  = resp.len();
-            bs.send_msgs[i].msg_len    = 0;
+        // Use as_slices() to get the two contiguous segments of the VecDeque
+        // without the O(n) memmove that make_contiguous() would perform when
+        // the ring buffer has wrapped.
+        let (a, b) = pending.as_slices();
+        for (i, (resp, peer)) in a.iter().chain(b.iter()).take(n).enumerate() {
+            fill_send_slot(bs, i, resp, *peer);
         }
 
         let result = socket.try_io(Interest::WRITABLE, || {
@@ -325,11 +338,14 @@ pub(crate) async fn serve_udp_batch(
 
     loop {
         // Park until readable, or until writable if we have pending sends to drain.
+        // No `biased` here: under a sustained read flood, a biased select would
+        // never poll the writable future, preventing Tokio from re-arming the
+        // WRITABLE readiness bit after a prior try_io(WRITABLE)→WouldBlock clears
+        // it, causing drain_pending_sends to become a permanent no-op.
         if pending_sends.is_empty() {
             socket.readable().await?;
         } else {
             tokio::select! {
-                biased; // prefer recv to maximise throughput when both are ready
                 r = socket.readable()  => r?,
                 w = socket.writable()  => w?,
             }
@@ -474,6 +490,13 @@ pub(crate) async fn serve_udp_batch(
                         pending_sends.push_back((resp.clone(), *peer));
                     }
                 }
+            }
+
+            // Attempt to drain pending sends after each recv batch.  This ensures
+            // progress even when the outer select! always resolves the readable arm
+            // and the writable future is never polled to re-arm EPOLLOUT.
+            if !pending_sends.is_empty() {
+                drain_pending_sends(&socket, fd, &mut bs, &mut pending_sends);
             }
         }
     }
