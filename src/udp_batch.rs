@@ -318,6 +318,16 @@ pub(crate) async fn serve_udp_batch(
             send_items.clear();
 
             for i in 0..n_recv {
+                // Drop datagrams truncated by the kernel (larger than MAX_PKT).
+                // recvmmsg sets MSG_TRUNC in msg_flags when the datagram didn't fit.
+                if bs.recv_msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                    state
+                        .querylog
+                        .counters
+                        .udp_truncated
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let pkt_len = bs.recv_msgs[i].msg_len as usize;
                 if pkt_len == 0 {
                     continue;
@@ -441,6 +451,36 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|&b| b), "not all 32 distinct packets received");
+    }
+
+    #[test]
+    fn truncated_packet_sets_msg_trunc_flag() {
+        // Send a datagram larger than MAX_PKT (4096). The kernel will truncate it
+        // to MAX_PKT bytes and set MSG_TRUNC in msg_flags.
+        let server = StdUdp::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let sender = StdUdp::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let big_pkt = vec![0xABu8; MAX_PKT + 1]; // 4097 bytes — exceeds slot size
+        sender.send_to(&big_pkt, addr).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let fd = AsRawFd::as_raw_fd(&server);
+        let mut bs = BatchState::new(1);
+        bs.reset_recv_namelen(1);
+
+        let received = unsafe { recv_batch(fd, &mut bs, 1) }.expect("recvmmsg failed");
+        assert_eq!(received, 1);
+        // msg_len reflects the truncated byte count (== MAX_PKT, not 4097).
+        assert_eq!(bs.recv_msgs[0].msg_len as usize, MAX_PKT);
+        // MSG_TRUNC must be set so we know to discard this packet.
+        assert_ne!(
+            bs.recv_msgs[0].msg_hdr.msg_flags & libc::MSG_TRUNC,
+            0,
+            "MSG_TRUNC was not set for a datagram larger than MAX_PKT"
+        );
     }
 
     #[test]

@@ -104,6 +104,8 @@ pub struct QueryLogCounters {
     pub upstream_err: AtomicU64,
     pub inflight_queued: AtomicU64,
     pub inflight_drops: AtomicU64,
+    /// UDP datagrams silently dropped because they exceeded MAX_PKT (MSG_TRUNC).
+    pub udp_truncated: AtomicU64,
     /// Cumulative upstream RTT sum (µs) — for average latency computation.
     pub rtt_sum_us: AtomicU64,
     pub rtt_count: AtomicU64,
@@ -139,6 +141,7 @@ impl QueryLogCounters {
             upstream_err: AtomicU64::new(0),
             inflight_queued: AtomicU64::new(0),
             inflight_drops: AtomicU64::new(0),
+            udp_truncated: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
             rtt_count: AtomicU64::new(0),
             singleflight_hits: AtomicU64::new(0),
