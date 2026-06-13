@@ -146,13 +146,9 @@ enum EntryFreshness {
 #[derive(Debug, Clone)]
 pub struct CacheLookup {
     pub packet: Bytes,
-    pub refresh: Option<CacheRefresh>,
-    pub qname: Arc<str>,
     /// True when the entry's TTL had expired but it was within the stale window.
     /// The caller should count this as a stale hit and spawn a background refresh.
     pub is_stale: bool,
-    /// Index of the group that originally cached this entry (u16::MAX = unknown).
-    pub group_id: u16,
 }
 
 /// Metadata returned from `get_into`; the packet bytes are written into the caller's buffer.
@@ -268,35 +264,6 @@ impl DnsCache {
     /// Try regular lookup first; if that misses and the query has an ECS option,
     /// retry with the ECS-stripped cache key and relaxed variant matching.
     /// This lets a strip-mode group serve all clients from one shared cache entry.
-    pub fn get_with_ecs_fallback(
-        &self,
-        query: &[u8],
-        question_end: usize,
-        client_id: u16,
-    ) -> Option<CacheLookup> {
-        if let Some(hit) = self.lookup(
-            query,
-            question_end,
-            client_id,
-            self.stale_expire_ttl > 0,
-            false,
-        ) {
-            return Some(hit);
-        }
-        if dns::extract_variant(query, question_end).ecs_src.is_some() {
-            self.lookup(
-                query,
-                question_end,
-                client_id,
-                self.stale_expire_ttl > 0,
-                true,
-            )
-        } else {
-            None
-        }
-    }
-
-    /// Like [`get_with_ecs_fallback`] but writes directly into `out`.
     pub fn get_into_with_ecs_fallback(
         &self,
         query: &[u8],
@@ -451,13 +418,9 @@ impl DnsCache {
         } else {
             dns::patch_ttls_at(&mut packet, &entry.ttl_offsets, elapsed);
         }
-        let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
         Some(CacheLookup {
             packet: packet.freeze(),
-            refresh,
-            qname: entry.qname.clone(),
             is_stale,
-            group_id: entry.group_id,
         })
     }
 
@@ -1001,8 +964,9 @@ mod tests {
             ..no_override_policy()
         };
         let (query, question_end) = add_to_cache(&cache, 100, Some(&policy));
+        let mut buf = BytesMut::new();
         let hit = cache
-            .get(&query, question_end, 1)
+            .get_into_with_ecs_fallback(&query, question_end, 1, &mut buf)
             .expect("expected cache hit");
         assert!(
             hit.refresh.is_some(),
@@ -1014,8 +978,9 @@ mod tests {
     fn no_refresh_without_policy() {
         let cache = DnsCache::new(&base_cache_config());
         let (query, question_end) = add_to_cache(&cache, 100, None);
+        let mut buf = BytesMut::new();
         let hit = cache
-            .get(&query, question_end, 1)
+            .get_into_with_ecs_fallback(&query, question_end, 1, &mut buf)
             .expect("expected cache hit");
         assert!(
             hit.refresh.is_none(),
@@ -1230,9 +1195,10 @@ mod tests {
 
         // A different ECS subnet should find the strip_ecs cached entry via fallback
         let (query_b, _) = make_ecs_query(77);
+        let mut buf = BytesMut::new();
         assert!(
             cache
-                .get_with_ecs_fallback(&query_b, question_end, 1)
+                .get_into_with_ecs_fallback(&query_b, question_end, 1, &mut buf)
                 .is_some(),
             "ECS fallback should find the strip-ecs cached entry"
         );

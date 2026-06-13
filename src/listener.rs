@@ -214,8 +214,6 @@ async fn handle_tcp_conn(
             FastPathOutcome::Drop => {}
             FastPathOutcome::Miss { info } => {
                 let packet = Bytes::copy_from_slice(pkt);
-                // Pass pre-parsed fast_info directly; avoids a second parse_query_fast
-                // call that handle_packet_bytes would otherwise perform internally.
                 match handle_packet_slow_preparsed(
                     packet,
                     peer,

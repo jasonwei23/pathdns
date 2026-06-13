@@ -260,9 +260,6 @@ pub struct Config {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
-    /// Plain UDP resolvers used at startup to resolve DoH/DoT/DoQ upstream hostnames.
-    /// Must be IP:port literals so they work before any DNS service is available.
-    pub bootstrap_dns: Vec<SocketAddr>,
 }
 
 impl Config {
@@ -505,7 +502,6 @@ impl Config {
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
             upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
-            bootstrap_dns,
         })
     }
 }
@@ -1815,11 +1811,16 @@ mod querylog_tests {
 
     #[test]
     fn bootstrap_dns_ip_only_accepted() {
-        let cfg = parse(r#"{"fallback":"null","bootstrap-dns":["8.8.8.8","1.1.1.1:53","[::1]:5353"]}"#).unwrap();
-        assert_eq!(cfg.bootstrap_dns.len(), 3);
-        assert_eq!(cfg.bootstrap_dns[0].port(), 53);
-        assert_eq!(cfg.bootstrap_dns[1].port(), 53);
-        assert_eq!(cfg.bootstrap_dns[2].port(), 5353);
+        let servers = parse_bootstrap_dns(vec![
+            "8.8.8.8".to_string(),
+            "1.1.1.1:53".to_string(),
+            "[::1]:5353".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(servers.len(), 3);
+        assert_eq!(servers[0].port(), 53);
+        assert_eq!(servers[1].port(), 53);
+        assert_eq!(servers[2].port(), 5353);
     }
 
     #[test]

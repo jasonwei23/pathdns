@@ -116,94 +116,6 @@ fn record_query_received(ql: &crate::querylog::QueryLogHandle, proto: ClientProt
     };
 }
 
-/// Synchronous fast path: parse header, apply qtype filter, look up the Moka cache.
-///
-/// Returns immediately with a ready response for the overwhelming majority of queries (cache hits
-/// and filter hits) without allocating a Tokio task. Only cache misses need a spawned task.
-/// Called both from the UDP receive loop (inline, no spawn) and from `handle_packet` (for TCP
-/// and UDP misses that were spawned before this check could short-circuit them).
-pub(crate) fn try_fast_path(
-    packet: &[u8],
-    peer: SocketAddr,
-    proto: ClientProto,
-    state: &AppState,
-) -> FastPathOutcome {
-    let t0 = state.querylog.collecting().then(Instant::now);
-
-    // Non-QUERY opcodes (STATUS, NOTIFY, UPDATE, …): return NOTIMP per RFC 1035.
-    if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
-        record_query_received(&state.querylog, proto);
-        return FastPathOutcome::Response {
-            resp: Bytes::from(dns::notimp_opcode_reply(packet)),
-            refresh: None,
-        };
-    }
-
-    let fast_info = match dns::parse_query_fast(packet) {
-        Ok(info) => info,
-        Err(_) => return FastPathOutcome::Drop,
-    };
-    record_query_received(&state.querylog, proto);
-
-    // Non-IN/non-ANY QCLASS: return NOTIMP per RFC 1035.
-    {
-        let i = fast_info.question_end.saturating_sub(2);
-        let qclass = u16::from_be_bytes([packet[i], packet[i + 1]]);
-        if qclass != 1 && qclass != 255 {
-            return FastPathOutcome::Response {
-                resp: Bytes::from(
-                    dns::notimp_reply(packet, fast_info.question_end).unwrap_or_default(),
-                ),
-                refresh: None,
-            };
-        }
-    }
-
-    // Fast cache read: no qname allocation needed.
-    if let Some(hit) =
-        state
-            .cache
-            .get_with_ecs_fallback(packet, fast_info.question_end, fast_info.id)
-    {
-        // When stale-client-timeout is enabled and the hit is stale, fall through to the
-        // async path so it can race upstream vs the timeout before deciding to serve stale.
-        if hit.is_stale && state.hot.load().stale_client_timeout_ms > 0 {
-            return FastPathOutcome::Miss { info: fast_info };
-        }
-        let ql = &state.querylog;
-        ql.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-        if hit.is_stale {
-            ql.counters.stale_served.fetch_add(1, Ordering::Relaxed);
-        }
-        if ql.collecting() {
-            ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
-                seq,
-                unix_micros: crate::querylog::unix_micros_now(),
-                client: peer.ip(),
-                client_port: peer.port(),
-                qname: hit.qname.clone(),
-                qtype: fast_info.qtype,
-                rcode: dns::rcode(&hit.packet),
-                elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
-                response_bytes: hit.packet.len() as u32,
-                source: if hit.is_stale { "stale" } else { "cache" },
-                group: group_id_to_name(hit.group_id, &state.hot.load()),
-                answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
-                    dns::answer_ips(&hit.packet, fast_info.question_end)
-                } else {
-                    smallvec::SmallVec::new()
-                },
-            });
-        }
-        return FastPathOutcome::Response {
-            resp: hit.packet,
-            refresh: hit.refresh,
-        };
-    }
-
-    FastPathOutcome::Miss { info: fast_info }
-}
-
 /// UDP fast path variant that writes the cache hit response directly into a reusable send buffer,
 /// avoiding the `BytesMut::from(entry.packet.as_ref())` copy in `CacheLookup::packet`.
 pub(crate) fn try_fast_path_into(
@@ -288,26 +200,6 @@ pub(crate) fn try_fast_path_into(
     }
 
     FastPathOutcome::Miss { info: fast_info }
-}
-
-pub(crate) async fn handle_packet_bytes(
-    packet: Bytes,
-    peer: SocketAddr,
-    proto: ClientProto,
-    state: Arc<AppState>,
-) -> Result<Option<Bytes>> {
-    match try_fast_path(&packet, peer, proto, &state) {
-        FastPathOutcome::Response { resp, refresh } => {
-            if let Some(r) = refresh {
-                spawn_cache_refresh(r, &state);
-            }
-            Ok(Some(resp))
-        }
-        FastPathOutcome::Drop => Ok(None),
-        FastPathOutcome::Miss { info } => {
-            handle_packet_slow_preparsed(packet, peer, proto, state, info, None).await
-        }
-    }
 }
 
 /// Slow path for cache misses. Skips the fast-path check and reuses the already
