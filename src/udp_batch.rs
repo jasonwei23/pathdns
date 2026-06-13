@@ -1,13 +1,15 @@
 #![cfg(target_os = "linux")]
 //! Batch UDP receive/send using Linux recvmmsg(2)/sendmmsg(2).
 //!
-//! Pre-allocates all recv/addr/iovec/mmsghdr buffers once at startup and
-//! reuses them across every batch iteration to avoid per-packet allocation.
+//! Pre-allocates ALL recv and send buffers (iovec, mmsghdr, sockaddr_storage)
+//! in `BatchState` once at startup and reuses them across every batch iteration.
+//! Zero heap allocations on the fast path.
 //!
 //! # SAFETY invariant for BatchState
-//! `recv_bufs` and `sockaddrs` must not be moved or reallocated after `iovecs`
-//! and `msgs` are initialized.  Enforced by pre-sizing Vecs to exactly
-//! `batch_size` elements at construction time and never pushing more.
+//! `recv_bufs`, `recv_sockaddrs`, `recv_iovecs`, `send_names`, and `send_iovecs`
+//! must not be moved or reallocated after the corresponding `*msgs` entries are
+//! initialized.  Enforced by pre-sizing every Vec to exactly `batch_size` at
+//! construction time and never pushing more.
 
 use crate::{
     dns,
@@ -37,187 +39,130 @@ const MAX_PKT: usize = 4096;
 // ── Pre-allocated per-socket batch state ─────────────────────────────────────
 
 struct BatchState {
+    /// Maximum batch size; recv and send sides are both allocated to this many slots.
     batch_size: usize,
-    recv_bufs:  Vec<Vec<u8>>,
-    sockaddrs:  Vec<libc::sockaddr_storage>,
-    // Kept alive because msgs[i].msg_hdr.msg_iov points into this Vec.
+
+    // Recv side — pointers in recv_msgs are pre-wired into these Vecs.
+    recv_bufs:  Vec<Vec<u8>>,                  // [batch_size][MAX_PKT]
+    recv_addrs: Vec<libc::sockaddr_storage>,   // sender addresses filled by recvmmsg
+    // Kept alive: recv_msgs[i].msg_hdr.msg_iov points into this Vec.
     #[allow(dead_code)]
-    iovecs:     Vec<libc::iovec>,
-    msgs:       Vec<libc::mmsghdr>,
+    recv_iovecs: Vec<libc::iovec>,
+    recv_msgs:   Vec<libc::mmsghdr>,
+
+    // Send side — pointers in send_msgs are pre-wired into send_names/send_iovecs.
+    send_names:  Vec<libc::sockaddr_storage>,  // dest addresses written before sendmmsg
+    send_iovecs: Vec<libc::iovec>,             // iov_base/len updated before sendmmsg
+    send_msgs:   Vec<libc::mmsghdr>,
 }
 
-// SAFETY: BatchState owns all memory it points to.  The raw pointers in
-// `iovecs` and `msgs` point into `recv_bufs` and `sockaddrs` which are owned
-// heap allocations that live inside the same BatchState.  No other thread
-// ever holds a copy of these pointers.
+// SAFETY: BatchState owns all memory it points to.  The raw pointers in the
+// *msgs fields point into allocations that live inside the same BatchState and
+// are never moved (Vecs are pre-sized and never pushed beyond capacity).  No
+// other thread ever holds a copy of these pointers.
 unsafe impl Send for BatchState {}
 
 impl BatchState {
     fn new(batch_size: usize) -> Self {
         let batch_size = batch_size.min(MAX_BATCH).max(1);
+        let namelen_full = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
-        // Heap-allocate receive buffers first; their addresses must be stable
-        // before we store raw pointers to them.
-        let mut recv_bufs: Vec<Vec<u8>> = (0..batch_size)
-            .map(|_| vec![0u8; MAX_PKT])
-            .collect();
-
-        // sockaddr_storage has private musl padding — must zeroed(), not struct literal.
-        let mut sockaddrs: Vec<libc::sockaddr_storage> =
+        // ── Recv side ────────────────────────────────────────────────────────
+        let mut recv_bufs: Vec<Vec<u8>> =
+            (0..batch_size).map(|_| vec![0u8; MAX_PKT]).collect();
+        let mut recv_addrs: Vec<libc::sockaddr_storage> =
             (0..batch_size).map(|_| unsafe { mem::zeroed() }).collect();
 
-        // Initialize all iovecs and mmsghdr entries to zero first, then wire up
-        // pointers in a second pass.  This ensures all Vecs have their final
-        // heap addresses before any raw pointer is stored.
-        let mut iovecs: Vec<libc::iovec> =
+        // Allocate all Vecs to final capacity BEFORE storing any raw pointers,
+        // so that the heap addresses are stable when we wire them up below.
+        let mut recv_iovecs: Vec<libc::iovec> =
             vec![unsafe { mem::zeroed() }; batch_size];
-        let mut msgs: Vec<libc::mmsghdr> =
+        let mut recv_msgs: Vec<libc::mmsghdr> =
             vec![unsafe { mem::zeroed() }; batch_size];
 
-        let namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         for i in 0..batch_size {
-            iovecs[i].iov_base = recv_bufs[i].as_mut_ptr() as *mut libc::c_void;
-            iovecs[i].iov_len  = MAX_PKT;
-
-            msgs[i].msg_hdr.msg_name    = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
-            msgs[i].msg_hdr.msg_namelen = namelen;
-            msgs[i].msg_hdr.msg_iov     = &mut iovecs[i] as *mut _;
-            // msg_iovlen: c_int on musl, size_t on glibc — `as _` infers the target type.
-            msgs[i].msg_hdr.msg_iovlen  = 1 as _;
+            recv_iovecs[i].iov_base = recv_bufs[i].as_mut_ptr() as *mut libc::c_void;
+            recv_iovecs[i].iov_len  = MAX_PKT;
+            recv_msgs[i].msg_hdr.msg_name    = &mut recv_addrs[i] as *mut _ as *mut libc::c_void;
+            recv_msgs[i].msg_hdr.msg_namelen = namelen_full;
+            recv_msgs[i].msg_hdr.msg_iov     = &mut recv_iovecs[i] as *mut _;
+            recv_msgs[i].msg_hdr.msg_iovlen  = 1 as _; // c_int on musl, size_t on glibc
         }
 
-        Self { batch_size, recv_bufs, sockaddrs, iovecs, msgs }
+        // ── Send side ─────────────────────────────────────────────────────────
+        let mut send_names: Vec<libc::sockaddr_storage> =
+            (0..batch_size).map(|_| unsafe { mem::zeroed() }).collect();
+        let mut send_iovecs: Vec<libc::iovec> =
+            vec![unsafe { mem::zeroed() }; batch_size];
+        let mut send_msgs: Vec<libc::mmsghdr> =
+            vec![unsafe { mem::zeroed() }; batch_size];
+
+        for i in 0..batch_size {
+            // msg_name and msg_iov are pre-wired; only msg_namelen, iov_base, iov_len
+            // need updating before each sendmmsg call (they depend on packet content).
+            send_msgs[i].msg_hdr.msg_name   = &mut send_names[i] as *mut _ as *mut libc::c_void;
+            send_msgs[i].msg_hdr.msg_iov    = &mut send_iovecs[i] as *mut _;
+            send_msgs[i].msg_hdr.msg_iovlen = 1 as _;
+        }
+
+        Self {
+            batch_size,
+            recv_bufs, recv_addrs, recv_iovecs, recv_msgs,
+            send_names, send_iovecs, send_msgs,
+        }
     }
 
-    /// Restore msg_namelen before each recvmmsg call.
-    /// The kernel overwrites it with the actual sender-address length; we must
-    /// reset it to the buffer capacity so the next call has room.
+    /// Restore recv msg_namelen before each recvmmsg call.
+    /// The kernel overwrites msg_namelen with the actual sender-address length;
+    /// we must reset it to the buffer capacity for the next call to have room.
     #[inline]
-    fn reset_namelen(&mut self) {
+    fn reset_recv_namelen(&mut self, n: usize) {
         let cap = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        for msg in &mut self.msgs {
+        for msg in &mut self.recv_msgs[..n] {
             msg.msg_hdr.msg_namelen = cap;
         }
     }
 }
 
-// ── recvmmsg helper ───────────────────────────────────────────────────────────
+// ── Address helpers ───────────────────────────────────────────────────────────
 
-/// # Safety
-/// `bs.msgs[..bs.batch_size]` must have valid iov/name pointers (guaranteed by
-/// BatchState construction).
-unsafe fn recv_batch(fd: libc::c_int, bs: &mut BatchState) -> std::io::Result<usize> {
-    let n = libc::recvmmsg(
-        fd,
-        bs.msgs.as_mut_ptr(),
-        bs.batch_size as libc::c_uint,
-        libc::MSG_DONTWAIT as _,
-        std::ptr::null_mut(),
-    );
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-// ── sendmmsg helper ───────────────────────────────────────────────────────────
-
-/// Temporary sockaddr union for outgoing messages.
-enum SockaddrBuf {
-    V4(libc::sockaddr_in),
-    V6(libc::sockaddr_in6),
-}
-
-fn sockaddr_from_std(peer: SocketAddr) -> SockaddrBuf {
-    match peer {
-        SocketAddr::V4(v4) => SockaddrBuf::V4(libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port:   v4.port().to_be(),
-            sin_addr:   libc::in_addr {
-                s_addr: u32::from_ne_bytes(v4.ip().octets()),
-            },
-            sin_zero: [0; 8],
-        }),
-        SocketAddr::V6(v6) => SockaddrBuf::V6(libc::sockaddr_in6 {
-            sin6_family:   libc::AF_INET6 as libc::sa_family_t,
-            sin6_port:     v6.port().to_be(),
-            sin6_flowinfo: v6.flowinfo(),
-            sin6_addr:     libc::in6_addr { s6_addr: v6.ip().octets() },
-            sin6_scope_id: v6.scope_id(),
-        }),
-    }
-}
-
-/// Send all accumulated fast-path responses in one sendmmsg call.
+/// Write `peer` into a zeroed `sockaddr_storage` and return the actual address length.
 ///
-/// sendmmsg returns -1 only when msgs[0] fails (nothing sent).
-/// Returns n < count when the first n messages were sent and the rest were not
-/// attempted.  Any unsent messages fall back to async `socket.send_to`.
-fn send_batch(socket: &Arc<UdpSocket>, items: &[(Bytes, SocketAddr)]) {
-    if items.is_empty() {
-        return;
-    }
-
-    let sa_bufs: Vec<SockaddrBuf> = items.iter().map(|(_, p)| sockaddr_from_std(*p)).collect();
-    let mut iovecs: Vec<libc::iovec>   = Vec::with_capacity(items.len());
-    let mut msgs: Vec<libc::mmsghdr>   = Vec::with_capacity(items.len());
-
-    for (i, (resp, _)) in items.iter().enumerate() {
-        iovecs.push(libc::iovec {
-            iov_base: resp.as_ptr() as *mut libc::c_void,
-            iov_len:  resp.len(),
-        });
-        let (name_ptr, name_len) = match &sa_bufs[i] {
-            SockaddrBuf::V4(s) => (
-                s as *const _ as *mut libc::c_void,
-                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            ),
-            SockaddrBuf::V6(s) => (
-                s as *const _ as *mut libc::c_void,
-                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            ),
-        };
-        let mut m: libc::mmsghdr = unsafe { mem::zeroed() };
-        m.msg_hdr.msg_name    = name_ptr;
-        m.msg_hdr.msg_namelen = name_len;
-        m.msg_hdr.msg_iov     = &iovecs[i] as *const _ as *mut libc::iovec;
-        m.msg_hdr.msg_iovlen  = 1 as _;
-        msgs.push(m);
-    }
-
-    let fd = socket.as_raw_fd();
-    let sent = unsafe {
-        libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as libc::c_uint, 0)
-    };
-
-    let first_unsent = if sent < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            0 // kernel buffer full: fall back for all
-        } else {
-            1 // permanent error on msgs[0]: skip it, retry the rest
+/// `sockaddr_in`/`sockaddr_in6` have all-public fields — struct literal syntax
+/// is safe for these types (no musl padding issue, unlike `msghdr`/`sockaddr_storage`).
+fn write_sockaddr(peer: SocketAddr, sa: &mut libc::sockaddr_storage) -> libc::socklen_t {
+    // Zero the full storage so unused bytes are deterministic (important for musl
+    // which may check the entire buffer).
+    unsafe { std::ptr::write_bytes(sa, 0, 1) };
+    match peer {
+        SocketAddr::V4(v4) => {
+            let p = sa as *mut _ as *mut libc::sockaddr_in;
+            unsafe {
+                (*p).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*p).sin_port   = v4.port().to_be();
+                (*p).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            }
+            mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
-    } else {
-        sent as usize
-    };
-
-    // Spawn async fallback for any messages that were not sent.
-    for (resp, peer) in &items[first_unsent..] {
-        let socket = socket.clone();
-        let resp   = resp.clone();
-        let peer   = *peer;
-        tokio::spawn(async move {
-            let _ = socket.send_to(&resp, peer).await;
-        });
+        SocketAddr::V6(v6) => {
+            let p = sa as *mut _ as *mut libc::sockaddr_in6;
+            unsafe {
+                (*p).sin6_family   = libc::AF_INET6 as libc::sa_family_t;
+                (*p).sin6_port     = v6.port().to_be();
+                (*p).sin6_addr.s6_addr = v6.ip().octets();
+                (*p).sin6_flowinfo = v6.flowinfo();
+                (*p).sin6_scope_id = v6.scope_id();
+            }
+            mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
     }
 }
 
-// ── sockaddr_storage → SocketAddr ────────────────────────────────────────────
-
+/// Parse the kernel-written sockaddr_storage back to a SocketAddr.
+///
 /// # Safety
-/// `sa` must have been written by recvmmsg with `salen > 0`.
-unsafe fn sockaddr_to_std(
+/// `sa` must have been filled by recvmmsg with `salen > 0`.
+unsafe fn read_sockaddr(
     sa: &libc::sockaddr_storage,
     salen: libc::socklen_t,
 ) -> Option<SocketAddr> {
@@ -244,24 +189,96 @@ unsafe fn sockaddr_to_std(
     }
 }
 
+// ── recvmmsg helper ───────────────────────────────────────────────────────────
+
+/// # Safety
+/// `bs.recv_msgs[..n]` must have valid iov/name pointers (guaranteed by BatchState).
+unsafe fn recv_batch(fd: libc::c_int, bs: &mut BatchState, n: usize) -> std::io::Result<usize> {
+    let ret = libc::recvmmsg(
+        fd,
+        bs.recv_msgs.as_mut_ptr(),
+        n as libc::c_uint,
+        libc::MSG_DONTWAIT as _,
+        std::ptr::null_mut(),
+    );
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+// ── sendmmsg helper ───────────────────────────────────────────────────────────
+
+/// Send `items` via sendmmsg using pre-allocated buffers in `bs`.
+///
+/// Any messages not sent (partial send or error) fall back to individual
+/// `socket.send_to` async tasks.  Zero heap allocations — all buffers come
+/// from the pre-allocated `BatchState`.
+fn send_batch(socket: &Arc<UdpSocket>, bs: &mut BatchState, items: &[(Bytes, SocketAddr)]) {
+    let n = items.len();
+    if n == 0 {
+        return;
+    }
+
+    // Fill in address and payload pointers for this batch.
+    for (i, (resp, peer)) in items.iter().enumerate() {
+        let salen = write_sockaddr(*peer, &mut bs.send_names[i]);
+        bs.send_msgs[i].msg_hdr.msg_namelen = salen;
+        bs.send_iovecs[i].iov_base = resp.as_ptr() as *mut libc::c_void;
+        bs.send_iovecs[i].iov_len  = resp.len();
+        bs.send_msgs[i].msg_len    = 0; // ignored on input by the kernel
+    }
+
+    let fd = socket.as_raw_fd();
+    let sent = unsafe {
+        libc::sendmmsg(fd, bs.send_msgs.as_mut_ptr(), n as libc::c_uint, 0)
+    };
+
+    // sendmmsg returns -1 only when msgs[0] fails (nothing sent).
+    // A return value 0 ≤ k < n means msgs[0..k] were sent; msgs[k..n] were not.
+    let first_unsent = if sent < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            0 // kernel buffer full: fall back for all
+        } else {
+            1 // permanent error on msgs[0]: skip it, fall back for the rest
+        }
+    } else {
+        sent as usize
+    };
+
+    // Spawn async fallback for each unsent response.
+    for (resp, peer) in &items[first_unsent..] {
+        let socket = socket.clone();
+        let resp   = resp.clone();
+        let peer   = *peer;
+        tokio::spawn(async move {
+            let _ = socket.send_to(&resp, peer).await;
+        });
+    }
+}
+
 // ── Main async loop ───────────────────────────────────────────────────────────
 
 /// Batch UDP receive/send loop using recvmmsg(2)/sendmmsg(2).
 ///
 /// Each iteration:
 ///  1. Await readability.
-///  2. Drain: call recvmmsg in a try_io loop until EAGAIN.
+///  2. Drain: call recvmmsg in a try_io loop until EAGAIN.  The effective vlen
+///     is read from the hot config each iteration so that a hot-reload of
+///     `udp-batch-size` (scaling down) takes effect without restarting the socket.
 ///  3. For each received packet, run try_fast_path_into synchronously.
 ///  4. Collect fast-path responses into a send list.
 ///  5. Spawn tasks for slow-path misses (cache miss → upstream).
-///  6. Send all fast-path responses in one sendmmsg call.
+///  6. Send all fast-path responses in one sendmmsg call (zero allocations).
 pub(crate) async fn serve_udp_batch(
     socket:     Arc<UdpSocket>,
     state:      Arc<AppState>,
     batch_size: usize,
 ) -> Result<()> {
     let batch_size = batch_size.min(MAX_BATCH).max(1);
-    let mut bs     = BatchState::new(batch_size);
+    let mut bs = BatchState::new(batch_size);
     let mut resp_buf  = BytesMut::with_capacity(512);
     let mut send_items: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(batch_size);
 
@@ -276,11 +293,18 @@ pub(crate) async fn serve_udp_batch(
         // edge-triggered notification; calling recvmmsg outside try_io causes
         // a busy-spin.
         loop {
-            bs.reset_namelen();
+            // Re-read batch size from config on each drain iteration so that a
+            // hot-reload decreasing udp-batch-size takes effect immediately.
+            let n = {
+                let h = state.hot.load();
+                h.cfg.udp_batch_size.min(bs.batch_size).max(1)
+            };
+
+            bs.reset_recv_namelen(n);
 
             let n_recv = match socket.try_io(Interest::READABLE, || {
-                // SAFETY: bs satisfies the invariant documented on BatchState.
-                unsafe { recv_batch(fd, &mut bs) }
+                // SAFETY: bs satisfies the BatchState invariant documented above.
+                unsafe { recv_batch(fd, &mut bs, n) }
             }) {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -294,12 +318,12 @@ pub(crate) async fn serve_udp_batch(
             send_items.clear();
 
             for i in 0..n_recv {
-                let pkt_len = bs.msgs[i].msg_len as usize;
+                let pkt_len = bs.recv_msgs[i].msg_len as usize;
                 if pkt_len == 0 {
                     continue;
                 }
-                let namelen = bs.msgs[i].msg_hdr.msg_namelen;
-                let peer = match unsafe { sockaddr_to_std(&bs.sockaddrs[i], namelen) } {
+                let namelen = bs.recv_msgs[i].msg_hdr.msg_namelen;
+                let peer = match unsafe { read_sockaddr(&bs.recv_addrs[i], namelen) } {
                     Some(a) => a,
                     None => continue,
                 };
@@ -317,7 +341,7 @@ pub(crate) async fn serve_udp_batch(
                     FastPathOutcome::Drop => {}
                     FastPathOutcome::Miss { info } => {
                         // Bug #9 fix: copy only the actual packet bytes (typically
-                        // 50–200 bytes) rather than the full 4096-byte recv slot.
+                        // 50–200 bytes) rather than the entire 4096-byte recv slot.
                         let packet = Bytes::copy_from_slice(pkt);
 
                         let permit = match state.limit.clone().try_acquire_owned() {
@@ -361,7 +385,7 @@ pub(crate) async fn serve_udp_batch(
             }
 
             if !send_items.is_empty() {
-                send_batch(&socket, &send_items);
+                send_batch(&socket, &mut bs, &send_items);
             }
         }
     }
@@ -375,16 +399,12 @@ mod tests {
     use std::net::{Ipv4Addr, UdpSocket as StdUdp};
 
     fn make_dns_query(id: u8) -> Vec<u8> {
-        // Minimal valid-looking DNS query header + 1 question
         vec![
-            id, 0,             // ID (id, 0)
+            id, 0,             // ID
             0x01, 0x00,        // QR=0 RD=1
             0x00, 0x01,        // QDCOUNT=1
-            0x00, 0x00,        // ANCOUNT=0
-            0x00, 0x00,        // NSCOUNT=0
-            0x00, 0x00,        // ARCOUNT=0
-            // QNAME: 4 "test" 0
-            4, b't', b'e', b's', b't', 0,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // AN/NS/AR = 0
+            4, b't', b'e', b's', b't', 0,         // QNAME: "test"
             0x00, 0x01,        // QTYPE A
             0x00, 0x01,        // QCLASS IN
         ]
@@ -403,20 +423,18 @@ mod tests {
             sender.send_to(&make_dns_query(i as u8), addr).unwrap();
         }
 
-        // Give the kernel a moment (loopback is nearly instant but not zero).
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let fd = AsRawFd::as_raw_fd(&server);
         let mut bs = BatchState::new(n);
-        bs.reset_namelen();
+        bs.reset_recv_namelen(n);
 
-        let received = unsafe { recv_batch(fd, &mut bs) }.expect("recvmmsg failed");
+        let received = unsafe { recv_batch(fd, &mut bs, n) }.expect("recvmmsg failed");
         assert_eq!(received, n, "expected {n} packets from recvmmsg");
 
-        // Verify each slot has non-zero length.
         let mut seen = [false; 32];
         for i in 0..n {
-            let len = bs.msgs[i].msg_len as usize;
+            let len = bs.recv_msgs[i].msg_len as usize;
             assert!(len > 0, "slot {i} msg_len is 0");
             let idx = bs.recv_bufs[i][0] as usize;
             assert!(idx < 32, "unexpected first byte {idx}");
@@ -428,44 +446,18 @@ mod tests {
     #[test]
     fn sockaddr_roundtrip_v4() {
         let orig: SocketAddr = "127.0.0.1:5353".parse().unwrap();
-        let buf = sockaddr_from_std(orig);
-        let (storage, salen) = match &buf {
-            SockaddrBuf::V4(s) => {
-                let mut st: libc::sockaddr_storage = unsafe { mem::zeroed() };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        s as *const _ as *const u8,
-                        &mut st as *mut _ as *mut u8,
-                        mem::size_of::<libc::sockaddr_in>(),
-                    );
-                }
-                (st, mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
-            }
-            _ => panic!("expected V4"),
-        };
-        let result = unsafe { sockaddr_to_std(&storage, salen) };
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let salen = write_sockaddr(orig, &mut storage);
+        let result = unsafe { read_sockaddr(&storage, salen) };
         assert_eq!(result, Some(orig));
     }
 
     #[test]
     fn sockaddr_roundtrip_v6() {
         let orig: SocketAddr = "[::1]:5353".parse().unwrap();
-        let buf = sockaddr_from_std(orig);
-        let (storage, salen) = match &buf {
-            SockaddrBuf::V6(s) => {
-                let mut st: libc::sockaddr_storage = unsafe { mem::zeroed() };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        s as *const _ as *const u8,
-                        &mut st as *mut _ as *mut u8,
-                        mem::size_of::<libc::sockaddr_in6>(),
-                    );
-                }
-                (st, mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
-            }
-            _ => panic!("expected V6"),
-        };
-        let result = unsafe { sockaddr_to_std(&storage, salen) };
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let salen = write_sockaddr(orig, &mut storage);
+        let result = unsafe { read_sockaddr(&storage, salen) };
         assert_eq!(result, Some(orig));
     }
 }
