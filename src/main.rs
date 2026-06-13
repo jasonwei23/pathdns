@@ -10,9 +10,7 @@ mod domain;
 mod hasher;
 mod geosite;
 mod ipset;
-#[cfg(unix)]
 mod listener;
-#[cfg(target_os = "linux")]
 mod udp_batch;
 mod log;
 mod persist;
@@ -233,7 +231,6 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
     serve_result
 }
 
-#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = match signal(SignalKind::terminate()) {
@@ -247,9 +244,4 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
     }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

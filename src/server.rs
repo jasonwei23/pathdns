@@ -6,7 +6,6 @@ use crate::cache::{CacheKey, DnsCache};
 use crate::config::{Config, EcsMode, FallbackTarget, InterfaceFilter};
 use crate::geosite::GeoSiteDb;
 use crate::ipset::IpSetManager;
-#[cfg(unix)]
 use crate::listener;
 use crate::route_table::RouteIndex;
 use crate::singleflight;
@@ -584,7 +583,6 @@ impl RefreshGate {
     }
 }
 
-#[cfg(unix)]
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
     let (bind, ifaces) = {
         let hot = state.hot.load();
@@ -642,7 +640,3 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-pub async fn serve(_state: Arc<AppState>) -> Result<()> {
-    anyhow::bail!("listener not available on non-unix")
-}

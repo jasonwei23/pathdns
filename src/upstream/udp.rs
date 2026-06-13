@@ -33,9 +33,6 @@ impl UdpUpstream {
         max_inflight: usize,
         ecs_mode: EcsMode,
     ) -> Result<Arc<Self>> {
-        // buf_size is only consumed by the #[cfg(unix)] set_socket_buf_size call below.
-        #[cfg(not(unix))]
-        let _ = buf_size;
         let bind = if remote.is_ipv6() {
             "[::]:0"
         } else {
@@ -50,7 +47,6 @@ impl UdpUpstream {
                 .connect(remote)
                 .await
                 .with_context(|| format!("upstream {name} udp connect failed: {remote}"))?;
-            #[cfg(unix)]
             super::set_socket_buf_size(&socket, buf_size);
             sockets.push(Arc::new(socket));
         }

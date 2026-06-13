@@ -1034,7 +1034,6 @@ pub(super) fn apply_ecs_mode(packet: &Bytes, mode: &EcsMode) -> Bytes {
 
 // -- Socket buffer helpers ----------------------------------------------------
 
-#[cfg(unix)]
 fn set_buf_size_fd(fd: libc::c_int, size: usize) {
     let size_i32 = size.min(i32::MAX as usize) as libc::c_int;
     for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
@@ -1050,8 +1049,7 @@ fn set_buf_size_fd(fd: libc::c_int, size: usize) {
     }
 }
 
-/// Set SO_RCVBUF and SO_SNDBUF on a tokio UdpSocket (Unix only).
-#[cfg(unix)]
+/// Set SO_RCVBUF and SO_SNDBUF on a tokio UdpSocket.
 pub fn set_socket_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
     if size == 0 {
         return;
@@ -1060,8 +1058,7 @@ pub fn set_socket_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
     set_buf_size_fd(socket.as_raw_fd(), size);
 }
 
-/// Set SO_RCVBUF and SO_SNDBUF on a raw file descriptor (Unix only).
-#[cfg(unix)]
+/// Set SO_RCVBUF and SO_SNDBUF on a raw file descriptor.
 pub fn set_raw_socket_buf_size(fd: libc::c_int, size: usize) {
     if size == 0 {
         return;

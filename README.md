@@ -2,7 +2,7 @@
 
 A policy-based DNS forwarder for split-horizon deployments. Routes queries to different upstream resolvers based on GeoSite domain classification and custom group rules, with optional ipset/nftset integration for IP-based routing decisions.
 
-Runs on Linux.
+**Linux only.** The project uses Linux-specific APIs throughout (`recvmmsg`/`sendmmsg`, `SO_REUSEPORT`, netlink for ipset/nftset, `SO_BINDTODEVICE`) and is not designed to run on other platforms.
 
 ---
 
