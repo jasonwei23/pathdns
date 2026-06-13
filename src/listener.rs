@@ -10,11 +10,13 @@
 //! Only cache misses spawn a task for full async upstream resolution.
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
-use crate::resolver::handle_packet_bytes;
+use crate::resolver::{
+    handle_packet_bytes, spawn_cache_refresh, try_fast_path_into, FastPathOutcome,
+};
 use crate::server::AppState;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};
 use anyhow::{anyhow, Context, Result};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
@@ -137,6 +139,10 @@ async fn handle_tcp_conn(
     // Held for the lifetime of this connection; drop releases the slot.
     _conn_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
+    // Disable Nagle so the 2-byte length prefix and response body are not
+    // buffered waiting to fill a segment — critical for DNS response latency.
+    let _ = stream.set_nodelay(true);
+
     let (idle_timeout, read_timeout) = {
         let hot = state.hot.load();
         let idle = (hot.cfg.tcp_idle_timeout_ms > 0)
@@ -145,6 +151,11 @@ async fn handle_tcp_conn(
             .then(|| Duration::from_millis(hot.cfg.tcp_read_timeout_ms));
         (idle, read)
     };
+
+    // Pre-allocate all per-connection buffers once and reuse across requests.
+    let mut resp_buf = BytesMut::with_capacity(512);
+    let mut packet_buf = vec![0u8; 512]; // grown on demand, never shrunk
+    let mut framing_buf = Vec::<u8>::with_capacity(514); // 2-byte length prefix + response body
 
     loop {
         // Wait for the 2-byte length prefix, applying the idle timeout.
@@ -171,12 +182,14 @@ async fn handle_tcp_conn(
             continue;
         }
 
-        // Read the message body, applying the frame-read timeout.
-        let mut packet = BytesMut::zeroed(len);
+        // Read the message body into the reusable packet buffer (no per-request malloc).
+        if packet_buf.len() < len {
+            packet_buf.resize(len, 0);
+        }
         let body_result = match read_timeout {
-            None => stream.read_exact(&mut packet).await,
+            None => stream.read_exact(&mut packet_buf[..len]).await,
             Some(t) => {
-                match tokio::time::timeout(t, stream.read_exact(&mut packet)).await {
+                match tokio::time::timeout(t, stream.read_exact(&mut packet_buf[..len])).await {
                     Ok(r) => r,
                     Err(_elapsed) => return Ok(()), // body read stalled — close
                 }
@@ -186,19 +199,47 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        match handle_packet_bytes(packet.freeze(), peer, ClientProto::Tcp, state.clone()).await {
-            Ok(Some(resp)) => write_tcp_response(&mut stream, &resp).await?,
-            Ok(None) => {}
-            Err(_) => return Ok(()),
+        let pkt = &packet_buf[..len];
+
+        // Try the synchronous fast path (cache hit) before the full async resolver.
+        // On a warm cache this avoids any heap allocation or task spawn.
+        resp_buf.clear();
+        match try_fast_path_into(pkt, peer, &state, &mut resp_buf) {
+            FastPathOutcome::Response { resp, refresh } => {
+                if let Some(r) = refresh {
+                    spawn_cache_refresh(r, &state);
+                }
+                write_tcp_response(&mut stream, &resp, &mut framing_buf).await?;
+            }
+            FastPathOutcome::Drop => {}
+            FastPathOutcome::Miss { .. } => {
+                let packet = Bytes::copy_from_slice(pkt);
+                match handle_packet_bytes(packet, peer, ClientProto::Tcp, state.clone()).await {
+                    Ok(Some(resp)) => {
+                        write_tcp_response(&mut stream, &resp, &mut framing_buf).await?
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Ok(()),
+                }
+            }
         }
     }
 }
 
-async fn write_tcp_response(stream: &mut TcpStream, resp: &[u8]) -> Result<()> {
+async fn write_tcp_response(
+    stream: &mut TcpStream,
+    resp: &[u8],
+    framing_buf: &mut Vec<u8>,
+) -> Result<()> {
     let len = u16::try_from(resp.len()).map_err(|_| anyhow!("dns response too large for tcp"))?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(resp).await?;
-    stream.flush().await?;
+    // Combine the 2-byte length prefix and response body into one write_all so
+    // the kernel sees a single writev — halves the syscall count per response.
+    // No flush needed: TcpStream has no userspace write buffer, and TCP_NODELAY
+    // ensures the kernel sends immediately without waiting to fill a segment.
+    framing_buf.clear();
+    framing_buf.extend_from_slice(&len.to_be_bytes());
+    framing_buf.extend_from_slice(resp);
+    stream.write_all(framing_buf).await?;
     Ok(())
 }
 
