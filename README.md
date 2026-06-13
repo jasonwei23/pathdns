@@ -102,7 +102,7 @@ All configuration is done via the JSON file.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bind` | string or array | `"127.0.0.1:65353"` | Listen address(es). Append `@udp` or `@tcp` to restrict protocol per address. IPv6 sockets are v6-only; for dual-stack use `["0.0.0.0:53", "[::]:53"]`. |
-| `worker-threads` | int | `2` | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
+| `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
 | `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
@@ -253,7 +253,7 @@ Caches primary/secondary routing decisions for the racing fallback.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `size` | int | — | Capacity in entries. |
-| `ttl` | int (s) | `3600` | Per-entry TTL. |
+| `ttl` | int (s) | `0` | Per-entry TTL. `0` = no expiry. |
 
 ### Query Log
 

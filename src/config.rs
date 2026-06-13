@@ -338,7 +338,7 @@ impl Config {
                 .filter(|&c| c > 0)
                 .map(|capacity| VerdictCacheConfig {
                     capacity,
-                    ttl: Duration::from_secs(vc.ttl.unwrap_or(3600)),
+                    ttl: Duration::from_secs(vc.ttl.unwrap_or(0)),
                 })
         });
 
