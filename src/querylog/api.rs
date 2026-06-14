@@ -20,10 +20,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::time::{interval, MissedTickBehavior};
 
 static DASHBOARD_HTML: &str = include_str!("page.html");
-/// One concurrent history query at a time — keeps memory and CPU predictable
-/// on router-class hardware.
+/// At most two concurrent history queries — keeps memory and CPU predictable
+/// on router-class hardware while allowing a second reader during pagination.
 static HISTORY_QUERY_GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 pub async fn serve(
@@ -52,6 +53,12 @@ pub async fn serve(
             else {
                 return;
             };
+
+            // SSE endpoint: stream events instead of returning a buffered response.
+            if req.method == "GET" && req.path == "/api/querylog/stream" {
+                handle_sse(req, conn, ring, (*token).as_deref()).await;
+                return;
+            }
 
             let (status, body, content_type) = dispatch(
                 req,
@@ -86,6 +93,8 @@ struct HttpRequest {
     path: String,
     query: String,
     auth: Option<String>,
+    /// Value of the `Last-Event-Id` header, used by browser EventSource on reconnect.
+    last_event_id: Option<String>,
 }
 
 async fn read_request(conn: &mut tokio::net::TcpStream) -> std::io::Result<HttpRequest> {
@@ -121,12 +130,16 @@ fn parse_http_request(text: &str) -> std::io::Result<HttpRequest> {
     };
 
     let mut auth = None;
+    let mut last_event_id = None;
     for line in lines {
-        if line.to_lowercase().starts_with("authorization:") {
+        let lower = line.to_lowercase();
+        if lower.starts_with("authorization:") {
             let value = line[14..].trim();
             if let Some(tok) = value.strip_prefix("Bearer ") {
                 auth = Some(tok.trim().to_string());
             }
+        } else if lower.starts_with("last-event-id:") {
+            last_event_id = Some(line[14..].trim().to_string());
         }
     }
 
@@ -135,6 +148,7 @@ fn parse_http_request(text: &str) -> std::io::Result<HttpRequest> {
         path: path.to_string(),
         query: query.to_string(),
         auth,
+        last_event_id,
     })
 }
 
@@ -238,8 +252,10 @@ async fn dispatch(
                 .unwrap_or(100);
             let before_seq =
                 parse_query_param(&req.query, "before_seq").and_then(|v| v.parse::<u64>().ok());
+            let after_seq =
+                parse_query_param(&req.query, "after_seq").and_then(|v| v.parse::<u64>().ok());
             let filter = parse_query_param(&req.query, "q");
-            let events = ring.query(before_seq, limit, filter.as_deref());
+            let events = ring.query(before_seq, after_seq, limit, filter.as_deref());
             let body = render_ring_events(&events);
             ("200 OK", body, "application/json")
         }
@@ -317,7 +333,7 @@ async fn dispatch(
                 );
             }
 
-            let gate = HISTORY_QUERY_GATE.get_or_init(|| tokio::sync::Semaphore::new(1));
+            let gate = HISTORY_QUERY_GATE.get_or_init(|| tokio::sync::Semaphore::new(2));
             let Ok(Ok(_permit)) =
                 tokio::time::timeout(Duration::from_secs(2), gate.acquire()).await
             else {
@@ -453,6 +469,103 @@ fn safe_history_filename(name: &str) -> bool {
         && (name.ends_with(".msgpack.gz") || name.ends_with(".msgpack"))
 }
 
+// ── SSE handler ──────────────────────────────────────────────────────────────
+
+/// Serve an SSE stream of live query events.
+///
+/// Auth: checks `Authorization: Bearer` header first, then `?token=` query
+/// parameter (needed because `EventSource` in browsers cannot set headers).
+///
+/// On reconnect, the browser sends `Last-Event-Id: <seq>` automatically;
+/// the server backfills all ring events with seq > that value so the client
+/// picks up from where it left off.
+async fn handle_sse(
+    req: HttpRequest,
+    mut conn: tokio::net::TcpStream,
+    ring: Arc<EventRing>,
+    token: Option<&str>,
+) {
+    if let Some(expected) = token {
+        let header_tok = req.auth.as_deref().unwrap_or("");
+        let param_tok = parse_query_param(&req.query, "token").unwrap_or_default();
+        if !ct_str_eq(header_tok, expected) && !ct_str_eq(&param_tok, expected) {
+            let _ = conn
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 24\r\nConnection: close\r\n\r\n\
+                      {\"error\":\"unauthorized\"}",
+                )
+                .await;
+            return;
+        }
+    }
+
+    // Subscribe before backfill to avoid missing events in the window between
+    // ring query and subscription.
+    let mut rx = ring.subscribe();
+
+    // Backfill: prefer Last-Event-Id header (auto-sent by browser on reconnect),
+    // fall back to ?last_seq= query parameter for initial page load.
+    let last_seq = req
+        .last_event_id
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            parse_query_param(&req.query, "last_seq").and_then(|v| v.parse::<u64>().ok())
+        });
+
+    let sse_headers = "HTTP/1.1 200 OK\r\n\
+                       Content-Type: text/event-stream\r\n\
+                       Cache-Control: no-cache\r\n\
+                       Connection: keep-alive\r\n\
+                       X-Accel-Buffering: no\r\n\
+                       \r\n";
+    if conn.write_all(sse_headers.as_bytes()).await.is_err() {
+        return;
+    }
+
+    if let Some(after) = last_seq {
+        // Send backfill oldest-first (ring.query returns newest-first, so reverse).
+        let events = ring.query(None, Some(after), 1000, None);
+        for ev in events.iter().rev() {
+            let line = format!("id:{}\ndata:{}\n\n", ev.seq, event_to_json(ev));
+            if conn.write_all(line.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Real-time loop: forward new events and send periodic heartbeats.
+    let mut hb = interval(Duration::from_secs(15));
+    hb.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    hb.tick().await; // discard immediate first tick
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(ev) => {
+                        let line = format!("id:{}\ndata:{}\n\n", ev.seq, event_to_json(&ev));
+                        if conn.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Receiver fell behind; tell the client to reconnect from the ring.
+                        let _ = conn.write_all(format!(": lagged {n}\n\n").as_bytes()).await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = hb.tick() => {
+                if conn.write_all(b": ping\n\n").await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 // ── JSON renderers ────────────────────────────────────────────────────────────
 
 fn render_stats(
@@ -533,28 +646,35 @@ fn render_stats(
     .unwrap_or_default()
 }
 
+fn event_to_json(ev: &super::QueryLogEvent) -> String {
+    let answer_ips: Vec<String> = ev.answer_ips.iter().map(ToString::to_string).collect();
+    serde_json::to_string(&serde_json::json!({
+        "seq": ev.seq,
+        "time": micros_to_rfc3339(ev.unix_micros),
+        "client": ev.client.to_string(),
+        "client_port": ev.client_port,
+        "qname": ev.qname.as_ref(),
+        "qtype": ev.qtype,
+        "rcode": ev.rcode,
+        "elapsed_us": ev.elapsed_us,
+        "response_bytes": ev.response_bytes,
+        "source": ev.source,
+        "group": ev.group.as_deref(),
+        "answer_ips": answer_ips,
+    }))
+    .unwrap_or_default()
+}
+
 fn render_ring_events(events: &[std::sync::Arc<super::QueryLogEvent>]) -> Vec<u8> {
-    let values: Vec<_> = events
-        .iter()
-        .map(|ev| {
-            let answer_ips: Vec<String> = ev.answer_ips.iter().map(ToString::to_string).collect();
-            serde_json::json!({
-                "seq": ev.seq,
-                "time": micros_to_rfc3339(ev.unix_micros),
-                "client": ev.client.to_string(),
-                "client_port": ev.client_port,
-                "qname": ev.qname.as_ref(),
-                "qtype": ev.qtype,
-                "rcode": ev.rcode,
-                "elapsed_us": ev.elapsed_us,
-                "response_bytes": ev.response_bytes,
-                "source": ev.source,
-                "group": ev.group.as_deref(),
-                "answer_ips": answer_ips,
-            })
-        })
-        .collect();
-    serde_json::to_vec(&values).unwrap_or_default()
+    let body = format!(
+        "[{}]",
+        events
+            .iter()
+            .map(|ev| event_to_json(ev))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    body.into_bytes()
 }
 
 /// Render a history page using the same event JSON shape as the live ring

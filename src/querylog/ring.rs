@@ -3,25 +3,30 @@
 use super::QueryLogEvent;
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast;
 
 // ── Event ring ───────────────────────────────────────────────────────────────
 
 /// Fixed-capacity FIFO of recent query events.
-/// Push drops the oldest entry when full.
+/// Push drops the oldest entry when full and notifies SSE subscribers.
 pub struct EventRing {
     buf: RwLock<VecDeque<Arc<QueryLogEvent>>>,
     capacity: usize,
+    tx: broadcast::Sender<Arc<QueryLogEvent>>,
 }
 
 impl EventRing {
     pub fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(1024);
         Self {
             buf: RwLock::new(VecDeque::with_capacity(capacity.min(4096))),
             capacity,
+            tx,
         }
     }
 
     /// Append an event, evicting the oldest entry if at capacity.
+    /// Also broadcasts to any active SSE subscribers.
     pub fn push(&self, ev: Arc<QueryLogEvent>) -> bool {
         if self.capacity == 0 {
             return false;
@@ -32,17 +37,25 @@ impl EventRing {
                 buf.pop_front();
                 evicted = true;
             }
-            buf.push_back(ev);
+            buf.push_back(Arc::clone(&ev));
+            drop(buf); // release read lock before notifying SSE subscribers
+            let _ = self.tx.send(ev);
             return evicted;
         }
         false
     }
 
-    /// Return up to `limit` events with `seq < before_seq` (newest-first),
-    /// optionally filtered by a qname substring.
+    /// Subscribe to live event broadcasts (for SSE).
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<QueryLogEvent>> {
+        self.tx.subscribe()
+    }
+
+    /// Return up to `limit` events, optionally bounded by `before_seq`/`after_seq`
+    /// (newest-first), and optionally filtered by a qname substring.
     pub fn query(
         &self,
         before_seq: Option<u64>,
+        after_seq: Option<u64>,
         limit: usize,
         filter: Option<&str>,
     ) -> Vec<Arc<QueryLogEvent>> {
@@ -55,6 +68,11 @@ impl EventRing {
             .filter(|ev| {
                 if let Some(seq) = before_seq {
                     if ev.seq >= seq {
+                        return false;
+                    }
+                }
+                if let Some(seq) = after_seq {
+                    if ev.seq <= seq {
                         return false;
                     }
                 }
