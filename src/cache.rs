@@ -58,9 +58,11 @@ pub fn cache_key_strip_ecs(query: &[u8], question_end: usize) -> CacheKey {
     cache_key_impl(query, question_end, true)
 }
 
-/// Inner hasher — uses a pre-computed `QueryVariant` so callers that already parsed
-/// the EDNS section do not have to re-scan the packet.
-fn cache_key_with_variant(
+/// Hash a query using a pre-computed [`dns::QueryVariant`].
+///
+/// Callers that need the variant for other decisions can use this entry point to
+/// avoid scanning the DNS additional section a second time.
+pub(crate) fn cache_key_with_variant(
     query: &[u8],
     question_end: usize,
     v: &dns::QueryVariant,
@@ -173,6 +175,16 @@ pub struct CacheLookupMeta {
     pub is_stale: bool,
     /// Index of the group that originally cached this entry (u16::MAX = unknown).
     pub group_id: u16,
+}
+
+struct KeyedLookup<'a> {
+    key: CacheKey,
+    query: &'a [u8],
+    question_end: usize,
+    client_id: u16,
+    allow_stale: bool,
+    strip_ecs: bool,
+    variant: &'a dns::QueryVariant,
 }
 
 #[derive(Debug, Clone)]
@@ -291,12 +303,34 @@ impl DnsCache {
         let allow_stale = self.stale_expire_ttl > 0;
         let live_v = dns::extract_variant(query, question_end);
         let key = cache_key_with_variant(query, question_end, &live_v, false);
-        if let Some(hit) = self.lookup_into_keyed(key, query, question_end, client_id, allow_stale, false, out, &live_v) {
+        if let Some(hit) = self.lookup_into_keyed(
+            KeyedLookup {
+                key,
+                query,
+                question_end,
+                client_id,
+                allow_stale,
+                strip_ecs: false,
+                variant: &live_v,
+            },
+            out,
+        ) {
             return Some(hit);
         }
         if live_v.ecs_src.is_some() {
             let strip_key = cache_key_with_variant(query, question_end, &live_v, true);
-            self.lookup_into_keyed(strip_key, query, question_end, client_id, allow_stale, true, out, &live_v)
+            self.lookup_into_keyed(
+                KeyedLookup {
+                    key: strip_key,
+                    query,
+                    question_end,
+                    client_id,
+                    allow_stale,
+                    strip_ecs: true,
+                    variant: &live_v,
+                },
+                out,
+            )
         } else {
             None
         }
@@ -437,22 +471,30 @@ impl DnsCache {
     /// the live query's pre-computed `QueryVariant` so neither needs to be re-derived here.
     fn lookup_into_keyed(
         &self,
-        key: CacheKey,
-        query: &[u8],
-        question_end: usize,
-        client_id: u16,
-        allow_stale: bool,
-        strip_ecs: bool,
+        lookup: KeyedLookup<'_>,
         out: &mut BytesMut,
-        live_v: &dns::QueryVariant,
     ) -> Option<CacheLookupMeta> {
         let cache = self.cache.as_ref()?;
-        let question = query.get(12..question_end)?;
-        let entry = cache.get(&key)?;
-        let matched = if strip_ecs {
-            queries_match_strip_ecs_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
+        let question = lookup.query.get(12..lookup.question_end)?;
+        let entry = cache.get(&lookup.key)?;
+        let matched = if lookup.strip_ecs {
+            queries_match_strip_ecs_v(
+                &entry.variant,
+                lookup.variant,
+                entry.question_end,
+                entry.query.as_ref(),
+                lookup.query,
+                lookup.question_end,
+            )
         } else {
-            queries_match_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
+            queries_match_v(
+                &entry.variant,
+                lookup.variant,
+                entry.question_end,
+                entry.query.as_ref(),
+                lookup.query,
+                lookup.question_end,
+            )
         };
         if !matched {
             return None;
@@ -463,12 +505,12 @@ impl DnsCache {
             .saturating_duration_since(entry.inserted)
             .as_secs()
             .min(u32::MAX as u64) as u32;
-        let (remaining, is_stale) = match self.entry_freshness(&entry, now, allow_stale) {
+        let (remaining, is_stale) = match self.entry_freshness(&entry, now, lookup.allow_stale) {
             EntryFreshness::Fresh { remaining } => (remaining, false),
             EntryFreshness::Stale { advertised_ttl } => (advertised_ttl, true),
             EntryFreshness::Expired { evict } => {
                 if evict {
-                    cache.invalidate(&key);
+                    cache.invalidate(&lookup.key);
                 }
                 return None;
             }
@@ -476,16 +518,16 @@ impl DnsCache {
 
         out.clear();
         out.extend_from_slice(&entry.packet);
-        let _ = dns::set_id(out, client_id);
-        if out.len() >= question_end {
-            out[12..question_end].copy_from_slice(question);
+        let _ = dns::set_id(out, lookup.client_id);
+        if out.len() >= lookup.question_end {
+            out[12..lookup.question_end].copy_from_slice(question);
         }
         if is_stale {
             dns::patch_ttls_uniform(out, &entry.ttl_offsets, remaining);
         } else {
             dns::patch_ttls_at(out, &entry.ttl_offsets, elapsed);
         }
-        let refresh = self.refresh_for(&key, &entry, remaining, is_stale);
+        let refresh = self.refresh_for(&lookup.key, &entry, remaining, is_stale);
         Some(CacheLookupMeta {
             refresh,
             qname: entry.qname.clone(),
@@ -493,7 +535,6 @@ impl DnsCache {
             group_id: entry.group_id,
         })
     }
-
 
     fn entry_freshness(&self, entry: &Entry, now: Instant, allow_stale: bool) -> EntryFreshness {
         let age = now.saturating_duration_since(entry.inserted).as_secs();

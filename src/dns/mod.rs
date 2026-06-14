@@ -498,6 +498,13 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn query_variant_layout_stays_compact() {
+        assert!(std::mem::size_of::<EcsSrc>() <= 17);
+        assert!(std::mem::size_of::<Option<EcsSrc>>() <= 18);
+        assert!(std::mem::size_of::<QueryVariant>() <= 32);
+    }
+
     /// Minimal DNS query for "test.example" type A, no EDNS.
     fn plain_query() -> (Vec<u8>, usize) {
         let qname: &[u8] = b"\x04test\x07example\x00";
