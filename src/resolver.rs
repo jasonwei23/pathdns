@@ -99,7 +99,7 @@ fn group_id_to_name(group_id: u16, hot: &HotState) -> Option<Arc<str>> {
     if group_id == u16::MAX {
         None
     } else if group_id == GROUP_ID_NONE_FALLBACK {
-        Some(Arc::from("none"))
+        Some(crate::router::none_arc())
     } else {
         hot.groups.get(group_id as usize).map(|g| g.name_arc.clone())
     }

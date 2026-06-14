@@ -82,8 +82,8 @@ pub struct QueryVariant {
 /// semantically identical ECS options (e.g. trailing zero bytes) compare equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EcsSrc {
-    /// Network address as a 128-bit integer (IPv4 occupies the low 32 bits).
-    pub addr: u128,
+    /// Network address as big-endian bytes (IPv4 uses the low 4 bytes: bytes 12–15).
+    pub addr: [u8; 16],
     /// Source prefix length.
     pub prefix_len: u8,
 }
@@ -225,30 +225,24 @@ fn parse_ecs_src(opt_data: &[u8]) -> Option<EcsSrc> {
     let addr_data = &opt_data[4..];
     let (addr, prefix_len) = match family {
         1 => {
-            let mut buf = [0u8; 4];
+            let mut raw = [0u8; 4];
             let n = addr_data.len().min(4);
-            buf[..n].copy_from_slice(&addr_data[..n]);
+            raw[..n].copy_from_slice(&addr_data[..n]);
             let plen = prefix_len.min(32);
-            let raw = u32::from_be_bytes(buf);
-            let mask = if plen == 0 {
-                0u32
-            } else {
-                !0u32 << (32 - plen)
-            };
-            (u128::from(raw & mask), plen)
+            let masked = u32::from_be_bytes(raw)
+                & if plen == 0 { 0u32 } else { !0u32 << (32 - plen) };
+            let mut addr = [0u8; 16];
+            addr[12..].copy_from_slice(&masked.to_be_bytes());
+            (addr, plen)
         }
         2 => {
-            let mut buf = [0u8; 16];
+            let mut raw = [0u8; 16];
             let n = addr_data.len().min(16);
-            buf[..n].copy_from_slice(&addr_data[..n]);
+            raw[..n].copy_from_slice(&addr_data[..n]);
             let plen = prefix_len.min(128);
-            let raw = u128::from_be_bytes(buf);
-            let mask = if plen == 0 {
-                0u128
-            } else {
-                !0u128 << (128 - plen)
-            };
-            (raw & mask, plen)
+            let masked = u128::from_be_bytes(raw)
+                & if plen == 0 { 0u128 } else { !0u128 << (128 - plen) };
+            (masked.to_be_bytes(), plen)
         }
         _ => return None,
     };

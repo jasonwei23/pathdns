@@ -11,7 +11,7 @@ use std::sync::Arc;
 static NONE_ARC: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
 
 #[inline]
-fn none_arc() -> Arc<str> {
+pub(crate) fn none_arc() -> Arc<str> {
     NONE_ARC.get_or_init(|| Arc::from("none")).clone()
 }
 

@@ -106,7 +106,7 @@ fn cache_key_with_variant(
             None => h.write_byte(0),
             Some(ecs) => {
                 h.write_byte(1);
-                h.write(&ecs.addr.to_be_bytes());
+                h.write(&ecs.addr);
                 h.write_byte(ecs.prefix_len);
             }
         }
@@ -450,9 +450,9 @@ impl DnsCache {
         let question = query.get(12..question_end)?;
         let entry = cache.get(&key)?;
         let matched = if strip_ecs {
-            queries_match_strip_ecs_v(&entry.variant, live_v, entry.query.as_ref(), query, question_end)
+            queries_match_strip_ecs_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
         } else {
-            queries_match_v(&entry.variant, live_v, entry.query.as_ref(), query, question_end)
+            queries_match_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
         };
         if !matched {
             return None;
@@ -798,17 +798,16 @@ fn queries_match_strip_ecs(stored: &[u8], query: &[u8], question_end: usize) -> 
 fn queries_match_v(
     stored_v: &dns::QueryVariant,
     live_v: &dns::QueryVariant,
+    stored_question_end: usize,
     stored: &[u8],
     query: &[u8],
     question_end: usize,
 ) -> bool {
-    if question_end > query.len() || query.len() < 12 || stored.len() < 12 {
-        return false;
-    }
-    let Some(stored_question_end) = dns::question_end(stored) else {
-        return false;
-    };
-    if stored_question_end != question_end {
+    if question_end > query.len()
+        || stored_question_end != question_end
+        || query.len() < 12
+        || stored.len() < 12
+    {
         return false;
     }
     if !dns::questions_match(&stored[12..question_end], &query[12..question_end]) {
@@ -821,17 +820,16 @@ fn queries_match_v(
 fn queries_match_strip_ecs_v(
     stored_v: &dns::QueryVariant,
     live_v: &dns::QueryVariant,
+    stored_question_end: usize,
     stored: &[u8],
     query: &[u8],
     question_end: usize,
 ) -> bool {
-    if question_end > query.len() || query.len() < 12 || stored.len() < 12 {
-        return false;
-    }
-    let Some(stored_question_end) = dns::question_end(stored) else {
-        return false;
-    };
-    if stored_question_end != question_end {
+    if question_end > query.len()
+        || stored_question_end != question_end
+        || query.len() < 12
+        || stored.len() < 12
+    {
         return false;
     }
     if !dns::questions_match(&stored[12..question_end], &query[12..question_end]) {
