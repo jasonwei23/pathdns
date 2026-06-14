@@ -421,6 +421,7 @@ let currentView = 'dashboard';
 let autoRefreshTimer = null;
 let dashTimer = null;
 let filterTimer = null;
+let savedAutoRefresh = null; // auto-refresh state saved while in archive mode
 
 // ── Quick filter state ────────────────────────────────────────────────────────
 let activeRcode = '*';    // '*' or rcode string e.g. '0','3'
@@ -737,13 +738,17 @@ function switchMode(mode) {
 
   if (isArchive) {
     clearInterval(autoRefreshTimer); autoRefreshTimer = null;
+    savedAutoRefresh = document.getElementById('ql-auto').checked;
     document.getElementById('ql-auto').checked = false;
     if (archFiles.length === 0) loadArchiveFiles();
     else { renderFilePicker(); if (archFile) renderArchiveView(); }
   } else {
     document.getElementById('arch-count').textContent = '';
     qlEvents = []; qlBeforeSeq = null; loadQueryLog();
-    // Restart auto-refresh timer if the toggle is on (default: on).
+    if (savedAutoRefresh !== null) {
+      document.getElementById('ql-auto').checked = savedAutoRefresh;
+      savedAutoRefresh = null;
+    }
     clearInterval(autoRefreshTimer); autoRefreshTimer = null;
     if (document.getElementById('ql-auto').checked) {
       autoRefreshTimer = setInterval(() => { qlEvents=[]; qlBeforeSeq=null; loadQueryLog(); }, 5000);
