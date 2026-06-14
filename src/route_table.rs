@@ -18,32 +18,46 @@ use crate::server::CustomGroup;
 use moka::sync::Cache as MokaCache;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // TagMemo.
 
 /// Per-query memoization of `GeoSiteDb::matches(tag_id, qname)`.
 ///
-/// Uses tag IDs (u16) as indices into a SmallVec<[Option<bool>; 32]>.
-/// This avoids string comparisons on the hot path.
+/// Uses two bits per tag, packed into 64-tag chunks. This avoids string
+/// comparisons on the hot path while keeping cold-route initialization small.
+#[derive(Clone, Copy, Default)]
+struct TagMemoChunk {
+    seen: u64,
+    matched: u64,
+}
+
 struct TagMemo {
-    results: SmallVec<[Option<bool>; 32]>,
+    chunks: SmallVec<[TagMemoChunk; 1]>,
 }
 
 impl TagMemo {
     fn new(num_tags: usize) -> Self {
-        let mut results = SmallVec::new();
-        results.resize(num_tags, None);
-        Self { results }
+        let mut chunks = SmallVec::new();
+        chunks.resize(num_tags.div_ceil(64), TagMemoChunk::default());
+        Self { chunks }
     }
 
     fn check(&mut self, gs: &GeoSiteDb, tag_id: u16, tag_name: &str, qname: &str) -> bool {
         let idx = tag_id as usize;
-        if let Some(v) = self.results.get(idx).copied().flatten() {
-            return v;
+        let chunk_idx = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if let Some(chunk) = self.chunks.get(chunk_idx) {
+            if chunk.seen & bit != 0 {
+                return chunk.matched & bit != 0;
+            }
         }
         let v = gs.matches(tag_name, qname);
-        if let Some(slot) = self.results.get_mut(idx) {
-            *slot = Some(v);
+        if let Some(chunk) = self.chunks.get_mut(chunk_idx) {
+            chunk.seen |= bit;
+            if v {
+                chunk.matched |= bit;
+            }
         }
         v
     }
@@ -80,7 +94,7 @@ pub struct RouteIndex {
     num_tags: usize,
 
     /// L1 route cache: qname -> group index (or usize::MAX for no match).
-    route_cache: MokaCache<String, usize>,
+    route_cache: MokaCache<Arc<str>, usize>,
 }
 
 impl RouteIndex {
@@ -164,35 +178,18 @@ impl RouteIndex {
                     groups.get(idx)
                 };
             }
-            let result = self.route_uncached(groups, qname, geosite);
-            let idx = result
-                .map(|g| {
-                    groups
-                        .iter()
-                        .position(|x| std::ptr::eq(x, g))
-                        .unwrap_or(usize::MAX)
-                })
-                .unwrap_or(usize::MAX);
-            self.route_cache.insert(qname.to_string(), idx);
-            return result;
+            let idx = self.route_index_uncached(qname, geosite);
+            self.route_cache.insert(Arc::from(qname), idx);
+            return groups.get(idx);
         }
-        self.route_uncached(groups, qname, geosite)
+        groups.get(self.route_index_uncached(qname, geosite))
     }
 
-    fn route_uncached<'a>(
-        &self,
-        groups: &'a [CustomGroup],
-        qname: &str,
-        geosite: Option<&GeoSiteDb>,
-    ) -> Option<&'a CustomGroup> {
+    fn route_index_uncached(&self, qname: &str, geosite: Option<&GeoSiteDb>) -> usize {
         let catch_all = self.catch_all_idx.unwrap_or(usize::MAX);
 
         if self.geosite_entries.is_empty() {
-            return if catch_all == usize::MAX {
-                None
-            } else {
-                Some(&groups[catch_all])
-            };
+            return catch_all;
         }
 
         let mut tag_memo = TagMemo::new(self.num_tags);
@@ -200,20 +197,15 @@ impl RouteIndex {
         for entry in &self.geosite_entries {
             // If the catch-all group precedes this GeoSite entry, it wins first.
             if catch_all < entry.group_idx {
-                return Some(&groups[catch_all]);
+                return catch_all;
             }
-            let group = &groups[entry.group_idx];
             if geo_entry_matches(entry, qname, geosite, &mut tag_memo, &self.tag_names) {
-                return Some(group);
+                return entry.group_idx;
             }
         }
 
         // All GeoSite entries exhausted; fall through to catch-all if present.
-        if catch_all != usize::MAX {
-            Some(&groups[catch_all])
-        } else {
-            None
-        }
+        catch_all
     }
 }
 
@@ -256,3 +248,35 @@ fn geo_entry_matches(
 }
 
 // Tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_memo_packs_sixty_four_tags_per_chunk() {
+        let empty = TagMemo::new(0);
+        assert!(empty.chunks.is_empty());
+
+        let inline = TagMemo::new(64);
+        assert_eq!(inline.chunks.len(), 1);
+        assert!(!inline.chunks.spilled());
+
+        let two_chunks = TagMemo::new(65);
+        assert_eq!(two_chunks.chunks.len(), 2);
+    }
+
+    #[test]
+    fn tag_memo_chunk_tracks_seen_and_matched_independently() {
+        let mut memo = TagMemo::new(64);
+        let false_bit = 1u64 << 7;
+        let true_bit = 1u64 << 42;
+
+        memo.chunks[0].seen |= false_bit | true_bit;
+        memo.chunks[0].matched |= true_bit;
+
+        assert_ne!(memo.chunks[0].seen & false_bit, 0);
+        assert_eq!(memo.chunks[0].matched & false_bit, 0);
+        assert_ne!(memo.chunks[0].matched & true_bit, 0);
+    }
+}

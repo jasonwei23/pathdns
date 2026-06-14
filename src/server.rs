@@ -74,11 +74,15 @@ pub struct AppState {
 }
 
 pub struct RefreshGate {
-    active: Mutex<HashSet<CacheKey>>,
+    shards: [Mutex<HashSet<CacheKey>>; 64],
 }
 
 pub struct CustomGroup {
     pub name: String,
+    /// Pre-interned Arc of `name`; clone is a refcount bump, no allocation per query.
+    pub name_arc: Arc<str>,
+    /// Index of this group in `HotState::groups`; carried in `RouteTarget::Group`.
+    pub index: usize,
     pub upstream: Option<UpstreamPool>,
     /// Group cache policy merged over global defaults at startup.
     pub cache_policy: crate::cache::ResolvedCachePolicy,
@@ -96,7 +100,7 @@ impl CustomGroup {
     pub fn target(&self) -> Option<crate::router::RouteTarget<'_>> {
         self.upstream
             .is_some()
-            .then_some(crate::router::RouteTarget::Group(self))
+            .then_some(crate::router::RouteTarget::Group(self, self.index))
     }
 }
 
@@ -209,7 +213,7 @@ async fn build_groups(
     cache: &DnsCache,
 ) -> Result<Vec<CustomGroup>> {
     let mut groups = Vec::new();
-    for spec in &cfg.groups {
+    for (idx, spec) in cfg.groups.iter().enumerate() {
         let upstream = if spec.fixed_rcode.is_some() {
             None
         } else {
@@ -229,6 +233,8 @@ async fn build_groups(
             .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
         groups.push(CustomGroup {
             name: spec.name.clone(),
+            name_arc: Arc::from(spec.name.as_str()),
+            index: idx,
             upstream,
             cache_policy: cache.resolve_policy(spec.cache_policy.as_ref()),
             filter_qtype: spec.filter_qtype.iter().copied().collect(),
@@ -565,20 +571,24 @@ fn is_reload_event(kind: &EventKind) -> bool {
 impl RefreshGate {
     pub(crate) fn new() -> Self {
         Self {
-            active: Mutex::new(HashSet::new()),
+            shards: std::array::from_fn(|_| Mutex::new(HashSet::new())),
         }
     }
 
+    fn shard(&self, key: &CacheKey) -> &Mutex<HashSet<CacheKey>> {
+        &self.shards[(*key as usize) & 63]
+    }
+
     pub(crate) fn begin(&self, key: &CacheKey) -> bool {
-        let Ok(mut active) = self.active.lock() else {
+        let Ok(mut s) = self.shard(key).lock() else {
             return false;
         };
-        active.insert(*key)
+        s.insert(*key)
     }
 
     pub(crate) fn end(&self, key: &CacheKey) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(key);
+        if let Ok(mut s) = self.shard(key).lock() {
+            s.remove(key);
         }
     }
 }

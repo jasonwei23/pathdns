@@ -45,6 +45,47 @@
 //! }
 //! ```
 //!
+//! # Example – nftset with prefix-mask routing
+//!
+//! Use `family@table@set` to target an nftset instead of an ipset.
+//! An optional fourth `@N` segment applies a prefix mask before insertion
+//! (e.g. `inet@fw4@mainroute@24` inserts the /24 network address for each
+//! resolved IPv4 address, useful for route tables keyed on prefixes).
+//! The v4 and v6 set names are separated by a comma in `add-ip`;
+//! use `"null"` to skip one address family.
+//!
+//! ```json
+//! {
+//!   "bind":         ["0.0.0.0:53", "[::]:53"],
+//!   "geosite-file": ["/etc/pathdns/geosite.dat"],
+//!   "group": [
+//!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"],
+//!       "add-ip": "inet@fw4@mainroute@24,inet@fw4@mainroute6@48" },
+//!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
+//!   ],
+//!   "fallback": {
+//!     "primary":     "domestic",
+//!     "secondary":   "overseas",
+//!     "ipset-name4": "inet@fw4@mainroute",
+//!     "ipset-name6": "inet@fw4@mainroute6"
+//!   },
+//!   "cache": { "size": 10000 }
+//! }
+//! ```
+//!
+//! ## Set name formats
+//!
+//! | Format | Meaning |
+//! |--------|---------|
+//! | `"myset"` | ipset named `myset` |
+//! | `"myset/24"` | ipset named `myset`, IP masked to /24 before insertion |
+//! | `"inet@fw4@myset"` | nftset: family `inet`, table `fw4`, set `myset` |
+//! | `"inet@fw4@myset@24"` | same nftset, IP masked to /24 before insertion |
+//!
+//! The mask variants are useful with nftset `interval` sets: pathdns queries
+//! the kernel for the `NFT_SET_INTERVAL` flag at startup and automatically
+//! writes masked entries as prefix ranges (e.g. `1.2.3.0-1.2.3.255`).
+//!
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -93,6 +134,14 @@ pub(crate) struct JsonConfig {
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
     pub(crate) upstream_max_response_bytes: Option<usize>,
+    /// Consecutive failures before a node enters the penalty window (default 3).
+    pub(crate) upstream_failure_threshold: Option<u32>,
+    /// How long (ms) a penalized node is skipped before being retried (default 30000).
+    pub(crate) upstream_penalty_window_ms: Option<u64>,
+    /// Force-probe the least-recently-selected node every N selections (default 100).
+    pub(crate) upstream_probe_interval: Option<u64>,
+    /// Banded selection factor: nodes within this multiple of the best score share traffic (default 2).
+    pub(crate) upstream_select_band_factor: Option<u64>,
     pub(crate) max_inflight: Option<usize>,
     pub(crate) inflight_queue_ms: Option<u64>,
     pub(crate) hedge_delay_ms: Option<u64>,

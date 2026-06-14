@@ -16,6 +16,10 @@ use std::time::Duration;
 
 use crate::config_file::{JsonConfig, JsonGroupCacheSection, JsonGroupEntry};
 
+mod upstream_url;
+mod bootstrap;
+use self::upstream_url::{parse_upstreams, parse_rcode_name};
+
 // ── Public types ────────────────────────────────────────────────────────────
 
 /// An IP prefix used in a fixed ECS option injected into outbound queries.
@@ -57,6 +61,14 @@ pub struct UpstreamConfig {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
+    /// Consecutive failures before a node enters the penalty window.
+    pub failure_threshold: u32,
+    /// How long (ms) a penalized node is skipped before being retried.
+    pub penalty_window_ms: u64,
+    /// Force-probe the least-recently-selected node every N upstream selections.
+    pub probe_interval: u64,
+    /// Banded selection: nodes within this multiple of the best score share traffic.
+    pub select_band_factor: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +272,10 @@ pub struct Config {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
+    pub upstream_failure_threshold: u32,
+    pub upstream_penalty_window_ms: u64,
+    pub upstream_probe_interval: u64,
+    pub upstream_select_band_factor: u64,
 }
 
 impl Config {
@@ -285,6 +301,10 @@ impl Config {
             upstream_max_inflight: self.upstream_max_inflight,
             hedge_delay: self.hedge_delay,
             upstream_max_response_bytes: self.upstream_max_response_bytes,
+            failure_threshold: self.upstream_failure_threshold,
+            penalty_window_ms: self.upstream_penalty_window_ms,
+            probe_interval: self.upstream_probe_interval,
+            select_band_factor: self.upstream_select_band_factor,
         }
     }
 
@@ -311,6 +331,20 @@ impl Config {
 
         let upstream_max_inflight = json.upstream_max_inflight.unwrap_or(256);
         let hedge_delay_ms = json.hedge_delay_ms.unwrap_or(0);
+
+        let upstream_failure_threshold = json.upstream_failure_threshold.unwrap_or(3);
+        if upstream_failure_threshold < 1 {
+            return Err(anyhow!("upstream-failure-threshold must be at least 1"));
+        }
+        let upstream_penalty_window_ms = json.upstream_penalty_window_ms.unwrap_or(30_000);
+        let upstream_probe_interval = json.upstream_probe_interval.unwrap_or(100);
+        if upstream_probe_interval < 1 {
+            return Err(anyhow!("upstream-probe-interval must be at least 1"));
+        }
+        let upstream_select_band_factor = json.upstream_select_band_factor.unwrap_or(2);
+        if upstream_select_band_factor < 1 {
+            return Err(anyhow!("upstream-select-band-factor must be at least 1"));
+        }
 
         // Parse bootstrap-dns before groups so it can be passed to upstream resolution.
         let bootstrap_dns = parse_bootstrap_dns(json.bootstrap_dns.unwrap_or_default())?;
@@ -502,6 +536,10 @@ impl Config {
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
             upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
+            upstream_failure_threshold,
+            upstream_penalty_window_ms,
+            upstream_probe_interval,
+            upstream_select_band_factor,
         })
     }
 }
@@ -990,7 +1028,7 @@ fn resolve_bind_proto(raw: &str) -> Result<(bool, bool)> {
     }
 }
 
-fn normalize_addr_with_default_port(s: &str, default_port: u16) -> String {
+pub(super) fn normalize_addr_with_default_port(s: &str, default_port: u16) -> String {
     if s.starts_with('[') {
         if s.rsplit_once(']')
             .is_some_and(|(_, tail)| tail.starts_with(':') && tail[1..].parse::<u16>().is_ok())
@@ -1021,17 +1059,6 @@ fn parse_addr(s: &str) -> Result<SocketAddr> {
     s.to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("failed to resolve address: {s}"))
-}
-
-fn parse_upstreams(items: &[String], bootstrap: &[SocketAddr]) -> Result<Vec<UpstreamEndpoint>> {
-    let mut out = Vec::new();
-    for item in items {
-        out.extend(parse_upstream(item, bootstrap)?);
-    }
-    if out.is_empty() {
-        return Err(anyhow!("at least one upstream DNS is required"));
-    }
-    Ok(out)
 }
 
 /// FNV-1a hash of the routing/cache-affecting config fields.
@@ -1151,186 +1178,7 @@ fn normalize_ipset_name(value: &str) -> Option<String> {
     }
 }
 
-fn parse_upstream(raw: &str, bootstrap: &[SocketAddr]) -> Result<Vec<UpstreamEndpoint>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err(anyhow!("upstream cannot be empty"));
-    }
-    if raw.contains('#') {
-        return Err(anyhow!(
-            "invalid upstream '{raw}': '#' port syntax is not supported; use udp://host:port or tcp://host:port"
-        ));
-    }
-    if let Some((host, addr)) = raw.rsplit_once('@') {
-        return Err(anyhow!(
-            "upstream host@addr syntax is not supported: {host}@{addr}"
-        ));
-    }
-
-    let Some((scheme, rest)) = raw.split_once("://") else {
-        // Schemaless: plain IP or hostname, default UDP/53.
-        let normalized = normalize_addr_with_default_port(raw, 53);
-        let host = authority_host(&normalized)?;
-        let port = authority_port(&normalized, 53);
-        let addr = resolve_host(host, port, bootstrap)
-            .with_context(|| format!("upstream '{raw}'"))?;
-        return Ok(vec![endpoint(
-            UpstreamProto::Udp,
-            addr,
-            None,
-            None,
-            false,
-            None,
-        )]);
-    };
-
-    let proto = parse_upstream_scheme(scheme)?;
-    let (rest_no_query, query) = rest.split_once('?').map_or((rest, ""), |(a, q)| (a, q));
-    let no_sni = query.split('&').any(|p| p == "no-sni");
-    let sni_override = query
-        .split('&')
-        .find_map(|p| p.strip_prefix("sni="))
-        .map(str::to_string);
-    let ecs_param = query.split('&').find_map(|p| p.strip_prefix("ecs="));
-    let ecs_mode: Option<EcsMode> = match ecs_param {
-        None => None,
-        Some("strip") => Some(EcsMode::Strip),
-        Some("forward") => Some(EcsMode::Forward),
-        Some(val) => Some(EcsMode::Fixed(
-            parse_ecs_subnet(val)
-                .with_context(|| format!("invalid upstream '{raw}': ?ecs={val}"))?,
-        )),
-    };
-
-    for param in query.split('&').filter(|p| !p.is_empty()) {
-        if param != "no-sni" && !param.starts_with("sni=") && !param.starts_with("ecs=") {
-            return Err(anyhow!(
-                "invalid upstream '{raw}': unknown query parameter '{param}'"
-            ));
-        }
-    }
-    if no_sni && !matches!(proto, UpstreamProto::Tls) {
-        return Err(anyhow!(
-            "invalid upstream '{raw}': ?no-sni is only valid for tls:// upstreams"
-        ));
-    }
-    if sni_override.is_some() && !proto.uses_tls_name() {
-        return Err(anyhow!(
-            "invalid upstream '{raw}': ?sni= is only valid for TLS-based upstreams"
-        ));
-    }
-
-    let (authority, path) = split_upstream_path(rest_no_query)?;
-    let port = proto.default_port();
-    let (host, addr) = resolve_authority(authority, port, bootstrap)
-        .with_context(|| format!("upstream '{raw}'"))?;
-    let server_name = sni_override.or_else(|| {
-        proto
-            .uses_tls_name()
-            .then(|| strip_ipv6_brackets(host).to_string())
-    });
-    let path = match proto {
-        UpstreamProto::Https | UpstreamProto::H3 => {
-            Some(path.unwrap_or(DEFAULT_DOH_PATH).to_string())
-        }
-        _ if path.is_some() => {
-            return Err(anyhow!(
-                "invalid upstream '{raw}': path is only valid for https://, doh://, h3://"
-            ));
-        }
-        _ => None,
-    };
-
-    Ok(vec![endpoint(
-        proto,
-        addr,
-        server_name,
-        path,
-        no_sni,
-        ecs_mode,
-    )])
-}
-
-const DEFAULT_DOH_PATH: &str = "/dns-query";
-
-fn endpoint(
-    proto: UpstreamProto,
-    addr: SocketAddr,
-    server_name: Option<String>,
-    path: Option<String>,
-    no_sni: bool,
-    ecs_mode: Option<EcsMode>,
-) -> UpstreamEndpoint {
-    UpstreamEndpoint {
-        proto,
-        addr,
-        server_name,
-        path,
-        no_sni,
-        ecs_mode,
-    }
-}
-
-fn parse_ecs_subnet(s: &str) -> Result<EcsSubnet> {
-    if let Some((addr_str, prefix_str)) = s.split_once('/') {
-        let addr: IpAddr = addr_str
-            .parse()
-            .with_context(|| format!("invalid address '{addr_str}'"))?;
-        let prefix_len: u8 = prefix_str
-            .parse()
-            .with_context(|| format!("invalid prefix length '{prefix_str}'"))?;
-        let max = if addr.is_ipv4() { 32u8 } else { 128u8 };
-        if prefix_len > max {
-            return Err(anyhow!("prefix length {prefix_len} exceeds maximum {max}"));
-        }
-        Ok(EcsSubnet { addr, prefix_len })
-    } else {
-        let addr: IpAddr = s
-            .parse()
-            .with_context(|| format!("expected IP address or CIDR prefix, got '{s}'"))?;
-        let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
-        Ok(EcsSubnet { addr, prefix_len })
-    }
-}
-
-fn parse_rcode_name(name: &str) -> Result<u8> {
-    match name.to_ascii_uppercase().as_str() {
-        "NOERROR" => Ok(0),
-        "FORMERR" => Ok(1),
-        "SERVFAIL" => Ok(2),
-        "NXDOMAIN" => Ok(3),
-        "NOTIMP" => Ok(4),
-        "REFUSED" => Ok(5),
-        other => other
-            .parse::<u8>()
-            .map_err(|_| anyhow!("unknown RCODE \"{other}\" — use NOERROR/NXDOMAIN/SERVFAIL/REFUSED or a number 0–15")),
-    }
-}
-
-fn parse_upstream_scheme(scheme: &str) -> Result<UpstreamProto> {
-    match scheme.to_ascii_lowercase().as_str() {
-        "udp" => Ok(UpstreamProto::Udp),
-        "tcp" => Ok(UpstreamProto::Tcp),
-        "tls" => Ok(UpstreamProto::Tls),
-        "https" | "doh" => Ok(UpstreamProto::Https),
-        "quic" | "doq" => Ok(UpstreamProto::Quic),
-        "h3" => Ok(UpstreamProto::H3),
-        other => Err(anyhow!("unsupported upstream scheme '{other}'")),
-    }
-}
-
-fn split_upstream_path(rest: &str) -> Result<(&str, Option<&str>)> {
-    let (authority, path) = rest.split_once('/').map_or((rest, None), |(a, p)| {
-        let path = if p.is_empty() { "/" } else { &rest[a.len()..] };
-        (a, Some(path))
-    });
-    if authority.is_empty() {
-        return Err(anyhow!("upstream URL is missing a host"));
-    }
-    Ok((authority, path))
-}
-
-fn authority_host(authority: &str) -> Result<&str> {
+pub(super) fn authority_host(authority: &str) -> Result<&str> {
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, tail)) = rest.split_once(']') else {
             return Err(anyhow!("invalid IPv6 upstream authority: {authority}"));
@@ -1346,7 +1194,7 @@ fn authority_host(authority: &str) -> Result<&str> {
         .map_or(authority, |(host, _)| host))
 }
 
-fn strip_ipv6_brackets(host: &str) -> &str {
+pub(super) fn strip_ipv6_brackets(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host)
@@ -1363,7 +1211,7 @@ fn parse_addr_with_default_port(s: &str, default_port: u16) -> Result<SocketAddr
 
 /// Parse `bootstrap-dns` entries.  Must be IP:port literals — hostnames are
 /// rejected to prevent the same chicken-and-egg problem bootstrap DNS solves.
-fn parse_bootstrap_dns(items: Vec<String>) -> Result<Vec<SocketAddr>> {
+pub(super) fn parse_bootstrap_dns(items: Vec<String>) -> Result<Vec<SocketAddr>> {
     items
         .into_iter()
         .map(|s| {
@@ -1380,7 +1228,7 @@ fn parse_bootstrap_dns(items: Vec<String>) -> Result<Vec<SocketAddr>> {
 }
 
 /// Extract the port from a `host:port` or `[ipv6]:port` authority string.
-fn authority_port(authority: &str, default_port: u16) -> u16 {
+pub(super) fn authority_port(authority: &str, default_port: u16) -> u16 {
     if authority.starts_with('[') {
         authority
             .rsplit_once(']')
@@ -1400,7 +1248,7 @@ fn authority_port(authority: &str, default_port: u16) -> u16 {
 /// servers when configured (one-shot UDP queries), or fall back to the system
 /// resolver (`getaddrinfo`).  When PathDNS is the system resolver, set
 /// `bootstrap-dns` to avoid the startup deadlock.
-fn resolve_host(host: &str, port: u16, bootstrap: &[SocketAddr]) -> Result<SocketAddr> {
+pub(super) fn resolve_host(host: &str, port: u16, bootstrap: &[SocketAddr]) -> Result<SocketAddr> {
     let bare = strip_ipv6_brackets(host);
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
@@ -1415,7 +1263,7 @@ fn resolve_host(host: &str, port: u16, bootstrap: &[SocketAddr]) -> Result<Socke
     let mut last_err: Option<anyhow::Error> = None;
     for &server in bootstrap {
         for qtype in [1u16, 28u16] {
-            match bootstrap_udp_query(host, qtype, server) {
+            match bootstrap::bootstrap_udp_query(host, qtype, server) {
                 Ok(ip) => return Ok(SocketAddr::new(ip, port)),
                 Err(e) => last_err = Some(e),
             }
@@ -1426,7 +1274,7 @@ fn resolve_host(host: &str, port: u16, bootstrap: &[SocketAddr]) -> Result<Socke
 }
 
 /// Like `parse_authority`, but resolves hostnames using bootstrap DNS.
-fn resolve_authority<'a>(
+pub(super) fn resolve_authority<'a>(
     authority: &'a str,
     default_port: u16,
     bootstrap: &[SocketAddr],
@@ -1437,140 +1285,11 @@ fn resolve_authority<'a>(
     Ok((host, addr))
 }
 
-/// Send a one-shot UDP DNS query and return the first IP of the requested type.
-fn bootstrap_udp_query(hostname: &str, qtype: u16, server: SocketAddr) -> Result<std::net::IpAddr> {
-    use std::net::UdpSocket as StdUdp;
-    let query = build_bootstrap_query(hostname, qtype)?;
-    let bind = if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let sock = StdUdp::bind(bind).context("bootstrap: bind UDP socket")?;
-    sock.set_read_timeout(Some(Duration::from_secs(3)))
-        .context("bootstrap: set read timeout")?;
-    sock.send_to(&query, server)
-        .with_context(|| format!("bootstrap: send query to {server}"))?;
-    let mut buf = [0u8; 512];
-    let (n, _) = sock
-        .recv_from(&mut buf)
-        .with_context(|| format!("bootstrap: no response from {server}"))?;
-    parse_bootstrap_answer(&buf[..n], qtype)
-}
-
-fn build_bootstrap_query(hostname: &str, qtype: u16) -> Result<Vec<u8>> {
-    let mut pkt: Vec<u8> = Vec::with_capacity(64);
-    // Header: ID=0x1000, QR=0 RD=1, QDCOUNT=1, rest=0
-    pkt.extend_from_slice(&[
-        0x10, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
-    for label in hostname.trim_end_matches('.').split('.') {
-        if label.len() > 63 {
-            return Err(anyhow!(
-                "bootstrap: label too long in hostname '{hostname}'"
-            ));
-        }
-        pkt.push(label.len() as u8);
-        pkt.extend_from_slice(label.as_bytes());
-    }
-    pkt.push(0); // root label
-    pkt.extend_from_slice(&qtype.to_be_bytes());
-    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
-    Ok(pkt)
-}
-
-fn parse_bootstrap_answer(resp: &[u8], qtype: u16) -> Result<std::net::IpAddr> {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    if resp.len() < 12 {
-        return Err(anyhow!("bootstrap: response too short"));
-    }
-    if resp[2] & 0x80 == 0 {
-        return Err(anyhow!("bootstrap: not a response packet"));
-    }
-    let rcode = resp[3] & 0x0f;
-    if rcode != 0 {
-        return Err(anyhow!("bootstrap: RCODE={rcode}"));
-    }
-    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
-    if ancount == 0 {
-        return Err(anyhow!("bootstrap: NODATA (no answer records)"));
-    }
-    let qdcount = u16::from_be_bytes([resp[4], resp[5]]) as usize;
-    let mut pos = 12usize;
-    for _ in 0..qdcount {
-        pos = skip_dns_name(resp, pos)?;
-        pos = pos
-            .checked_add(4)
-            .filter(|&p| p <= resp.len())
-            .ok_or_else(|| anyhow!("bootstrap: question section truncated"))?;
-    }
-    for _ in 0..ancount {
-        pos = skip_dns_name(resp, pos)?;
-        if pos + 10 > resp.len() {
-            return Err(anyhow!("bootstrap: answer section truncated"));
-        }
-        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
-        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlen > resp.len() {
-            return Err(anyhow!("bootstrap: RDATA truncated"));
-        }
-        if rtype == qtype {
-            if qtype == 1 && rdlen == 4 {
-                return Ok(IpAddr::V4(Ipv4Addr::new(
-                    resp[pos],
-                    resp[pos + 1],
-                    resp[pos + 2],
-                    resp[pos + 3],
-                )));
-            } else if qtype == 28 && rdlen == 16 {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(&resp[pos..pos + 16]);
-                return Ok(IpAddr::V6(Ipv6Addr::from(o)));
-            }
-        }
-        pos += rdlen;
-    }
-    Err(anyhow!(
-        "bootstrap: no {} records in answer",
-        if qtype == 1 { "A" } else { "AAAA" }
-    ))
-}
-
-/// Skip a DNS label sequence (with optional pointer compression) at `pos`.
-/// Returns the position immediately after the name.
-fn skip_dns_name(buf: &[u8], mut pos: usize) -> Result<usize> {
-    loop {
-        if pos >= buf.len() {
-            return Err(anyhow!("bootstrap: name extends past end of packet"));
-        }
-        match buf[pos] >> 6 {
-            0 => {
-                let len = buf[pos] as usize;
-                if len == 0 {
-                    return Ok(pos + 1);
-                }
-                pos += 1 + len;
-            }
-            3 => return Ok(pos + 2), // compression pointer
-            _ => return Err(anyhow!("bootstrap: unsupported label type 0x{:02x}", buf[pos])),
-        }
-    }
-}
-
-impl UpstreamProto {
-    pub fn default_port(self) -> u16 {
-        match self {
-            Self::Udp | Self::Tcp => 53,
-            Self::Tls | Self::Quic => 853,
-            Self::Https | Self::H3 => 443,
-        }
-    }
-
-    fn uses_tls_name(self) -> bool {
-        matches!(self, Self::Tls | Self::Https | Self::Quic | Self::H3)
-    }
-}
-
 #[cfg(test)]
 mod querylog_tests {
     use super::*;
+    use super::bootstrap::{build_bootstrap_query, skip_dns_name};
+    use super::upstream_url::parse_upstream;
 
     fn parse(input: &str) -> Result<Config> {
         let json: JsonConfig = serde_json::from_str(input)?;

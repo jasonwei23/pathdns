@@ -29,29 +29,6 @@ impl NetfilterClient {
         })
     }
 
-    /// Test whether `ip` is present in `set`.  Socket timeout → `Err`.
-    pub(super) fn test(&mut self, set: &SetName, ip: IpAddr) -> Result<bool> {
-        let seq = self.sock.alloc_seq();
-        let req = match set {
-            SetName::IpSet { name, .. } => NetfilterRequest::IpsetTest { name, ip },
-            SetName::NftSet {
-                family, table, set, ..
-            } => NetfilterRequest::NftSetTest {
-                family: *family,
-                table,
-                set,
-                ip,
-            },
-        };
-        self.sock.send_raw(&req.encode(seq))?;
-
-        let msg = self.recv_for_test(seq)?;
-        match set {
-            SetName::IpSet { .. } => codec::decode_ipset_test(msg.msg_type, &msg.data),
-            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type, &msg.data),
-        }
-    }
-
     /// Query whether the nftset carries the `NFT_SET_INTERVAL` flag.
     /// Returns `false` on timeout or if the flag is absent.
     pub(super) fn query_nft_interval_flag(
@@ -70,6 +47,38 @@ impl NetfilterClient {
         };
         let flags = codec::decode_nft_set_flags(msg.msg_type, &msg.data)?;
         Ok(flags & codec::NFT_SET_INTERVAL != 0)
+    }
+
+    /// Send a test query without waiting for a response.
+    /// Returns the sequence number to pass to `recv_test`.
+    pub(super) fn send_test(&mut self, set: &SetName, ip: IpAddr) -> Result<u32> {
+        let seq = self.sock.alloc_seq();
+        let req = match set {
+            SetName::IpSet { name, .. } => NetfilterRequest::IpsetTest { name, ip },
+            SetName::NftSet {
+                family,
+                table,
+                set,
+                ..
+            } => NetfilterRequest::NftSetTest {
+                family: *family,
+                table,
+                set,
+                ip,
+            },
+        };
+        self.sock.send_raw(&req.encode(seq))?;
+        Ok(seq)
+    }
+
+    /// Receive the response for a test query identified by `seq`.
+    /// Timeout is an error — the result is unknown.
+    pub(super) fn recv_test(&mut self, set: &SetName, seq: u32) -> Result<bool> {
+        let msg = self.recv_for_test(seq)?;
+        match set {
+            SetName::IpSet { .. } => codec::decode_ipset_test(msg.msg_type, &msg.data),
+            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type, &msg.data),
+        }
     }
 
     /// Add `ips` to `set`.  Relies on `EEXIST` for duplicates (blind add).
@@ -116,7 +125,10 @@ impl NetfilterClient {
         let seq = self.sock.alloc_seq();
         self.sock
             .send_raw(&NetfilterRequest::IpsetAddBatch { name, ips, mask }.encode(seq))?;
-        self.recv_ack_add(seq)
+        // No recv: the message is sent without NLM_F_ACK so the kernel never
+        // sends a response.  This eliminates one blocking recv() per ipset batch,
+        // making ipset adds fully fire-and-forget.
+        Ok(())
     }
 
     fn add_nftset(
@@ -141,6 +153,65 @@ impl NetfilterClient {
             .encode(seq),
         )?;
         self.recv_ack_add(seq)
+    }
+
+    /// Pipeline nftset adds: send all messages first, then receive all acks in order.
+    ///
+    /// This collapses N serial round-trips (one per set) into a single kernel RTT
+    /// by exploiting the FIFO ordering guarantee of a single netlink socket.
+    /// The nftables batch protocol requires an ack per `NFNL_MSG_BATCH_END`, so
+    /// we cannot drop them the way we do for ipset — we just overlap the sends.
+    pub(super) fn add_nftset_pipelined(
+        &mut self,
+        chunks: &[(super::config::SetName, Vec<IpAddr>, bool)],
+    ) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        // Phase 1: send all messages, collecting the seq numbers we'll need to ack.
+        let mut seqs: Vec<u32> = Vec::with_capacity(chunks.len());
+        for (set, ips, interval) in chunks {
+            let super::config::SetName::NftSet {
+                family,
+                table,
+                set: set_name,
+                mask,
+            } = set
+            else {
+                continue;
+            };
+            let seq = self.sock.alloc_seq();
+            self.sock.send_raw(
+                &NetfilterRequest::NftSetAdd {
+                    family: *family,
+                    table,
+                    set: set_name,
+                    ips,
+                    mask: *mask,
+                    interval: *interval,
+                }
+                .encode(seq),
+            )?;
+            seqs.push(seq);
+        }
+        // Phase 2: drain acks in the same order we sent them.
+        // recv_for_seq discards messages with non-matching seqs, so receiving
+        // in send order is required to avoid losing acks for later seqs.
+        let mut first_err: Option<anyhow::Error> = None;
+        for seq in seqs {
+            match self.sock.recv_for_seq(seq) {
+                Ok(msg) => {
+                    if let Err(e) = codec::decode_ack_ok_or_exists(msg.msg_type, &msg.data) {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                Err(e) if is_timeout(&e) => {}
+                Err(e) => {
+                    first_err.get_or_insert(anyhow::anyhow!(e));
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Receive for add operations.  Timeout is treated as `Ok` — the kernel

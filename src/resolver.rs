@@ -4,7 +4,7 @@
 //! Listener code owns sockets and framing; this module owns packet lifecycle after a DNS
 //! message has been received.
 
-use crate::cache::{cache_key, cache_key_strip_ecs, CacheKey, CacheRefresh};
+use crate::cache::{cache_key_with_variant, CacheKey, CacheRefresh};
 use crate::dns;
 use crate::ipset::TestVerdict;
 use crate::router::RouteTarget;
@@ -99,11 +99,11 @@ fn group_id_to_name(group_id: u16, hot: &HotState) -> Option<Arc<str>> {
     if group_id == u16::MAX {
         None
     } else if group_id == GROUP_ID_NONE_FALLBACK {
-        Some(Arc::from("none"))
+        Some(crate::router::none_arc())
     } else {
         hot.groups
             .get(group_id as usize)
-            .map(|g| Arc::from(g.name.as_str()))
+            .map(|g| g.name_arc.clone())
     }
 }
 
@@ -162,17 +162,25 @@ pub(crate) fn try_fast_path_into(
         fast_info.id,
         send_buf,
     ) {
+        let ql = &state.querylog;
+        // Load hot config at most once: needed for stale-timeout check and querylog group name.
+        let hot: Option<Arc<HotState>> = if meta.is_stale || ql.collecting() {
+            Some(state.hot.load_full())
+        } else {
+            None
+        };
+
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
-        if meta.is_stale && state.hot.load().stale_client_timeout_ms > 0 {
+        if meta.is_stale && hot.as_ref().is_some_and(|h| h.stale_client_timeout_ms > 0) {
             return FastPathOutcome::Miss { info: fast_info };
         }
-        let ql = &state.querylog;
         ql.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         if meta.is_stale {
             ql.counters.stale_served.fetch_add(1, Ordering::Relaxed);
         }
         if ql.collecting() {
+            let h = hot.as_ref().unwrap();
             ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
                 seq,
                 unix_micros: crate::querylog::unix_micros_now(),
@@ -184,7 +192,7 @@ pub(crate) fn try_fast_path_into(
                 elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
                 response_bytes: send_buf.len() as u32,
                 source: if meta.is_stale { "stale" } else { "cache" },
-                group: group_id_to_name(meta.group_id, &state.hot.load()),
+                group: group_id_to_name(meta.group_id, h),
                 answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
                     dns::answer_ips(send_buf, fast_info.question_end)
                 } else {
@@ -237,13 +245,14 @@ async fn handle_packet_slow_with_info(
             Ok(permit) => permit,
             Err(_) => {
                 // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
-                let acquired = if state.hot.load().cfg.inflight_queue_ms > 0 {
+                let queue_ms = state.hot.load().cfg.inflight_queue_ms;
+                let acquired = if queue_ms > 0 {
                     state
                         .querylog
                         .counters
                         .inflight_queued
                         .fetch_add(1, Ordering::Relaxed);
-                    let wait = Duration::from_millis(state.hot.load().cfg.inflight_queue_ms);
+                    let wait = Duration::from_millis(queue_ms);
                     tokio::time::timeout(wait, state.limit.clone().acquire_owned())
                         .await
                         .ok()
@@ -403,7 +412,7 @@ async fn do_upstream_exchange(
             )
             .await
         }
-        RouteTarget::Group(_) => {
+        RouteTarget::Group(_, _) => {
             let Some(upstream) = target.upstream() else {
                 anyhow::bail!("route target requires an upstream");
             };
@@ -425,7 +434,7 @@ async fn exchange_with_dedupe(
     target: RouteTarget<'_>,
 ) -> Result<Bytes> {
     // Apply qtype filter before any network activity.
-    if let RouteTarget::Group(g) = &target {
+    if let RouteTarget::Group(g, _) = &target {
         if g.filter_qtype.contains(&ctx.info.qtype) {
             let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
             if ctx.client().is_some() {
@@ -434,14 +443,7 @@ async fn exchange_with_dedupe(
                     .counters
                     .filtered
                     .fetch_add(1, Ordering::Relaxed);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &resp,
-                    "filtered",
-                    Some(Arc::from(g.name.as_str())),
-                    0,
-                );
+                emit_slow_event(&ctx, state, &resp, "filtered", Some(g.name_arc.clone()), 0);
             }
             return Ok(resp);
         }
@@ -453,17 +455,11 @@ async fn exchange_with_dedupe(
     let routing_gen = state
         .routing_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let ck = cache_key(&ctx.packet, ctx.info.question_end);
-    // Normalize cache key for strip-mode targets so all ECS clients share one entry.
-    let ck = if target.strip_ecs()
-        && dns::extract_variant(&ctx.packet, ctx.info.question_end)
-            .ecs_src
-            .is_some()
-    {
-        cache_key_strip_ecs(&ctx.packet, ctx.info.question_end)
-    } else {
-        ck
-    };
+    // Parse the EDNS variant once, then reuse it for cache-key selection and the
+    // strip-mode cache-write decision.
+    let variant = dns::extract_variant(&ctx.packet, ctx.info.question_end);
+    let ecs_in_query = target.strip_ecs() && variant.ecs_src.is_some();
+    let ck = cache_key_with_variant(&ctx.packet, ctx.info.question_end, &variant, ecs_in_query);
     // Mix routing generation into the singleflight key so followers from a previous
     // routing generation do not join an in-flight request for a different route target.
     let sf_ck = ck ^ routing_gen.wrapping_mul(0x9e3779b97f4a7c15);
@@ -476,35 +472,22 @@ async fn exchange_with_dedupe(
             dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
         );
         match tokio::time::timeout(deadline, rx.changed()).await {
-            Err(_elapsed) => {
-                let elapsed = started.elapsed().as_micros() as u64;
-                record_client_latency(&ctx, state, elapsed);
-                record_singleflight_hit(&ctx, state);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &servfail,
-                    "singleflight",
-                    Some(Arc::from(target.group_name())),
-                    elapsed,
-                );
-                return Ok(servfail);
-            }
-            Ok(Err(_closed)) => {
-                let elapsed = started.elapsed().as_micros() as u64;
-                record_client_latency(&ctx, state, elapsed);
-                record_singleflight_hit(&ctx, state);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &servfail,
-                    "singleflight",
-                    Some(Arc::from(target.group_name())),
-                    elapsed,
-                );
-                return Ok(servfail);
-            }
             Ok(Ok(())) => {}
+            _ => {
+                // covers both Err(_timeout) and Ok(Err(_channel_closed))
+                let elapsed = started.elapsed().as_micros() as u64;
+                record_client_latency(&ctx, state, elapsed);
+                record_singleflight_hit(&ctx, state);
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &servfail,
+                    "singleflight",
+                    Some(target.group_name_arc()),
+                    elapsed,
+                );
+                return Ok(servfail);
+            }
         }
         let Some(resp) = rx.borrow().clone() else {
             anyhow::bail!("singleflight leader returned no response");
@@ -528,7 +511,7 @@ async fn exchange_with_dedupe(
                 state,
                 &servfail,
                 "singleflight",
-                Some(Arc::from(target.group_name())),
+                Some(target.group_name_arc()),
                 elapsed,
             );
             return Ok(servfail);
@@ -545,7 +528,7 @@ async fn exchange_with_dedupe(
             state,
             &resp,
             "singleflight",
-            Some(Arc::from(target.group_name())),
+            Some(target.group_name_arc()),
             elapsed,
         );
         return Ok(resp);
@@ -576,6 +559,7 @@ async fn exchange_with_dedupe(
     };
 
     let group_name = target.group_name();
+    let group_arc = target.group_name_arc();
 
     let result = if let Some(stale_pkt) = stale_fallback {
         let timeout_ms = stale_timeout_ms;
@@ -600,7 +584,7 @@ async fn exchange_with_dedupe(
                     state,
                     &stale_pkt,
                     "stale",
-                    Some(Arc::from(group_name)),
+                    Some(group_arc.clone()),
                     elapsed,
                 );
                 let refresh = CacheRefresh {
@@ -630,16 +614,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    emit_slow_event(
-                        &ctx,
-                        state,
-                        &stale,
-                        "stale",
-                        Some(Arc::from(group_name)),
-                        elapsed,
-                    );
-                    return Ok(stale);
+                    return emit_stale_hit(&ctx, state, stale, group_arc.clone(), started);
                 }
             }
 
@@ -653,25 +628,12 @@ async fn exchange_with_dedupe(
                     == routing_gen
             {
                 let (cache_policy, group_id) = match &target {
-                    RouteTarget::Group(g) => {
-                        let gid = state
-                            .hot
-                            .load()
-                            .groups
-                            .iter()
-                            .position(|sg| std::ptr::eq(sg, *g))
-                            .map(|i| i as u16)
-                            .unwrap_or(u16::MAX);
-                        (g.cache_policy, gid)
-                    }
+                    RouteTarget::Group(g, idx) => (g.cache_policy, *idx as u16),
                     // NoneIpSet ("none" fallback): use sentinel 65534 so cache hits show group "none".
                     _ => (state.cache.resolve_policy(None), GROUP_ID_NONE_FALLBACK),
                 };
-                let stripped_query: Option<bytes::Bytes> = if target.strip_ecs()
-                    && dns::extract_variant(&ctx.packet, ctx.info.question_end)
-                        .ecs_src
-                        .is_some()
-                {
+                // ecs_in_query was computed once above; reuse here to avoid a second extract_variant.
+                let stripped_query: Option<bytes::Bytes> = if ecs_in_query {
                     dns::strip_edns_ecs(&query_for_cache).map(bytes::Bytes::from)
                 } else {
                     None
@@ -712,14 +674,7 @@ async fn exchange_with_dedupe(
                     .upstream_ok
                     .fetch_add(1, Ordering::Relaxed);
             }
-            emit_slow_event(
-                &ctx,
-                state,
-                &resp,
-                "upstream",
-                Some(Arc::from(group_name)),
-                elapsed,
-            );
+            emit_slow_event(&ctx, state, &resp, "upstream", Some(group_arc), elapsed);
             Ok(resp)
         }
         Err(err) => {
@@ -733,16 +688,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    emit_slow_event(
-                        &ctx,
-                        state,
-                        &stale,
-                        "stale",
-                        Some(Arc::from(group_name)),
-                        elapsed,
-                    );
-                    return Ok(stale);
+                    return emit_stale_hit(&ctx, state, stale, group_arc, started);
                 }
             }
             crate::warn_rate_limited!(
@@ -767,14 +713,7 @@ async fn exchange_with_dedupe(
                     .upstream_err
                     .fetch_add(1, Ordering::Relaxed);
             }
-            emit_slow_event(
-                &ctx,
-                state,
-                &servfail,
-                "upstream",
-                Some(Arc::from(group_name)),
-                elapsed,
-            );
+            emit_slow_event(&ctx, state, &servfail, "upstream", Some(group_arc), elapsed);
             Ok(servfail)
         }
     }
@@ -854,6 +793,20 @@ fn serve_stale(
         .packet;
     singleflight::publish_bytes(&state.remote_inflight, key, stale.clone());
     Some(stale)
+}
+
+/// Emit the querylog event for a served stale entry and return it.
+/// Called after `_leader.published = true` has been set at both stale-serve sites.
+fn emit_stale_hit(
+    ctx: &QueryContext,
+    state: &AppState,
+    stale: Bytes,
+    group: Arc<str>,
+    started: Instant,
+) -> Result<Bytes> {
+    let elapsed = started.elapsed().as_micros() as u64;
+    emit_slow_event(ctx, state, &stale, "stale", Some(group), elapsed);
+    Ok(stale)
 }
 
 /// Race primary and secondary upstream groups.
@@ -1019,7 +972,7 @@ fn maybe_add_response_ips(
     if ips.is_empty() {
         return;
     }
-    if let RouteTarget::Group(group) = target {
+    if let RouteTarget::Group(group, _) = target {
         ipset.add_group_ips(&group.name, &ips);
     }
 }

@@ -418,7 +418,8 @@ tr:last-child td{border-bottom:none}
 <script>
 let TOKEN = sessionStorage.getItem('pathdns_token') || '';
 let currentView = 'dashboard';
-let autoRefreshTimer = null;
+let sseSource = null;   // active EventSource for live querylog
+let qlAfterSeq = null;  // highest seq seen; used for SSE dedup and delta fetch
 let dashTimer = null;
 let filterTimer = null;
 let savedAutoRefresh = null; // auto-refresh state saved while in archive mode
@@ -472,7 +473,44 @@ function submitToken() {
   TOKEN = document.getElementById('auth-input').value.trim();
   sessionStorage.setItem('pathdns_token', TOKEN);
   document.getElementById('auth-overlay').style.display = 'none';
+  if (currentView === 'querylog' && qlMode === 'live') {
+    closeSSE();
+    if (document.getElementById('ql-auto').checked) openSSE();
+  }
   refreshAll();
+}
+
+// ── SSE (live querylog push) ──────────────────────────────────────────────────
+
+function openSSE() {
+  closeSSE();
+  const params = new URLSearchParams();
+  if (TOKEN) params.set('token', TOKEN);
+  // last_seq for initial URL; on reconnect browser sends Last-Event-Id header automatically
+  if (qlAfterSeq !== null) params.set('last_seq', String(qlAfterSeq));
+  const url = '/api/querylog/stream?' + params.toString();
+  sseSource = new EventSource(url);
+  sseSource.onmessage = handleSSEEvent;
+  // onerror: EventSource reconnects automatically; no action needed
+}
+
+function closeSSE() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+}
+
+function handleSSEEvent(e) {
+  let ev;
+  try { ev = JSON.parse(e.data); } catch { return; }
+  // Deduplicate against events already shown from initial loadQueryLog()
+  if (qlAfterSeq !== null && ev.seq <= qlAfterSeq) return;
+  if (qlAfterSeq === null || ev.seq > qlAfterSeq) qlAfterSeq = ev.seq;
+  qlEvents.unshift(ev);
+  if (qlEvents.length > 1000) qlEvents.pop();
+  // Skip if domain filter excludes this event
+  const filter = document.getElementById('ql-filter').value.trim();
+  if (filter && !ev.qname.includes(filter)) return;
+  if (!applyFilters([ev]).length) return;
+  prependEventRow(ev);
 }
 
 document.getElementById('auth-input').addEventListener('keydown', e => {
@@ -492,10 +530,16 @@ function showView(v) {
   });
   currentView = v;
   history.replaceState(null, '', v === 'dashboard' ? location.pathname : '#' + v);
-  if (v === 'dashboard') loadDashboard();
-  else if (v === 'querylog') {
-    if (qlMode === 'live') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
-    else if (archFiles.length === 0) loadArchiveFiles();
+  if (v === 'dashboard') {
+    closeSSE();
+    loadDashboard();
+  } else if (v === 'querylog') {
+    if (qlMode === 'live') {
+      qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
+      loadQueryLog().then(() => {
+        if (document.getElementById('ql-auto').checked) openSSE();
+      });
+    } else if (archFiles.length === 0) loadArchiveFiles();
     else if (archFile) renderArchiveView();
   }
 }
@@ -737,22 +781,21 @@ function switchMode(mode) {
   document.getElementById('ql-more').style.display = isArchive ? 'none' : document.getElementById('ql-more').style.display;
 
   if (isArchive) {
-    clearInterval(autoRefreshTimer); autoRefreshTimer = null;
+    closeSSE();
     savedAutoRefresh = document.getElementById('ql-auto').checked;
     document.getElementById('ql-auto').checked = false;
     if (archFiles.length === 0) loadArchiveFiles();
     else { renderFilePicker(); if (archFile) renderArchiveView(); }
   } else {
     document.getElementById('arch-count').textContent = '';
-    qlEvents = []; qlBeforeSeq = null; loadQueryLog();
+    qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
     if (savedAutoRefresh !== null) {
       document.getElementById('ql-auto').checked = savedAutoRefresh;
       savedAutoRefresh = null;
     }
-    clearInterval(autoRefreshTimer); autoRefreshTimer = null;
-    if (document.getElementById('ql-auto').checked) {
-      autoRefreshTimer = setInterval(() => { qlEvents=[]; qlBeforeSeq=null; loadQueryLog(); }, 5000);
-    }
+    loadQueryLog().then(() => {
+      if (document.getElementById('ql-auto').checked) openSSE();
+    });
   }
 }
 
@@ -770,6 +813,11 @@ async function loadQueryLog() {
 
   if (qlBeforeSeq === null) qlEvents = events;
   else qlEvents = qlEvents.concat(events);
+
+  // Track the highest seq for SSE deduplication and reconnect backfill
+  for (const ev of events) {
+    if (qlAfterSeq === null || ev.seq > qlAfterSeq) qlAfterSeq = ev.seq;
+  }
 
   renderQueryLog(qlEvents);
 
@@ -962,7 +1010,13 @@ async function loadArchive() {
   document.getElementById('ql-tbody').innerHTML =
     '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Loading…</td></tr>';
   document.getElementById('ql-more').style.display = 'none';
-  const r = await tryFetch(url);
+  let r = await tryFetch(url);
+  if (r && r.status === 503) {
+    document.getElementById('ql-tbody').innerHTML =
+      '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Query busy, retrying…</td></tr>';
+    await new Promise(res => setTimeout(res, 1200));
+    r = await tryFetch(url);
+  }
   if (!r || !r.ok) {
     document.getElementById('ql-tbody').innerHTML =
       '<tr><td colspan="8" style="color:var(--red);text-align:center">Failed to load archive</td></tr>';
@@ -1046,6 +1100,36 @@ function sourceTag(src) {
   return '<span class="badge ' + (map[src]||'badge-ok') + '">' + esc(src) + '</span>';
 }
 
+function buildEventRow(ev) {
+  const tr = document.createElement('tr');
+  tr.className = 'ql-row';
+  const t = new Date(ev.time);
+  const timeStr = qlMode === 'archive'
+    ? t.toLocaleDateString([],{month:'2-digit',day:'2-digit'}) + ' ' + t.toLocaleTimeString()
+    : t.toLocaleTimeString();
+  tr.innerHTML =
+    '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
+    '<td>' + esc(ev.client) + '</td>' +
+    '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
+    '<td>' + esc(qtypeName(ev.qtype)) + '</td>' +
+    '<td>' + rcodeTag(ev.rcode) + '</td>' +
+    '<td>' + elapsedCell(ev.elapsed_us) + '</td>' +
+    '<td>' + sourceTag(ev.source) + '</td>' +
+    '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';
+  tr.onclick = () => openModal(ev);
+  return tr;
+}
+
+// Prepend a single new SSE event row without re-rendering the whole table.
+function prependEventRow(ev) {
+  const tbody = document.getElementById('ql-tbody');
+  // Remove placeholder "No entries" row if present
+  if (tbody.rows.length === 1 && tbody.rows[0].cells.length === 1) tbody.innerHTML = '';
+  tbody.insertBefore(buildEventRow(ev), tbody.firstChild);
+  // Keep the table bounded to avoid unbounded DOM growth
+  while (tbody.rows.length > 500) tbody.deleteRow(-1);
+}
+
 function renderQueryLog(events) {
   const display = (qlMode === 'live') ? applyFilters(events) : events;
   const tbody = document.getElementById('ql-tbody');
@@ -1054,25 +1138,7 @@ function renderQueryLog(events) {
     return;
   }
   const frag = document.createDocumentFragment();
-  for (const ev of display) {
-    const tr = document.createElement('tr');
-    tr.className = 'ql-row';
-    const t = new Date(ev.time);
-    const timeStr = qlMode === 'archive'
-      ? t.toLocaleDateString([],{month:'2-digit',day:'2-digit'}) + ' ' + t.toLocaleTimeString()
-      : t.toLocaleTimeString();
-    tr.innerHTML =
-      '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
-      '<td>' + esc(ev.client) + '</td>' +
-      '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
-      '<td>' + esc(qtypeName(ev.qtype)) + '</td>' +
-      '<td>' + rcodeTag(ev.rcode) + '</td>' +
-      '<td>' + elapsedCell(ev.elapsed_us) + '</td>' +
-      '<td>' + sourceTag(ev.source) + '</td>' +
-      '<td>' + (ev.group ? esc(ev.group) : '<span style="color:var(--text2)">—</span>') + '</td>';
-    tr.onclick = () => openModal(ev);
-    frag.appendChild(tr);
-  }
+  for (const ev of display) frag.appendChild(buildEventRow(ev));
   tbody.innerHTML = '';
   tbody.appendChild(frag);
 }
@@ -1132,9 +1198,14 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 
 function filterChanged() {
   clearTimeout(filterTimer);
-  filterTimer = setTimeout(() => {
-    if (qlMode === 'live') { qlEvents = []; qlBeforeSeq = null; loadQueryLog(); }
-    else if (archFile) resetArchiveQuery();
+  filterTimer = setTimeout(async () => {
+    if (qlMode === 'live') {
+      // Close SSE, reload with new server-side filter, then reopen SSE.
+      closeSSE();
+      qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
+      await loadQueryLog();
+      if (document.getElementById('ql-auto').checked) openSSE();
+    } else if (archFile) resetArchiveQuery();
   }, 250);
 }
 
@@ -1143,15 +1214,21 @@ function loadMore() {
 }
 
 async function clearLog() {
+  closeSSE();
   await tryFetch('/api/querylog', {method:'DELETE'});
-  qlEvents = []; qlBeforeSeq = null;
+  qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
   renderQueryLog([]);
+  if (document.getElementById('ql-auto').checked) {
+    await loadQueryLog();
+    openSSE();
+  }
 }
 
 function toggleAuto() {
-  clearInterval(autoRefreshTimer); autoRefreshTimer = null;
   if (document.getElementById('ql-auto').checked) {
-    autoRefreshTimer = setInterval(() => { qlEvents=[]; qlBeforeSeq=null; loadQueryLog(); }, 5000);
+    openSSE();
+  } else {
+    closeSSE();
   }
 }
 
@@ -1188,8 +1265,11 @@ function esc(s) {
 
 function refreshAll() {
   if (currentView === 'dashboard') loadDashboard();
-  else if (currentView === 'querylog' && qlMode === 'live' && document.getElementById('ql-auto').checked) {
-    qlEvents=[]; qlBeforeSeq=null; loadQueryLog();
+  else if (currentView === 'querylog' && qlMode === 'live') {
+    qlEvents=[]; qlBeforeSeq=null; qlAfterSeq=null;
+    loadQueryLog().then(() => {
+      if (document.getElementById('ql-auto').checked) { closeSSE(); openSSE(); }
+    });
   }
 }
 
