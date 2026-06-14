@@ -101,9 +101,7 @@ fn group_id_to_name(group_id: u16, hot: &HotState) -> Option<Arc<str>> {
     } else if group_id == GROUP_ID_NONE_FALLBACK {
         Some(Arc::from("none"))
     } else {
-        hot.groups
-            .get(group_id as usize)
-            .map(|g| Arc::from(g.name.as_str()))
+        hot.groups.get(group_id as usize).map(|g| g.name_arc.clone())
     }
 }
 
@@ -237,13 +235,14 @@ async fn handle_packet_slow_with_info(
             Ok(permit) => permit,
             Err(_) => {
                 // Queue mode: wait up to inflight_queue_ms for a permit before hard-dropping.
-                let acquired = if state.hot.load().cfg.inflight_queue_ms > 0 {
+                let queue_ms = state.hot.load().cfg.inflight_queue_ms;
+                let acquired = if queue_ms > 0 {
                     state
                         .querylog
                         .counters
                         .inflight_queued
                         .fetch_add(1, Ordering::Relaxed);
-                    let wait = Duration::from_millis(state.hot.load().cfg.inflight_queue_ms);
+                    let wait = Duration::from_millis(queue_ms);
                     tokio::time::timeout(wait, state.limit.clone().acquire_owned())
                         .await
                         .ok()
@@ -403,7 +402,7 @@ async fn do_upstream_exchange(
             )
             .await
         }
-        RouteTarget::Group(_) => {
+        RouteTarget::Group(_, _) => {
             let Some(upstream) = target.upstream() else {
                 anyhow::bail!("route target requires an upstream");
             };
@@ -425,7 +424,7 @@ async fn exchange_with_dedupe(
     target: RouteTarget<'_>,
 ) -> Result<Bytes> {
     // Apply qtype filter before any network activity.
-    if let RouteTarget::Group(g) = &target {
+    if let RouteTarget::Group(g, _) = &target {
         if g.filter_qtype.contains(&ctx.info.qtype) {
             let resp = dns::empty_reply(&ctx.packet, ctx.info.question_end).map(Bytes::from)?;
             if ctx.client().is_some() {
@@ -439,7 +438,7 @@ async fn exchange_with_dedupe(
                     state,
                     &resp,
                     "filtered",
-                    Some(Arc::from(g.name.as_str())),
+                    Some(g.name_arc.clone()),
                     0,
                 );
             }
@@ -453,16 +452,16 @@ async fn exchange_with_dedupe(
     let routing_gen = state
         .routing_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let ck = cache_key(&ctx.packet, ctx.info.question_end);
-    // Normalize cache key for strip-mode targets so all ECS clients share one entry.
-    let ck = if target.strip_ecs()
+    // Check once whether the query contains an ECS option; reused for cache key selection
+    // and later for the strip-mode cache-write decision.
+    let ecs_in_query = target.strip_ecs()
         && dns::extract_variant(&ctx.packet, ctx.info.question_end)
             .ecs_src
-            .is_some()
-    {
+            .is_some();
+    let ck = if ecs_in_query {
         cache_key_strip_ecs(&ctx.packet, ctx.info.question_end)
     } else {
-        ck
+        cache_key(&ctx.packet, ctx.info.question_end)
     };
     // Mix routing generation into the singleflight key so followers from a previous
     // routing generation do not join an in-flight request for a different route target.
@@ -487,7 +486,7 @@ async fn exchange_with_dedupe(
                     state,
                     &servfail,
                     "singleflight",
-                    Some(Arc::from(target.group_name())),
+                    Some(target.group_name_arc()),
                     elapsed,
                 );
                 return Ok(servfail);
@@ -515,7 +514,7 @@ async fn exchange_with_dedupe(
                 state,
                 &servfail,
                 "singleflight",
-                Some(Arc::from(target.group_name())),
+                Some(target.group_name_arc()),
                 elapsed,
             );
             return Ok(servfail);
@@ -563,6 +562,7 @@ async fn exchange_with_dedupe(
     };
 
     let group_name = target.group_name();
+    let group_arc = target.group_name_arc();
 
     let result = if let Some(stale_pkt) = stale_fallback {
         let timeout_ms = stale_timeout_ms;
@@ -587,7 +587,7 @@ async fn exchange_with_dedupe(
                     state,
                     &stale_pkt,
                     "stale",
-                    Some(Arc::from(group_name)),
+                    Some(group_arc.clone()),
                     elapsed,
                 );
                 let refresh = CacheRefresh {
@@ -617,7 +617,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    return emit_stale_hit(&ctx, state, stale, group_name, started);
+                    return emit_stale_hit(&ctx, state, stale, group_arc.clone(), started);
                 }
             }
 
@@ -631,25 +631,12 @@ async fn exchange_with_dedupe(
                     == routing_gen
             {
                 let (cache_policy, group_id) = match &target {
-                    RouteTarget::Group(g) => {
-                        let gid = state
-                            .hot
-                            .load()
-                            .groups
-                            .iter()
-                            .position(|sg| std::ptr::eq(sg, *g))
-                            .map(|i| i as u16)
-                            .unwrap_or(u16::MAX);
-                        (g.cache_policy, gid)
-                    }
+                    RouteTarget::Group(g, idx) => (g.cache_policy, *idx as u16),
                     // NoneIpSet ("none" fallback): use sentinel 65534 so cache hits show group "none".
                     _ => (state.cache.resolve_policy(None), GROUP_ID_NONE_FALLBACK),
                 };
-                let stripped_query: Option<bytes::Bytes> = if target.strip_ecs()
-                    && dns::extract_variant(&ctx.packet, ctx.info.question_end)
-                        .ecs_src
-                        .is_some()
-                {
+                // ecs_in_query was computed once above; reuse here to avoid a second extract_variant.
+                let stripped_query: Option<bytes::Bytes> = if ecs_in_query {
                     dns::strip_edns_ecs(&query_for_cache).map(bytes::Bytes::from)
                 } else {
                     None
@@ -695,7 +682,7 @@ async fn exchange_with_dedupe(
                 state,
                 &resp,
                 "upstream",
-                Some(Arc::from(group_name)),
+                Some(group_arc),
                 elapsed,
             );
             Ok(resp)
@@ -711,7 +698,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    return emit_stale_hit(&ctx, state, stale, group_name, started);
+                    return emit_stale_hit(&ctx, state, stale, group_arc, started);
                 }
             }
             crate::warn_rate_limited!(
@@ -741,7 +728,7 @@ async fn exchange_with_dedupe(
                 state,
                 &servfail,
                 "upstream",
-                Some(Arc::from(group_name)),
+                Some(group_arc),
                 elapsed,
             );
             Ok(servfail)
@@ -831,11 +818,11 @@ fn emit_stale_hit(
     ctx: &QueryContext,
     state: &AppState,
     stale: Bytes,
-    group_name: &str,
+    group: Arc<str>,
     started: Instant,
 ) -> Result<Bytes> {
     let elapsed = started.elapsed().as_micros() as u64;
-    emit_slow_event(ctx, state, &stale, "stale", Some(Arc::from(group_name)), elapsed);
+    emit_slow_event(ctx, state, &stale, "stale", Some(group), elapsed);
     Ok(stale)
 }
 
@@ -1002,7 +989,7 @@ fn maybe_add_response_ips(
     if ips.is_empty() {
         return;
     }
-    if let RouteTarget::Group(group) = target {
+    if let RouteTarget::Group(group, _) = target {
         ipset.add_group_ips(&group.name, &ips);
     }
 }

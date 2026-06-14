@@ -79,6 +79,10 @@ pub struct RefreshGate {
 
 pub struct CustomGroup {
     pub name: String,
+    /// Pre-interned Arc of `name`; clone is a refcount bump, no allocation per query.
+    pub name_arc: Arc<str>,
+    /// Index of this group in `HotState::groups`; carried in `RouteTarget::Group`.
+    pub index: usize,
     pub upstream: Option<UpstreamPool>,
     /// Group cache policy merged over global defaults at startup.
     pub cache_policy: crate::cache::ResolvedCachePolicy,
@@ -96,7 +100,7 @@ impl CustomGroup {
     pub fn target(&self) -> Option<crate::router::RouteTarget<'_>> {
         self.upstream
             .is_some()
-            .then_some(crate::router::RouteTarget::Group(self))
+            .then_some(crate::router::RouteTarget::Group(self, self.index))
     }
 }
 
@@ -209,7 +213,7 @@ async fn build_groups(
     cache: &DnsCache,
 ) -> Result<Vec<CustomGroup>> {
     let mut groups = Vec::new();
-    for spec in &cfg.groups {
+    for (idx, spec) in cfg.groups.iter().enumerate() {
         let upstream = if spec.fixed_rcode.is_some() {
             None
         } else {
@@ -229,6 +233,8 @@ async fn build_groups(
             .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
         groups.push(CustomGroup {
             name: spec.name.clone(),
+            name_arc: Arc::from(spec.name.as_str()),
+            index: idx,
             upstream,
             cache_policy: cache.resolve_policy(spec.cache_policy.as_ref()),
             filter_qtype: spec.filter_qtype.iter().copied().collect(),

@@ -8,11 +8,18 @@ use crate::server::{CustomGroup, HotState, ResolvedFallback};
 use crate::upstream::UpstreamPool;
 use std::sync::Arc;
 
+static NONE_ARC: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+
+#[inline]
+fn none_arc() -> Arc<str> {
+    NONE_ARC.get_or_init(|| Arc::from("none")).clone()
+}
+
 /// The upstream target selected for a query.
 #[derive(Clone, Copy)]
 pub enum RouteTarget<'a> {
-    /// Route to a named custom group.
-    Group(&'a CustomGroup),
+    /// Route to a named custom group. The `usize` is the group's index in `HotState::groups`.
+    Group(&'a CustomGroup, usize),
     /// Race primary vs secondary; first valid non-SERVFAIL response wins.
     Race {
         primary: &'a CustomGroup,
@@ -28,21 +35,29 @@ pub enum RouteTarget<'a> {
 impl<'a> RouteTarget<'a> {
     pub fn group_name(&self) -> &'a str {
         match self {
-            Self::Group(group) => &group.name,
+            Self::Group(group, _) => &group.name,
             Self::Race { .. } | Self::NoneIpSet { .. } => "none",
+        }
+    }
+
+    /// Returns the group name as a pre-interned `Arc<str>`, avoiding per-call allocation.
+    pub fn group_name_arc(&self) -> Arc<str> {
+        match self {
+            Self::Group(group, _) => group.name_arc.clone(),
+            Self::Race { .. } | Self::NoneIpSet { .. } => none_arc(),
         }
     }
 
     pub fn skip_cache(&self) -> bool {
         match self {
-            Self::Group(group) => group.cache_policy.skip,
+            Self::Group(group, _) => group.cache_policy.skip,
             Self::Race { .. } | Self::NoneIpSet { .. } => false,
         }
     }
 
     pub fn upstream(&self) -> Option<&'a UpstreamPool> {
         match self {
-            Self::Group(group) => group.upstream.as_ref(),
+            Self::Group(group, _) => group.upstream.as_ref(),
             Self::Race { .. } | Self::NoneIpSet { .. } => None,
         }
     }
@@ -51,7 +66,7 @@ impl<'a> RouteTarget<'a> {
     /// can share a single cache entry keyed on the ECS-stripped variant.
     pub fn strip_ecs(&self) -> bool {
         match self {
-            Self::Group(g) => g.strip_ecs,
+            Self::Group(g, _) => g.strip_ecs,
             Self::Race { primary, secondary } | Self::NoneIpSet { primary, secondary } => {
                 primary.strip_ecs && secondary.strip_ecs
             }

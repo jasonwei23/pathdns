@@ -18,6 +18,7 @@ use crate::server::CustomGroup;
 use moka::sync::Cache as MokaCache;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // TagMemo.
 
@@ -80,7 +81,7 @@ pub struct RouteIndex {
     num_tags: usize,
 
     /// L1 route cache: qname -> group index (or usize::MAX for no match).
-    route_cache: MokaCache<String, usize>,
+    route_cache: MokaCache<Arc<str>, usize>,
 }
 
 impl RouteIndex {
@@ -173,7 +174,7 @@ impl RouteIndex {
                         .unwrap_or(usize::MAX)
                 })
                 .unwrap_or(usize::MAX);
-            self.route_cache.insert(qname.to_string(), idx);
+            self.route_cache.insert(Arc::from(qname), idx);
             return result;
         }
         self.route_uncached(groups, qname, geosite)
