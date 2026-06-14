@@ -45,6 +45,47 @@
 //! }
 //! ```
 //!
+//! # Example – nftset with prefix-mask routing
+//!
+//! Use `family@table@set` to target an nftset instead of an ipset.
+//! An optional fourth `@N` segment applies a prefix mask before insertion
+//! (e.g. `inet@fw4@mainroute@24` inserts the /24 network address for each
+//! resolved IPv4 address, useful for route tables keyed on prefixes).
+//! The v4 and v6 set names are separated by a comma in `add-ip`;
+//! use `"null"` to skip one address family.
+//!
+//! ```json
+//! {
+//!   "bind":         ["0.0.0.0:53", "[::]:53"],
+//!   "geosite-file": ["/etc/pathdns/geosite.dat"],
+//!   "group": [
+//!     { "name": "domestic", "tag": ["cn"],  "upstream": ["119.29.29.29"],
+//!       "add-ip": "inet@fw4@mainroute@24,inet@fw4@mainroute6@48" },
+//!     { "name": "overseas", "tag": ["!cn"], "upstream": ["tcp://1.1.1.1"] }
+//!   ],
+//!   "fallback": {
+//!     "primary":     "domestic",
+//!     "secondary":   "overseas",
+//!     "ipset-name4": "inet@fw4@mainroute",
+//!     "ipset-name6": "inet@fw4@mainroute6"
+//!   },
+//!   "cache": { "size": 10000 }
+//! }
+//! ```
+//!
+//! ## Set name formats
+//!
+//! | Format | Meaning |
+//! |--------|---------|
+//! | `"myset"` | ipset named `myset` |
+//! | `"myset/24"` | ipset named `myset`, IP masked to /24 before insertion |
+//! | `"inet@fw4@myset"` | nftset: family `inet`, table `fw4`, set `myset` |
+//! | `"inet@fw4@myset@24"` | same nftset, IP masked to /24 before insertion |
+//!
+//! The mask variants are useful with nftset `interval` sets: pathdns queries
+//! the kernel for the `NFT_SET_INTERVAL` flag at startup and automatically
+//! writes masked entries as prefix ranges (e.g. `1.2.3.0-1.2.3.255`).
+//!
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
