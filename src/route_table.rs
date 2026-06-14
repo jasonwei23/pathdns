@@ -24,27 +24,40 @@ use std::sync::Arc;
 
 /// Per-query memoization of `GeoSiteDb::matches(tag_id, qname)`.
 ///
-/// Uses tag IDs (u16) as indices into a SmallVec<[Option<bool>; 32]>.
-/// This avoids string comparisons on the hot path.
+/// Uses two bits per tag, packed into 64-tag chunks. This avoids string
+/// comparisons on the hot path while keeping cold-route initialization small.
+#[derive(Clone, Copy, Default)]
+struct TagMemoChunk {
+    seen: u64,
+    matched: u64,
+}
+
 struct TagMemo {
-    results: SmallVec<[Option<bool>; 32]>,
+    chunks: SmallVec<[TagMemoChunk; 1]>,
 }
 
 impl TagMemo {
     fn new(num_tags: usize) -> Self {
-        let mut results = SmallVec::new();
-        results.resize(num_tags, None);
-        Self { results }
+        let mut chunks = SmallVec::new();
+        chunks.resize(num_tags.div_ceil(64), TagMemoChunk::default());
+        Self { chunks }
     }
 
     fn check(&mut self, gs: &GeoSiteDb, tag_id: u16, tag_name: &str, qname: &str) -> bool {
         let idx = tag_id as usize;
-        if let Some(v) = self.results.get(idx).copied().flatten() {
-            return v;
+        let chunk_idx = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if let Some(chunk) = self.chunks.get(chunk_idx) {
+            if chunk.seen & bit != 0 {
+                return chunk.matched & bit != 0;
+            }
         }
         let v = gs.matches(tag_name, qname);
-        if let Some(slot) = self.results.get_mut(idx) {
-            *slot = Some(v);
+        if let Some(chunk) = self.chunks.get_mut(chunk_idx) {
+            chunk.seen |= bit;
+            if v {
+                chunk.matched |= bit;
+            }
         }
         v
     }
@@ -235,3 +248,35 @@ fn geo_entry_matches(
 }
 
 // Tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_memo_packs_sixty_four_tags_per_chunk() {
+        let empty = TagMemo::new(0);
+        assert!(empty.chunks.is_empty());
+
+        let inline = TagMemo::new(64);
+        assert_eq!(inline.chunks.len(), 1);
+        assert!(!inline.chunks.spilled());
+
+        let two_chunks = TagMemo::new(65);
+        assert_eq!(two_chunks.chunks.len(), 2);
+    }
+
+    #[test]
+    fn tag_memo_chunk_tracks_seen_and_matched_independently() {
+        let mut memo = TagMemo::new(64);
+        let false_bit = 1u64 << 7;
+        let true_bit = 1u64 << 42;
+
+        memo.chunks[0].seen |= false_bit | true_bit;
+        memo.chunks[0].matched |= true_bit;
+
+        assert_ne!(memo.chunks[0].seen & false_bit, 0);
+        assert_eq!(memo.chunks[0].matched & false_bit, 0);
+        assert_ne!(memo.chunks[0].matched & true_bit, 0);
+    }
+}
