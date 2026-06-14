@@ -165,35 +165,18 @@ impl RouteIndex {
                     groups.get(idx)
                 };
             }
-            let result = self.route_uncached(groups, qname, geosite);
-            let idx = result
-                .map(|g| {
-                    groups
-                        .iter()
-                        .position(|x| std::ptr::eq(x, g))
-                        .unwrap_or(usize::MAX)
-                })
-                .unwrap_or(usize::MAX);
+            let idx = self.route_index_uncached(qname, geosite);
             self.route_cache.insert(Arc::from(qname), idx);
-            return result;
+            return groups.get(idx);
         }
-        self.route_uncached(groups, qname, geosite)
+        groups.get(self.route_index_uncached(qname, geosite))
     }
 
-    fn route_uncached<'a>(
-        &self,
-        groups: &'a [CustomGroup],
-        qname: &str,
-        geosite: Option<&GeoSiteDb>,
-    ) -> Option<&'a CustomGroup> {
+    fn route_index_uncached(&self, qname: &str, geosite: Option<&GeoSiteDb>) -> usize {
         let catch_all = self.catch_all_idx.unwrap_or(usize::MAX);
 
         if self.geosite_entries.is_empty() {
-            return if catch_all == usize::MAX {
-                None
-            } else {
-                Some(&groups[catch_all])
-            };
+            return catch_all;
         }
 
         let mut tag_memo = TagMemo::new(self.num_tags);
@@ -201,20 +184,15 @@ impl RouteIndex {
         for entry in &self.geosite_entries {
             // If the catch-all group precedes this GeoSite entry, it wins first.
             if catch_all < entry.group_idx {
-                return Some(&groups[catch_all]);
+                return catch_all;
             }
-            let group = &groups[entry.group_idx];
             if geo_entry_matches(entry, qname, geosite, &mut tag_memo, &self.tag_names) {
-                return Some(group);
+                return entry.group_idx;
             }
         }
 
         // All GeoSite entries exhausted; fall through to catch-all if present.
-        if catch_all != usize::MAX {
-            Some(&groups[catch_all])
-        } else {
-            None
-        }
+        catch_all
     }
 }
 

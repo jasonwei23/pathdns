@@ -4,7 +4,7 @@
 //! Listener code owns sockets and framing; this module owns packet lifecycle after a DNS
 //! message has been received.
 
-use crate::cache::{cache_key, cache_key_strip_ecs, CacheKey, CacheRefresh};
+use crate::cache::{cache_key_with_variant, CacheKey, CacheRefresh};
 use crate::dns;
 use crate::ipset::TestVerdict;
 use crate::router::RouteTarget;
@@ -101,7 +101,9 @@ fn group_id_to_name(group_id: u16, hot: &HotState) -> Option<Arc<str>> {
     } else if group_id == GROUP_ID_NONE_FALLBACK {
         Some(crate::router::none_arc())
     } else {
-        hot.groups.get(group_id as usize).map(|g| g.name_arc.clone())
+        hot.groups
+            .get(group_id as usize)
+            .map(|g| g.name_arc.clone())
     }
 }
 
@@ -162,8 +164,11 @@ pub(crate) fn try_fast_path_into(
     ) {
         let ql = &state.querylog;
         // Load hot config at most once: needed for stale-timeout check and querylog group name.
-        let hot: Option<Arc<HotState>> =
-            if meta.is_stale || ql.collecting() { Some(state.hot.load_full()) } else { None };
+        let hot: Option<Arc<HotState>> = if meta.is_stale || ql.collecting() {
+            Some(state.hot.load_full())
+        } else {
+            None
+        };
 
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
@@ -438,14 +443,7 @@ async fn exchange_with_dedupe(
                     .counters
                     .filtered
                     .fetch_add(1, Ordering::Relaxed);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &resp,
-                    "filtered",
-                    Some(g.name_arc.clone()),
-                    0,
-                );
+                emit_slow_event(&ctx, state, &resp, "filtered", Some(g.name_arc.clone()), 0);
             }
             return Ok(resp);
         }
@@ -457,17 +455,11 @@ async fn exchange_with_dedupe(
     let routing_gen = state
         .routing_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    // Check once whether the query contains an ECS option; reused for cache key selection
-    // and later for the strip-mode cache-write decision.
-    let ecs_in_query = target.strip_ecs()
-        && dns::extract_variant(&ctx.packet, ctx.info.question_end)
-            .ecs_src
-            .is_some();
-    let ck = if ecs_in_query {
-        cache_key_strip_ecs(&ctx.packet, ctx.info.question_end)
-    } else {
-        cache_key(&ctx.packet, ctx.info.question_end)
-    };
+    // Parse the EDNS variant once, then reuse it for cache-key selection and the
+    // strip-mode cache-write decision.
+    let variant = dns::extract_variant(&ctx.packet, ctx.info.question_end);
+    let ecs_in_query = target.strip_ecs() && variant.ecs_src.is_some();
+    let ck = cache_key_with_variant(&ctx.packet, ctx.info.question_end, &variant, ecs_in_query);
     // Mix routing generation into the singleflight key so followers from a previous
     // routing generation do not join an in-flight request for a different route target.
     let sf_ck = ck ^ routing_gen.wrapping_mul(0x9e3779b97f4a7c15);
@@ -536,7 +528,7 @@ async fn exchange_with_dedupe(
             state,
             &resp,
             "singleflight",
-            Some(Arc::from(target.group_name())),
+            Some(target.group_name_arc()),
             elapsed,
         );
         return Ok(resp);
@@ -682,14 +674,7 @@ async fn exchange_with_dedupe(
                     .upstream_ok
                     .fetch_add(1, Ordering::Relaxed);
             }
-            emit_slow_event(
-                &ctx,
-                state,
-                &resp,
-                "upstream",
-                Some(group_arc),
-                elapsed,
-            );
+            emit_slow_event(&ctx, state, &resp, "upstream", Some(group_arc), elapsed);
             Ok(resp)
         }
         Err(err) => {
@@ -728,14 +713,7 @@ async fn exchange_with_dedupe(
                     .upstream_err
                     .fetch_add(1, Ordering::Relaxed);
             }
-            emit_slow_event(
-                &ctx,
-                state,
-                &servfail,
-                "upstream",
-                Some(group_arc),
-                elapsed,
-            );
+            emit_slow_event(&ctx, state, &servfail, "upstream", Some(group_arc), elapsed);
             Ok(servfail)
         }
     }

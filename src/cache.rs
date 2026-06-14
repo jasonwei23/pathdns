@@ -58,9 +58,11 @@ pub fn cache_key_strip_ecs(query: &[u8], question_end: usize) -> CacheKey {
     cache_key_impl(query, question_end, true)
 }
 
-/// Inner hasher — uses a pre-computed `QueryVariant` so callers that already parsed
-/// the EDNS section do not have to re-scan the packet.
-fn cache_key_with_variant(
+/// Hash a query using a pre-computed [`dns::QueryVariant`].
+///
+/// Callers that need the variant for other decisions can use this entry point to
+/// avoid scanning the DNS additional section a second time.
+pub(crate) fn cache_key_with_variant(
     query: &[u8],
     question_end: usize,
     v: &dns::QueryVariant,
@@ -291,12 +293,30 @@ impl DnsCache {
         let allow_stale = self.stale_expire_ttl > 0;
         let live_v = dns::extract_variant(query, question_end);
         let key = cache_key_with_variant(query, question_end, &live_v, false);
-        if let Some(hit) = self.lookup_into_keyed(key, query, question_end, client_id, allow_stale, false, out, &live_v) {
+        if let Some(hit) = self.lookup_into_keyed(
+            key,
+            query,
+            question_end,
+            client_id,
+            allow_stale,
+            false,
+            out,
+            &live_v,
+        ) {
             return Some(hit);
         }
         if live_v.ecs_src.is_some() {
             let strip_key = cache_key_with_variant(query, question_end, &live_v, true);
-            self.lookup_into_keyed(strip_key, query, question_end, client_id, allow_stale, true, out, &live_v)
+            self.lookup_into_keyed(
+                strip_key,
+                query,
+                question_end,
+                client_id,
+                allow_stale,
+                true,
+                out,
+                &live_v,
+            )
         } else {
             None
         }
@@ -450,9 +470,23 @@ impl DnsCache {
         let question = query.get(12..question_end)?;
         let entry = cache.get(&key)?;
         let matched = if strip_ecs {
-            queries_match_strip_ecs_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
+            queries_match_strip_ecs_v(
+                &entry.variant,
+                live_v,
+                entry.question_end,
+                entry.query.as_ref(),
+                query,
+                question_end,
+            )
         } else {
-            queries_match_v(&entry.variant, live_v, entry.question_end, entry.query.as_ref(), query, question_end)
+            queries_match_v(
+                &entry.variant,
+                live_v,
+                entry.question_end,
+                entry.query.as_ref(),
+                query,
+                question_end,
+            )
         };
         if !matched {
             return None;
@@ -493,7 +527,6 @@ impl DnsCache {
             group_id: entry.group_id,
         })
     }
-
 
     fn entry_freshness(&self, entry: &Entry, now: Instant, allow_stale: bool) -> EntryFreshness {
         let age = now.saturating_duration_since(entry.inserted).as_secs();
