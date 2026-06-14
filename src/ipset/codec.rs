@@ -34,7 +34,6 @@ const NFPROTO_IPV6: u8 = 10;
 const NFNETLINK_V0: u8 = 0;
 
 const NLM_F_REQUEST: u16 = 0x01;
-const NLM_F_ACK: u16 = 0x04;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
 
@@ -163,9 +162,13 @@ fn encode_ipset_test(name: &str, ip: IpAddr, seq: u32) -> Vec<u8> {
 fn encode_ipset_add_batch(name: &str, ips: &[IpAddr], mask: Option<u8>, seq: u32) -> Vec<u8> {
     assert!(!ips.is_empty());
     let family = ip_family(ips[0]);
+    // NLM_F_ACK is intentionally omitted: the kernel processes the add without
+    // sending a response, giving fire-and-forget semantics.  EEXIST is silently
+    // accepted by the kernel in the same way as a successful add, so no ack is
+    // needed to distinguish "already present" from "just added".
     let mut msg = NlBuilder::new(
         ipset_msg_type(IPSET_CMD_ADD),
-        NLM_F_REQUEST | NLM_F_ACK,
+        NLM_F_REQUEST,
         family,
         0,
     );
