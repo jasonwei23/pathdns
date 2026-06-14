@@ -319,6 +319,20 @@ tr:last-child td{border-bottom:none}
           <div class="stat-sub">current average</div>
         </div>
       </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Memory (RSS)</div>
+          <div class="stat-value" id="stat-rss">—</div>
+          <div class="stat-sub">resident set size</div>
+        </div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">CPU Usage</div>
+          <div class="stat-value" id="stat-cpu">—</div>
+          <div class="stat-sub">since last refresh</div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -626,6 +640,12 @@ function fmtCount(n) {
   return n >= 1000 ? (n/1000).toFixed(0)+'K' : String(n);
 }
 
+function fmtBytes(b) {
+  if (b >= 1073741824) return (b/1073741824).toFixed(1) + ' GB';
+  if (b >= 1048576)    return (b/1048576).toFixed(1) + ' MB';
+  return (b/1024).toFixed(0) + ' KB';
+}
+
 async function loadDashboard() {
   const buckets = RANGE_BUCKETS[statsRangeSeconds] || 12;
   const [r1, r2] = await Promise.all([
@@ -661,6 +681,19 @@ async function loadDashboard() {
     ? (entries / cap * 100).toFixed(0) + '% of ' + fmt(cap)
     : 'disabled';
   document.getElementById('stat-rtt').textContent = fmtRtt(live.avg_resolution_us);
+
+  // Process resource cards
+  const rssEl = document.getElementById('stat-rss');
+  rssEl.textContent = live.rss_bytes != null ? fmtBytes(live.rss_bytes) : '—';
+
+  const cpuEl = document.getElementById('stat-cpu');
+  const cpuPct = live.cpu_pct;
+  if (cpuPct != null) {
+    cpuEl.textContent = cpuPct.toFixed(1) + '%';
+    cpuEl.style.color = cpuPct >= 70 ? 'var(--red)' : cpuPct >= 30 ? 'var(--amber)' : 'var(--text)';
+  } else {
+    cpuEl.textContent = '—';
+  }
 
   // Sparklines — each array is one value per bucket; sum = displayed number
   lastBuckets = bkts;

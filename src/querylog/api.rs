@@ -16,8 +16,8 @@ use crate::querylog::ring::{EventRing, StatsRing};
 use crate::querylog::worker::micros_to_rfc3339;
 use crate::server::AppState;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -25,6 +25,58 @@ static DASHBOARD_HTML: &str = include_str!("page.html");
 /// One concurrent history query at a time — keeps memory and CPU predictable
 /// on router-class hardware.
 static HISTORY_QUERY_GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+/// Stores the previous (timestamp, total_jiffies) reading for CPU% calculation.
+static CPU_PREV: OnceLock<Mutex<(Instant, u64)>> = OnceLock::new();
+
+/// Returns `(cpu_pct, rss_bytes)` for the current process by reading
+/// `/proc/self/stat` and `/proc/self/status`.  CPU% is computed relative to
+/// the previous call; the first call always returns 0%.
+fn process_stats() -> (f64, u64) {
+    let jiffies = read_cpu_jiffies().unwrap_or(0);
+    let rss_bytes = read_rss_kb().unwrap_or(0).saturating_mul(1024);
+    let ticks_per_sec = {
+        let t = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if t > 0 { t as f64 } else { 100.0 }
+    };
+    let now = Instant::now();
+    let state = CPU_PREV.get_or_init(|| Mutex::new((now, jiffies)));
+    let cpu_pct = {
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        let (prev_time, prev_jiffies) = *guard;
+        let elapsed = now.duration_since(prev_time).as_secs_f64();
+        let pct = if elapsed > 0.1 && jiffies >= prev_jiffies {
+            (jiffies - prev_jiffies) as f64 / ticks_per_sec / elapsed * 100.0
+        } else {
+            0.0
+        };
+        *guard = (now, jiffies);
+        pct
+    };
+    (cpu_pct, rss_bytes)
+}
+
+fn read_cpu_jiffies() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // comm (field 2) may contain spaces/parens; skip past the last ')'.
+    let after_comm = stat.rfind(')')? + 1;
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    // After comm: state(0) ppid(1) pgroup(2) session(3) tty(4) tpgid(5) flags(6)
+    // minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12)
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+fn read_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
 
 pub async fn serve(
     listener: TcpListener,
@@ -496,7 +548,10 @@ fn render_stats(
     let ring_evictions = c.ring_evictions.load(Ordering::Relaxed);
     let file_write_errors = c.file_write_errors.load(Ordering::Relaxed);
 
+    let (cpu_pct, rss_bytes) = process_stats();
     serde_json::to_vec(&serde_json::json!({
+        "cpu_pct": (cpu_pct * 10.0).round() / 10.0,
+        "rss_bytes": rss_bytes,
         "queries_total": total,
         "queries_udp": c.queries_udp.load(Ordering::Relaxed),
         "queries_tcp": c.queries_tcp.load(Ordering::Relaxed),
