@@ -160,17 +160,22 @@ pub(crate) fn try_fast_path_into(
         fast_info.id,
         send_buf,
     ) {
+        let ql = &state.querylog;
+        // Load hot config at most once: needed for stale-timeout check and querylog group name.
+        let hot: Option<Arc<HotState>> =
+            if meta.is_stale || ql.collecting() { Some(state.hot.load_full()) } else { None };
+
         // When stale-client-timeout is enabled and the hit is stale, fall through to the
         // async path so it can race upstream vs the timeout before deciding to serve stale.
-        if meta.is_stale && state.hot.load().stale_client_timeout_ms > 0 {
+        if meta.is_stale && hot.as_ref().is_some_and(|h| h.stale_client_timeout_ms > 0) {
             return FastPathOutcome::Miss { info: fast_info };
         }
-        let ql = &state.querylog;
         ql.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         if meta.is_stale {
             ql.counters.stale_served.fetch_add(1, Ordering::Relaxed);
         }
         if ql.collecting() {
+            let h = hot.as_ref().unwrap();
             ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
                 seq,
                 unix_micros: crate::querylog::unix_micros_now(),
@@ -182,7 +187,7 @@ pub(crate) fn try_fast_path_into(
                 elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
                 response_bytes: send_buf.len() as u32,
                 source: if meta.is_stale { "stale" } else { "cache" },
-                group: group_id_to_name(meta.group_id, &state.hot.load()),
+                group: group_id_to_name(meta.group_id, h),
                 answer_ips: if ql.collect_answer_ips() && matches!(fast_info.qtype, 1 | 28) {
                     dns::answer_ips(send_buf, fast_info.question_end)
                 } else {

@@ -74,7 +74,7 @@ pub struct AppState {
 }
 
 pub struct RefreshGate {
-    active: Mutex<HashSet<CacheKey>>,
+    shards: [Mutex<HashSet<CacheKey>>; 64],
 }
 
 pub struct CustomGroup {
@@ -571,20 +571,24 @@ fn is_reload_event(kind: &EventKind) -> bool {
 impl RefreshGate {
     pub(crate) fn new() -> Self {
         Self {
-            active: Mutex::new(HashSet::new()),
+            shards: std::array::from_fn(|_| Mutex::new(HashSet::new())),
         }
     }
 
+    fn shard(&self, key: &CacheKey) -> &Mutex<HashSet<CacheKey>> {
+        &self.shards[(*key as usize) & 63]
+    }
+
     pub(crate) fn begin(&self, key: &CacheKey) -> bool {
-        let Ok(mut active) = self.active.lock() else {
+        let Ok(mut s) = self.shard(key).lock() else {
             return false;
         };
-        active.insert(*key)
+        s.insert(*key)
     }
 
     pub(crate) fn end(&self, key: &CacheKey) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(key);
+        if let Ok(mut s) = self.shard(key).lock() {
+            s.remove(key);
         }
     }
 }
