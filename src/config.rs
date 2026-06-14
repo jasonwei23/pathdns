@@ -57,6 +57,14 @@ pub struct UpstreamConfig {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
+    /// Consecutive failures before a node enters the penalty window.
+    pub failure_threshold: u32,
+    /// How long (ms) a penalized node is skipped before being retried.
+    pub penalty_window_ms: u64,
+    /// Force-probe the least-recently-selected node every N upstream selections.
+    pub probe_interval: u64,
+    /// Banded selection: nodes within this multiple of the best score share traffic.
+    pub select_band_factor: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +268,10 @@ pub struct Config {
     pub hedge_delay: Option<Duration>,
     /// Reject upstream TCP/TLS responses larger than this (bytes). 0 = no limit.
     pub upstream_max_response_bytes: usize,
+    pub upstream_failure_threshold: u32,
+    pub upstream_penalty_window_ms: u64,
+    pub upstream_probe_interval: u64,
+    pub upstream_select_band_factor: u64,
 }
 
 impl Config {
@@ -285,6 +297,10 @@ impl Config {
             upstream_max_inflight: self.upstream_max_inflight,
             hedge_delay: self.hedge_delay,
             upstream_max_response_bytes: self.upstream_max_response_bytes,
+            failure_threshold: self.upstream_failure_threshold,
+            penalty_window_ms: self.upstream_penalty_window_ms,
+            probe_interval: self.upstream_probe_interval,
+            select_band_factor: self.upstream_select_band_factor,
         }
     }
 
@@ -311,6 +327,20 @@ impl Config {
 
         let upstream_max_inflight = json.upstream_max_inflight.unwrap_or(256);
         let hedge_delay_ms = json.hedge_delay_ms.unwrap_or(0);
+
+        let upstream_failure_threshold = json.upstream_failure_threshold.unwrap_or(3);
+        if upstream_failure_threshold < 1 {
+            return Err(anyhow!("upstream-failure-threshold must be at least 1"));
+        }
+        let upstream_penalty_window_ms = json.upstream_penalty_window_ms.unwrap_or(30_000);
+        let upstream_probe_interval = json.upstream_probe_interval.unwrap_or(100);
+        if upstream_probe_interval < 1 {
+            return Err(anyhow!("upstream-probe-interval must be at least 1"));
+        }
+        let upstream_select_band_factor = json.upstream_select_band_factor.unwrap_or(2);
+        if upstream_select_band_factor < 1 {
+            return Err(anyhow!("upstream-select-band-factor must be at least 1"));
+        }
 
         // Parse bootstrap-dns before groups so it can be passed to upstream resolution.
         let bootstrap_dns = parse_bootstrap_dns(json.bootstrap_dns.unwrap_or_default())?;
@@ -502,6 +532,10 @@ impl Config {
             upstream_max_inflight,
             hedge_delay: (hedge_delay_ms > 0).then(|| Duration::from_millis(hedge_delay_ms)),
             upstream_max_response_bytes: json.upstream_max_response_bytes.unwrap_or(0),
+            upstream_failure_threshold,
+            upstream_penalty_window_ms,
+            upstream_probe_interval,
+            upstream_select_band_factor,
         })
     }
 }

@@ -54,17 +54,6 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use udp::UdpUpstream;
 
-/// Failures before a node enters the penalty window.
-const FAILURE_THRESHOLD: u32 = 3;
-/// How long a penalized node is skipped before being retried.
-const PENALTY_DURATION_MS: u64 = 30_000;
-/// Every N upstream selections, force-route to the least-recently-used eligible node so
-/// healthy-but-slow nodes are periodically re-probed rather than starved forever.
-const PROBE_INTERVAL: u64 = 100;
-/// Banded selection (Unbound-style): nodes whose score is within this multiple of the
-/// best score share traffic via pseudo-random pick instead of herding onto the single
-/// minimum.
-const SELECT_BAND_FACTOR: u64 = 2;
 /// Additive band floor in microseconds so sub-millisecond scores are treated as equal.
 const SELECT_BAND_FLOOR_US: u64 = 2_000;
 /// RTT estimate applied on failure when the node has no RTT data yet.
@@ -77,12 +66,12 @@ const FAILURE_RTT_CAP_US: u64 = 10_000_000;
 const CONGESTION_SCORE_FACTOR: u64 = 4;
 
 /// Upper score bound for banded selection.  Nodes scoring at or below this limit
-/// are considered interchangeable with the best node: `best × SELECT_BAND_FACTOR`,
+/// are considered interchangeable with the best node: `best × factor`,
 /// with an additive floor so microsecond-scale scores (LAN resolvers, untested
 /// nodes) are all treated as equal rather than split by measurement noise.
-fn band_limit(best: u64) -> u64 {
-    best.saturating_mul(SELECT_BAND_FACTOR)
-        .max(best.saturating_add(SELECT_BAND_FLOOR_US))
+fn band_limit(best: u64, factor: u64, floor: u64) -> u64 {
+    best.saturating_mul(factor)
+        .max(best.saturating_add(floor))
 }
 
 pub(super) fn now_ms() -> u64 {
@@ -142,10 +131,14 @@ struct HealthStats {
     probe_in_progress: AtomicBool,
     /// Configured hard cap (upstream-max-inflight). 0 = unlimited (AIMD disabled).
     max_inflight: u64,
+    /// Consecutive failures before entering the penalty window (upstream-failure-threshold).
+    failure_threshold: u32,
+    /// How long (ms) a penalized node is skipped (upstream-penalty-window-ms).
+    penalty_duration_ms: u64,
 }
 
 impl HealthStats {
-    fn new(max_inflight: u64) -> Self {
+    fn new(max_inflight: u64, failure_threshold: u32, penalty_duration_ms: u64) -> Self {
         let window = if max_inflight > 0 {
             max_inflight
         } else {
@@ -158,6 +151,8 @@ impl HealthStats {
             concurrency_window: AtomicU64::new(window),
             probe_in_progress: AtomicBool::new(false),
             max_inflight,
+            failure_threshold,
+            penalty_duration_ms,
         }
     }
 
@@ -209,9 +204,9 @@ impl HealthStats {
         self.probe_in_progress.store(false, Ordering::Relaxed);
 
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= FAILURE_THRESHOLD {
+        if n >= self.failure_threshold {
             self.penalty_until_ms
-                .store(now_ms() + PENALTY_DURATION_MS, Ordering::Relaxed);
+                .store(now_ms() + self.penalty_duration_ms, Ordering::Relaxed);
         }
         n
     }
@@ -264,6 +259,10 @@ pub struct UpstreamPool {
     /// Capped at `max(nodes.len(), 4)` to prevent amplification storms when the primary
     /// pool is degraded and every query would otherwise spawn a secondary.
     active_hedges: AtomicU64,
+    /// Force-probe the least-recently-selected eligible node every N upstream selections.
+    probe_interval: u64,
+    /// Banded selection factor: nodes within this multiple of the best score share traffic.
+    select_band_factor: u64,
 }
 
 pub(super) struct UpstreamRequest {
@@ -469,7 +468,11 @@ impl UpstreamPool {
             nodes.push(UpstreamNode {
                 transport,
                 client_filter: endpoint.proto.client_filter(),
-                health: HealthStats::new(cfg.upstream_max_inflight as u64),
+                health: HealthStats::new(
+                    cfg.upstream_max_inflight as u64,
+                    cfg.failure_threshold,
+                    cfg.penalty_window_ms,
+                ),
                 stats: NodeStats::new(),
                 last_selected: AtomicU64::new(0),
                 addr_display: node_addr_display,
@@ -506,6 +509,8 @@ impl UpstreamPool {
             hedge_delay: cfg.hedge_delay,
             querylog_counters,
             active_hedges: AtomicU64::new(0),
+            probe_interval: cfg.probe_interval,
+            select_band_factor: cfg.select_band_factor,
         })
     }
 
@@ -528,7 +533,7 @@ impl UpstreamPool {
             .min_by_key(|(_, n)| n.last_selected.load(Ordering::Relaxed));
         if let Some((probe_idx, probe_node)) = probe {
             if query_ix.wrapping_sub(probe_node.last_selected.load(Ordering::Relaxed))
-                >= PROBE_INTERVAL
+                >= self.probe_interval
             {
                 return Some(probe_idx);
             }
@@ -551,7 +556,7 @@ impl UpstreamPool {
             candidates.push((idx, score));
         }
         if !candidates.is_empty() {
-            let limit = band_limit(best_score);
+            let limit = band_limit(best_score, self.select_band_factor, SELECT_BAND_FLOOR_US);
             let in_band = candidates.iter().filter(|&&(_, s)| s <= limit).count();
             // Fibonacci-hash the query counter for a cheap, well-scattered pick.
             let pick = (query_ix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as usize % in_band;
@@ -827,7 +832,7 @@ impl UpstreamNode {
                 } else {
                     self.stats.record_err();
                 }
-                if n == FAILURE_THRESHOLD {
+                if n == self.health.failure_threshold {
                     crate::startup!(
                         "upstream {} event=penalized consecutive_failures={n}",
                         self.transport.name()
@@ -1076,9 +1081,17 @@ pub fn set_raw_socket_buf_size(fd: libc::c_int, size: usize) {
 mod tests {
     use super::*;
 
+    const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+    const DEFAULT_PENALTY_DURATION_MS: u64 = 30_000;
+    const DEFAULT_SELECT_BAND_FACTOR: u64 = 2;
+
+    fn default_health() -> HealthStats {
+        HealthStats::new(0, DEFAULT_FAILURE_THRESHOLD, DEFAULT_PENALTY_DURATION_MS)
+    }
+
     #[test]
     fn failure_inflates_rtt_estimate() {
-        let h = HealthStats::new(0);
+        let h = default_health();
         h.record_success(20_000);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), 20_000);
 
@@ -1096,7 +1109,7 @@ mod tests {
 
     #[test]
     fn failure_inflation_is_capped() {
-        let h = HealthStats::new(0);
+        let h = default_health();
         h.record_success(8_000_000);
         h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_CAP_US);
@@ -1106,14 +1119,14 @@ mod tests {
 
     #[test]
     fn failure_with_no_data_uses_floor() {
-        let h = HealthStats::new(0);
+        let h = default_health();
         h.record_failure(false);
         assert_eq!(h.ewma_rtt_us.load(Ordering::Relaxed), FAILURE_RTT_FLOOR_US);
     }
 
     #[test]
     fn success_after_failure_adopts_fresh_sample() {
-        let h = HealthStats::new(0);
+        let h = default_health();
         h.record_success(20_000);
         h.record_failure(false);
         h.record_failure(false);
@@ -1125,7 +1138,7 @@ mod tests {
 
     #[test]
     fn steady_state_success_blends_ewma() {
-        let h = HealthStats::new(0);
+        let h = default_health();
         h.record_success(20_000);
         h.record_success(40_000);
         // 0.75 * 20_000 + 0.25 * 40_000 = 25_000
@@ -1134,8 +1147,8 @@ mod tests {
 
     #[test]
     fn penalty_after_threshold_and_reset_on_success() {
-        let h = HealthStats::new(0);
-        for _ in 0..FAILURE_THRESHOLD {
+        let h = default_health();
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
             h.record_failure(false);
         }
         assert!(h.is_penalized_at(now_ms()));
@@ -1146,10 +1159,19 @@ mod tests {
     #[test]
     fn band_limit_floor_and_factor() {
         // No data / zero best: floor only.
-        assert_eq!(band_limit(0), SELECT_BAND_FLOOR_US);
+        assert_eq!(
+            band_limit(0, DEFAULT_SELECT_BAND_FACTOR, SELECT_BAND_FLOOR_US),
+            SELECT_BAND_FLOOR_US
+        );
         // Sub-millisecond best: additive floor dominates (500*2 < 500+2000).
-        assert_eq!(band_limit(500), 500 + SELECT_BAND_FLOOR_US);
+        assert_eq!(
+            band_limit(500, DEFAULT_SELECT_BAND_FACTOR, SELECT_BAND_FLOOR_US),
+            500 + SELECT_BAND_FLOOR_US
+        );
         // Above the floor crossover: multiplicative factor dominates.
-        assert_eq!(band_limit(10_000), 20_000);
+        assert_eq!(
+            band_limit(10_000, DEFAULT_SELECT_BAND_FACTOR, SELECT_BAND_FLOOR_US),
+            20_000
+        );
     }
 }

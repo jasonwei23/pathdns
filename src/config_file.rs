@@ -93,6 +93,14 @@ pub(crate) struct JsonConfig {
     pub(crate) upstream_udp_sockets: Option<usize>,
     pub(crate) upstream_max_inflight: Option<usize>,
     pub(crate) upstream_max_response_bytes: Option<usize>,
+    /// Consecutive failures before a node enters the penalty window (default 3).
+    pub(crate) upstream_failure_threshold: Option<u32>,
+    /// How long (ms) a penalized node is skipped before being retried (default 30000).
+    pub(crate) upstream_penalty_window_ms: Option<u64>,
+    /// Force-probe the least-recently-selected node every N selections (default 100).
+    pub(crate) upstream_probe_interval: Option<u64>,
+    /// Banded selection factor: nodes within this multiple of the best score share traffic (default 2).
+    pub(crate) upstream_select_band_factor: Option<u64>,
     pub(crate) max_inflight: Option<usize>,
     pub(crate) inflight_queue_ms: Option<u64>,
     pub(crate) hedge_delay_ms: Option<u64>,
