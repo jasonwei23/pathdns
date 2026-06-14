@@ -2,15 +2,21 @@
 
 use super::QueryLogEvent;
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
 // ── Event ring ───────────────────────────────────────────────────────────────
 
 /// Fixed-capacity FIFO of recent query events.
 /// Push drops the oldest entry when full and notifies SSE subscribers.
+///
+/// Uses a plain `Mutex` rather than `RwLock`: on Linux `pthread_rwlock` can
+/// starve writers indefinitely when readers arrive continuously (SSE backfill
+/// or polling API calls).  Push operations are O(1) and the critical section
+/// is short in both push and query, so mutual exclusion costs less than
+/// starvation.
 pub struct EventRing {
-    buf: RwLock<VecDeque<Arc<QueryLogEvent>>>,
+    buf: Mutex<VecDeque<Arc<QueryLogEvent>>>,
     capacity: usize,
     tx: broadcast::Sender<Arc<QueryLogEvent>>,
 }
@@ -19,7 +25,7 @@ impl EventRing {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
-            buf: RwLock::new(VecDeque::with_capacity(capacity.min(4096))),
+            buf: Mutex::new(VecDeque::with_capacity(capacity.min(4096))),
             capacity,
             tx,
         }
@@ -31,14 +37,14 @@ impl EventRing {
         if self.capacity == 0 {
             return false;
         }
-        if let Ok(mut buf) = self.buf.write() {
+        if let Ok(mut buf) = self.buf.lock() {
             let mut evicted = false;
             if buf.len() >= self.capacity {
                 buf.pop_front();
                 evicted = true;
             }
             buf.push_back(Arc::clone(&ev));
-            drop(buf); // release read lock before notifying SSE subscribers
+            drop(buf); // release lock before notifying SSE subscribers
             let _ = self.tx.send(ev);
             return evicted;
         }
@@ -59,7 +65,7 @@ impl EventRing {
         limit: usize,
         filter: Option<&str>,
     ) -> Vec<Arc<QueryLogEvent>> {
-        let Ok(buf) = self.buf.read() else {
+        let Ok(buf) = self.buf.lock() else {
             return vec![];
         };
         let limit = limit.clamp(1, 1000);
@@ -90,13 +96,13 @@ impl EventRing {
 
     /// Clear all events from the ring.
     pub fn clear(&self) {
-        if let Ok(mut buf) = self.buf.write() {
+        if let Ok(mut buf) = self.buf.lock() {
             buf.clear();
         }
     }
 
     pub fn len(&self) -> usize {
-        self.buf.read().map(|b| b.len()).unwrap_or(0)
+        self.buf.lock().map(|b| b.len()).unwrap_or(0)
     }
 
     pub fn enabled(&self) -> bool {
