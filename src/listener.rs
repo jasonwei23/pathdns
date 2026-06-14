@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
 
 /// Bind `worker_threads` SO_REUSEPORT UDP sockets and race them in a `JoinSet`.
@@ -133,7 +133,7 @@ async fn serve_tcp_listener(listener: Arc<TcpListener>, state: Arc<AppState>) ->
 }
 
 async fn handle_tcp_conn(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: std::net::SocketAddr,
     state: Arc<AppState>,
     // Held for the lifetime of this connection; drop releases the slot.
@@ -152,7 +152,13 @@ async fn handle_tcp_conn(
         (idle, read)
     };
 
-    // Pre-allocate all per-connection buffers once and reuse across requests.
+    // Split into independent read and write halves so that slow-path queries
+    // (cache misses that need upstream resolution) can be resolved concurrently
+    // without blocking the read loop from accepting the next query.
+    let (mut read_half, write_half) = stream.into_split();
+    let write_half = Arc::new(Mutex::new(write_half));
+
+    // Pre-allocate per-connection buffers reused across fast-path requests.
     let mut resp_buf = BytesMut::with_capacity(512);
     let mut packet_buf = vec![0u8; 512]; // grown on demand, never shrunk
     let mut framing_buf = Vec::<u8>::with_capacity(514); // 2-byte length prefix + response body
@@ -163,9 +169,9 @@ async fn handle_tcp_conn(
         // only the first byte of the header is evicted when the timeout fires.
         let mut len_buf = [0u8; 2];
         let len_result = match idle_timeout {
-            None => stream.read_exact(&mut len_buf).await,
+            None => read_half.read_exact(&mut len_buf).await,
             Some(t) => {
-                match tokio::time::timeout(t, stream.read_exact(&mut len_buf)).await {
+                match tokio::time::timeout(t, read_half.read_exact(&mut len_buf)).await {
                     Ok(r) => r,
                     Err(_elapsed) => return Ok(()), // idle timeout — close cleanly
                 }
@@ -187,9 +193,9 @@ async fn handle_tcp_conn(
             packet_buf.resize(len, 0);
         }
         let body_result = match read_timeout {
-            None => stream.read_exact(&mut packet_buf[..len]).await,
+            None => read_half.read_exact(&mut packet_buf[..len]).await,
             Some(t) => {
-                match tokio::time::timeout(t, stream.read_exact(&mut packet_buf[..len])).await {
+                match tokio::time::timeout(t, read_half.read_exact(&mut packet_buf[..len])).await {
                     Ok(r) => r,
                     Err(_elapsed) => return Ok(()), // body read stalled — close
                 }
@@ -209,34 +215,47 @@ async fn handle_tcp_conn(
                 if let Some(r) = refresh {
                     spawn_cache_refresh(r, &state);
                 }
-                write_tcp_response(&mut stream, &resp, &mut framing_buf).await?;
+                let mut w = write_half.lock().await;
+                if write_tcp_response(&mut *w, &resp, &mut framing_buf)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
             FastPathOutcome::Drop => {}
             FastPathOutcome::Miss { info } => {
+                // Spawn a concurrent task so the read loop continues immediately
+                // rather than blocking until upstream resolution completes.
                 let packet = Bytes::copy_from_slice(pkt);
-                match handle_packet_slow_preparsed(
-                    packet,
-                    peer,
-                    ClientProto::Tcp,
-                    state.clone(),
-                    info,
-                    None,
-                )
-                .await
-                {
-                    Ok(Some(resp)) => {
-                        write_tcp_response(&mut stream, &resp, &mut framing_buf).await?
+                let write = Arc::clone(&write_half);
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    match handle_packet_slow_preparsed(
+                        packet,
+                        peer,
+                        ClientProto::Tcp,
+                        state2,
+                        info,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(Some(resp)) => {
+                            let mut framing = Vec::with_capacity(resp.len() + 2);
+                            let mut w = write.lock().await;
+                            let _ = write_tcp_response(&mut *w, &resp, &mut framing).await;
+                        }
+                        _ => {}
                     }
-                    Ok(None) => {}
-                    Err(_) => return Ok(()),
-                }
+                });
             }
         }
     }
 }
 
-async fn write_tcp_response(
-    stream: &mut TcpStream,
+async fn write_tcp_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
     resp: &[u8],
     framing_buf: &mut Vec<u8>,
 ) -> Result<()> {
@@ -248,7 +267,7 @@ async fn write_tcp_response(
     framing_buf.clear();
     framing_buf.extend_from_slice(&len.to_be_bytes());
     framing_buf.extend_from_slice(resp);
-    stream.write_all(framing_buf).await?;
+    writer.write_all(framing_buf).await?;
     Ok(())
 }
 
