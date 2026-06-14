@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 pub(super) const ADD_QUEUE_SIZE: usize = 16384;
 
@@ -36,71 +37,106 @@ pub(super) fn spawn_add_worker() -> mpsc::SyncSender<AddJob> {
 }
 
 fn run_add_worker(rx: mpsc::Receiver<AddJob>) {
-    let mut client = match NetfilterClient::new() {
-        Ok(c) => c,
-        Err(err) => {
-            crate::log_error!("netlink op=add_worker status=failed error={err:#}");
-            return;
-        }
-    };
     let mut warned: HashSet<String> = HashSet::new();
     let mut batch: Vec<AddJob> = Vec::new();
     // Reusable buffer for nftset chunks; cleared each iteration.
     let mut nftset_chunks: Vec<(SetName, Vec<IpAddr>, bool)> = Vec::new();
 
-    while let Ok(job) = rx.recv() {
-        batch.push(job);
-        // Drain all currently available jobs before processing — larger batches
-        // mean fewer sort/dedup passes and better pipelining on the netlink side.
-        while let Ok(job) = rx.try_recv() {
-            batch.push(job);
-        }
-
-        batch.sort_by(|a, b| a.set.cmp(&b.set).then_with(|| a.ip.cmp(&b.ip)));
-        dedup_jobs(&mut batch);
-
-        let mut first_err: Option<String> = None;
-
-        // Walk contiguous runs of the same set.
-        // ipset runs are sent immediately (fire-and-forget).
-        // nftset runs are accumulated for a single pipelined send+recv pass.
-        let mut pos = 0usize;
-        while pos < batch.len() {
-            let set = batch[pos].set.clone();
-            let interval = batch[pos].interval;
-            let chunk_start = pos;
-            pos += 1;
-            while pos < batch.len() && batch[pos].set == set {
-                pos += 1;
+    // Outer loop: reconnect on socket errors rather than exiting permanently.
+    'reconnect: loop {
+        let mut client = loop {
+            match NetfilterClient::new() {
+                Ok(c) => break c,
+                Err(err) => {
+                    crate::log_error!(
+                        "netlink op=add_worker status=connect_failed error={err:#}"
+                    );
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
-            let ips: Vec<IpAddr> = batch[chunk_start..pos].iter().map(|j| j.ip).collect();
+        };
 
-            match &set {
-                SetName::IpSet { .. } => {
-                    if let Err(err) = client.add_many(&set, &ips, interval) {
-                        first_err.get_or_insert_with(|| format!("{err:#}"));
+        loop {
+            let job = match rx.recv() {
+                Ok(job) => job,
+                Err(_) => return, // sender dropped; exit permanently
+            };
+            batch.push(job);
+            // Drain all currently available jobs before processing — larger batches
+            // mean fewer sort/dedup passes and better pipelining on the netlink side.
+            while let Ok(job) = rx.try_recv() {
+                batch.push(job);
+            }
+
+            batch.sort_by(|a, b| a.set.cmp(&b.set).then_with(|| a.ip.cmp(&b.ip)));
+            dedup_jobs(&mut batch);
+
+            let mut first_err: Option<String> = None;
+            let mut need_reconnect = false;
+
+            // Walk contiguous runs of the same set.
+            // ipset runs are sent immediately (fire-and-forget).
+            // nftset runs are accumulated for a single pipelined send+recv pass.
+            let mut pos = 0usize;
+            while pos < batch.len() {
+                let set = batch[pos].set.clone();
+                let interval = batch[pos].interval;
+                let chunk_start = pos;
+                pos += 1;
+                while pos < batch.len() && batch[pos].set == set {
+                    pos += 1;
+                }
+                let ips: Vec<IpAddr> = batch[chunk_start..pos].iter().map(|j| j.ip).collect();
+
+                match &set {
+                    SetName::IpSet { .. } => {
+                        if let Err(err) = client.add_many(&set, &ips, interval) {
+                            if is_io_error(&err) {
+                                need_reconnect = true;
+                            }
+                            first_err.get_or_insert_with(|| format!("{err:#}"));
+                        }
+                    }
+                    SetName::NftSet { .. } => {
+                        nftset_chunks.push((set, ips, interval));
                     }
                 }
-                SetName::NftSet { .. } => {
-                    nftset_chunks.push((set, ips, interval));
+
+                if need_reconnect {
+                    break;
                 }
             }
-        }
 
-        // Send all nftset messages in one go, then drain all acks — one kernel
-        // RTT for the entire batch regardless of how many distinct sets are present.
-        if let Err(err) = client.add_nftset_pipelined(&nftset_chunks) {
-            first_err.get_or_insert_with(|| format!("{err:#}"));
-        }
+            // Send all nftset messages in one go, then drain all acks — one kernel
+            // RTT for the entire batch regardless of how many distinct sets are present.
+            if !need_reconnect {
+                if let Err(err) = client.add_nftset_pipelined(&nftset_chunks) {
+                    if is_io_error(&err) {
+                        need_reconnect = true;
+                    }
+                    first_err.get_or_insert_with(|| format!("{err:#}"));
+                }
+            }
 
-        if let Some(key) = first_err {
-            if warned.insert(key.clone()) {
-                crate::log_error!("netlink op=add_batch status=failed error={key}");
+            if let Some(key) = first_err {
+                if warned.insert(key.clone()) {
+                    crate::log_error!("netlink op=add_batch status=failed error={key}");
+                }
+            }
+            batch.clear();
+            nftset_chunks.clear();
+
+            if need_reconnect {
+                // Brief pause before reconnecting so we don't spin on a broken kernel.
+                thread::sleep(Duration::from_millis(100));
+                continue 'reconnect;
             }
         }
-        batch.clear();
-        nftset_chunks.clear();
     }
+}
+
+fn is_io_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<std::io::Error>())
 }
 
 /// Remove adjacent duplicate (set, ip) pairs.

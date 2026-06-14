@@ -133,37 +133,70 @@ impl IpSetManager {
     }
 
     pub fn test_response(&self, ips: &[IpAddr]) -> TestVerdict {
-        if self.test.is_none() {
+        let Some(test_pair) = &self.test else {
             return TestVerdict::OtherCase;
-        }
+        };
         if ips.is_empty() {
             return TestVerdict::NoIpFound;
         }
 
-        let mut verdict = TestVerdict::SecondaryIp;
-        let mut any_testable = false;
-        for ip in ips {
-            match self.test_ip(*ip) {
-                Ok(Some(true)) => {
-                    verdict = TestVerdict::PrimaryIp;
-                    break;
-                }
-                Ok(Some(false)) => {
-                    any_testable = true;
-                }
-                Ok(None) => {
-                    // No set configured for this address family; skip.
-                }
+        // Collect only IPs that have a configured set for their address family.
+        let testable: Vec<(IpAddr, &SetName)> = ips
+            .iter()
+            .filter_map(|ip| test_pair.set_for(*ip).map(|set| (*ip, set)))
+            .collect();
+
+        if testable.is_empty() {
+            return TestVerdict::OtherCase;
+        }
+
+        let mut client = match self.client.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.warn_once(WarnKind::TestNetlink, anyhow!("netlink client lock poisoned"));
+                return TestVerdict::OtherCase;
+            }
+        };
+
+        // Phase 1: send all test queries up front, collecting sequence numbers.
+        // This pipelines N queries into one kernel RTT instead of N.
+        let mut pending: Vec<(&SetName, u32)> = Vec::with_capacity(testable.len());
+        for (ip, set) in &testable {
+            match client.send_test(set, *ip) {
+                Ok(seq) => pending.push((set, seq)),
                 Err(err) => {
+                    if is_io_error(&err) {
+                        try_reconnect(&mut client);
+                    }
+                    self.warn_once(WarnKind::TestNetlink, err);
+                    return TestVerdict::OtherCase;
+                }
+            }
+        }
+
+        // Phase 2: receive responses in the same order they were sent.
+        // recv_for_seq discards stale messages, so FIFO order is required.
+        let mut verdict = TestVerdict::SecondaryIp;
+        for (set, seq) in &pending {
+            if verdict == TestVerdict::PrimaryIp {
+                // Already found a hit; skip remaining recvs.
+                // The kernel still sends the responses — they will be
+                // silently discarded by the next recv_for_seq call
+                // (their seq numbers won't match the next fresh request).
+                break;
+            }
+            match client.recv_test(set, *seq) {
+                Ok(true) => verdict = TestVerdict::PrimaryIp,
+                Ok(false) => {} // remains SecondaryIp
+                Err(err) => {
+                    if is_io_error(&err) {
+                        try_reconnect(&mut client);
+                    }
                     self.warn_once(WarnKind::TestNetlink, err);
                     verdict = TestVerdict::OtherCase;
                     break;
                 }
             }
-        }
-        // If no IP could be tested against a configured set, we have no basis to classify.
-        if !any_testable && verdict == TestVerdict::SecondaryIp {
-            verdict = TestVerdict::OtherCase;
         }
 
         verdict
@@ -173,20 +206,6 @@ impl IpSetManager {
         if let Some(pair) = self.group_pair(group) {
             self.add_ips(pair, ips);
         }
-    }
-
-    fn test_ip(&self, ip: IpAddr) -> Result<Option<bool>> {
-        let Some(test) = &self.test else {
-            return Ok(None);
-        };
-        let Some(set) = test.set_for(ip) else {
-            return Ok(None);
-        };
-        self.client
-            .lock()
-            .map_err(|_| anyhow!("netlink client lock poisoned"))?
-            .test(set, ip)
-            .map(Some)
     }
 
     fn group_pair(&self, group: &str) -> Option<&SetPair> {
@@ -262,6 +281,21 @@ impl IpSetManager {
         unreachable!()
     }
     pub fn add_group_ips(&self, _group: &str, _ips: &[std::net::IpAddr]) {}
+}
+
+#[cfg(target_os = "linux")]
+fn is_io_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<std::io::Error>())
+}
+
+#[cfg(target_os = "linux")]
+fn try_reconnect(client: &mut NetfilterClient) {
+    match NetfilterClient::new() {
+        Ok(new_client) => *client = new_client,
+        Err(err) => {
+            crate::log_error!("netlink op=reconnect status=failed error={err:#}");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

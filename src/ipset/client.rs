@@ -29,29 +29,6 @@ impl NetfilterClient {
         })
     }
 
-    /// Test whether `ip` is present in `set`.  Socket timeout → `Err`.
-    pub(super) fn test(&mut self, set: &SetName, ip: IpAddr) -> Result<bool> {
-        let seq = self.sock.alloc_seq();
-        let req = match set {
-            SetName::IpSet { name, .. } => NetfilterRequest::IpsetTest { name, ip },
-            SetName::NftSet {
-                family, table, set, ..
-            } => NetfilterRequest::NftSetTest {
-                family: *family,
-                table,
-                set,
-                ip,
-            },
-        };
-        self.sock.send_raw(&req.encode(seq))?;
-
-        let msg = self.recv_for_test(seq)?;
-        match set {
-            SetName::IpSet { .. } => codec::decode_ipset_test(msg.msg_type, &msg.data),
-            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type, &msg.data),
-        }
-    }
-
     /// Query whether the nftset carries the `NFT_SET_INTERVAL` flag.
     /// Returns `false` on timeout or if the flag is absent.
     pub(super) fn query_nft_interval_flag(
@@ -70,6 +47,38 @@ impl NetfilterClient {
         };
         let flags = codec::decode_nft_set_flags(msg.msg_type, &msg.data)?;
         Ok(flags & codec::NFT_SET_INTERVAL != 0)
+    }
+
+    /// Send a test query without waiting for a response.
+    /// Returns the sequence number to pass to `recv_test`.
+    pub(super) fn send_test(&mut self, set: &SetName, ip: IpAddr) -> Result<u32> {
+        let seq = self.sock.alloc_seq();
+        let req = match set {
+            SetName::IpSet { name, .. } => NetfilterRequest::IpsetTest { name, ip },
+            SetName::NftSet {
+                family,
+                table,
+                set,
+                ..
+            } => NetfilterRequest::NftSetTest {
+                family: *family,
+                table,
+                set,
+                ip,
+            },
+        };
+        self.sock.send_raw(&req.encode(seq))?;
+        Ok(seq)
+    }
+
+    /// Receive the response for a test query identified by `seq`.
+    /// Timeout is an error — the result is unknown.
+    pub(super) fn recv_test(&mut self, set: &SetName, seq: u32) -> Result<bool> {
+        let msg = self.recv_for_test(seq)?;
+        match set {
+            SetName::IpSet { .. } => codec::decode_ipset_test(msg.msg_type, &msg.data),
+            SetName::NftSet { .. } => codec::decode_nft_test(msg.msg_type, &msg.data),
+        }
     }
 
     /// Add `ips` to `set`.  Relies on `EEXIST` for duplicates (blind add).
