@@ -476,35 +476,22 @@ async fn exchange_with_dedupe(
             dns::servfail_reply(&ctx.packet, ctx.info.question_end).unwrap_or_default(),
         );
         match tokio::time::timeout(deadline, rx.changed()).await {
-            Err(_elapsed) => {
-                let elapsed = started.elapsed().as_micros() as u64;
-                record_client_latency(&ctx, state, elapsed);
-                record_singleflight_hit(&ctx, state);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &servfail,
-                    "singleflight",
-                    Some(Arc::from(target.group_name())),
-                    elapsed,
-                );
-                return Ok(servfail);
-            }
-            Ok(Err(_closed)) => {
-                let elapsed = started.elapsed().as_micros() as u64;
-                record_client_latency(&ctx, state, elapsed);
-                record_singleflight_hit(&ctx, state);
-                emit_slow_event(
-                    &ctx,
-                    state,
-                    &servfail,
-                    "singleflight",
-                    Some(Arc::from(target.group_name())),
-                    elapsed,
-                );
-                return Ok(servfail);
-            }
             Ok(Ok(())) => {}
+            _ => {
+                // covers both Err(_timeout) and Ok(Err(_channel_closed))
+                let elapsed = started.elapsed().as_micros() as u64;
+                record_client_latency(&ctx, state, elapsed);
+                record_singleflight_hit(&ctx, state);
+                emit_slow_event(
+                    &ctx,
+                    state,
+                    &servfail,
+                    "singleflight",
+                    Some(Arc::from(target.group_name())),
+                    elapsed,
+                );
+                return Ok(servfail);
+            }
         }
         let Some(resp) = rx.borrow().clone() else {
             anyhow::bail!("singleflight leader returned no response");
@@ -630,16 +617,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    emit_slow_event(
-                        &ctx,
-                        state,
-                        &stale,
-                        "stale",
-                        Some(Arc::from(group_name)),
-                        elapsed,
-                    );
-                    return Ok(stale);
+                    return emit_stale_hit(&ctx, state, stale, group_name, started);
                 }
             }
 
@@ -733,16 +711,7 @@ async fn exchange_with_dedupe(
                     ctx.client().is_some(),
                 ) {
                     _leader.published = true;
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    emit_slow_event(
-                        &ctx,
-                        state,
-                        &stale,
-                        "stale",
-                        Some(Arc::from(group_name)),
-                        elapsed,
-                    );
-                    return Ok(stale);
+                    return emit_stale_hit(&ctx, state, stale, group_name, started);
                 }
             }
             crate::warn_rate_limited!(
@@ -854,6 +823,20 @@ fn serve_stale(
         .packet;
     singleflight::publish_bytes(&state.remote_inflight, key, stale.clone());
     Some(stale)
+}
+
+/// Emit the querylog event for a served stale entry and return it.
+/// Called after `_leader.published = true` has been set at both stale-serve sites.
+fn emit_stale_hit(
+    ctx: &QueryContext,
+    state: &AppState,
+    stale: Bytes,
+    group_name: &str,
+    started: Instant,
+) -> Result<Bytes> {
+    let elapsed = started.elapsed().as_micros() as u64;
+    emit_slow_event(ctx, state, &stale, "stale", Some(Arc::from(group_name)), elapsed);
+    Ok(stale)
 }
 
 /// Race primary and secondary upstream groups.

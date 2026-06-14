@@ -764,17 +764,17 @@ struct ActiveInflightGuard<'a>(&'a AtomicI64);
 /// including on cancellation via `tokio::select!`.
 struct HedgeGuard<'a>(&'a AtomicU64);
 
-impl Drop for ActiveInflightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
+macro_rules! impl_atomic_dec_drop {
+    ($guard:ident) => {
+        impl Drop for $guard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    };
 }
-
-impl Drop for HedgeGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+impl_atomic_dec_drop!(ActiveInflightGuard);
+impl_atomic_dec_drop!(HedgeGuard);
 
 impl UpstreamNode {
     fn enabled_for(&self, client_proto: ClientProto) -> bool {
