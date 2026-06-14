@@ -102,6 +102,7 @@ All configuration is done via the JSON file.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bind` | string or array | `"127.0.0.1:65353"` | Listen address(es). Append `@udp` or `@tcp` to restrict protocol per address. IPv6 sockets are v6-only; for dual-stack use `["0.0.0.0:53", "[::]:53"]`. |
+| `interface` | string array | — | Network interface filter applied via `SO_BINDTODEVICE`. `["eth0", "br-lan"]` accepts only those interfaces; `["!wan"]` accepts all except the listed ones. Absent or `[]` binds all interfaces. Mixing allow and deny entries is an error. |
 | `worker-threads` | int | CPU count | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | `worker-threads × 1024` | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
@@ -115,6 +116,7 @@ All configuration is done via the JSON file.
 | `tcp-max-connections` | int | `1024` | Maximum concurrent inbound TCP connections. `0` = unlimited. |
 | `tcp-read-timeout-ms` | int (ms) | `5000` | Timeout for reading the DNS message body. `0` = disabled. |
 | `tcp-idle-timeout-ms` | int (ms) | `30000` | Idle TCP connection timeout. `0` = disabled. |
+| `bootstrap-dns` | string array | — | Plain UDP resolvers (IP:port) used at startup to resolve DoH/DoT/DoQ upstream hostnames. Required when PathDNS is the system resolver and upstreams are specified by hostname. Port defaults to 53. |
 | `querylog` | object | — | Query log / dashboard settings (see [Query Log](#query-log--dashboard)). |
 | `geosite-file` | string array | — | GeoSite `.dat` or `.json` files. Required when any group uses `tag`. |
 | `no-ipset-blacklist` | bool | `false` | Allow loopback/unspecified IPs in ipset add operations. |
