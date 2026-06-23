@@ -1,0 +1,60 @@
+name: Build aarch64 binary
+
+# Cross-compiles a release pathdns binary for 64-bit ARM Linux
+# (aarch64-unknown-linux-musl → a static binary that runs on routers/SBCs
+# without a matching glibc). Uses cross-rs so the musl toolchain and ring's
+# C/asm build are handled in a container.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-aarch64-
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Stage artifact
+        run: |
+          install -Dm755 target/aarch64-unknown-linux-musl/release/pathdns \
+            dist/pathdns-linux-aarch64
+          cd dist && sha256sum pathdns-linux-aarch64 > pathdns-linux-aarch64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathdns-linux-aarch64
+          path: dist/*
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
