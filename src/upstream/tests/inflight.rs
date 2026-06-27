@@ -1,4 +1,5 @@
 use super::*;
+use bytes::BytesMut;
 
 /// "a." A IN — 7 bytes
 fn q() -> Bytes {
@@ -31,7 +32,7 @@ fn valid_response_delivered() {
     let question = q();
     let (uid, _rx, _guard) = reg.register("t", 0x9999, question.clone()).unwrap();
     let (mut buf, len) = build_response(uid, 0, 1, &question);
-    assert!(matches!(reg.complete(&mut buf, len), Completion::Delivered));
+    assert!(matches!(reg.complete(&mut buf[..len]), Completion::Delivered));
 }
 
 #[test]
@@ -40,7 +41,7 @@ fn response_qdcount_zero_rejected() {
     let question = q();
     let (uid, _rx, _guard) = reg.register("t", 0x9999, question.clone()).unwrap();
     let (mut buf, len) = build_response(uid, 0, 0, &question);
-    assert!(matches!(reg.complete(&mut buf, len), Completion::NoWaiter));
+    assert!(matches!(reg.complete(&mut buf[..len]), Completion::NoWaiter));
 }
 
 #[test]
@@ -49,7 +50,7 @@ fn response_qdcount_two_rejected() {
     let question = q();
     let (uid, _rx, _guard) = reg.register("t", 0x9999, question.clone()).unwrap();
     let (mut buf, len) = build_response(uid, 0, 2, &question);
-    assert!(matches!(reg.complete(&mut buf, len), Completion::NoWaiter));
+    assert!(matches!(reg.complete(&mut buf[..len]), Completion::NoWaiter));
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn response_non_query_opcode_rejected() {
     let (uid, _rx, _guard) = reg.register("t", 0x9999, question.clone()).unwrap();
     // opcode=4 (NOTIFY)
     let (mut buf, len) = build_response(uid, 4, 1, &question);
-    assert!(matches!(reg.complete(&mut buf, len), Completion::NoWaiter));
+    assert!(matches!(reg.complete(&mut buf[..len]), Completion::NoWaiter));
 }
 
 #[test]

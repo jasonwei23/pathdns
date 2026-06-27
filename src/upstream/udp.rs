@@ -14,6 +14,11 @@ use tokio::net::UdpSocket;
 
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
+/// Datagrams drained per `recvmmsg` syscall on each upstream socket. Larger batches
+/// amortise the syscall over more responses under load; 16 keeps per-socket buffer
+/// reservation modest (slots are lazily committed, so unused capacity costs nothing).
+const RECV_BATCH: usize = 16;
+
 pub(super) struct UdpUpstream {
     pub(super) name: String,
     remote: SocketAddr,
@@ -153,14 +158,15 @@ impl UdpUpstream {
     async fn recv_loop(self: Arc<Self>, socket_idx: usize) -> Result<()> {
         let socket = &self.sockets[socket_idx];
         let fd = socket.as_raw_fd();
-        let mut buf = BytesMut::with_capacity(MAX_DNS_MESSAGE);
+        let mut batch = sys::RecvMmsgBatch::new(RECV_BATCH, MAX_DNS_MESSAGE);
         let mut recv_count = 0u32;
         loop {
-            buf.clear();
-            if buf.capacity() < MAX_DNS_MESSAGE {
-                buf.reserve(MAX_DNS_MESSAGE - buf.capacity());
-            }
-            let n = match socket.recv_buf(&mut buf).await {
+            // Wait for readability, then drain every queued datagram with a single
+            // recvmmsg syscall instead of one recvfrom per packet.
+            let received = match socket
+                .async_io(tokio::io::Interest::READABLE, || batch.recv(fd))
+                .await
+            {
                 Ok(n) => n,
                 // ICMP unreachable for this connected upstream surfaces as a socket
                 // error. Drain the IP_RECVERR queue and keep going — a dead/unreachable
@@ -172,18 +178,25 @@ impl UdpUpstream {
                 }
                 Err(e) => return Err(e.into()),
             };
-            match self.inflight.complete(&mut buf, n) {
-                Completion::Delivered => {
-                    recv_count += 1;
-                    // Yield every 100 dispatched responses to prevent monopolizing the Tokio
-                    // worker during burst periods where many responses arrive back-to-back.
-                    if recv_count >= 100 {
-                        recv_count = 0;
-                        tokio::task::yield_now().await;
+            for i in 0..received {
+                // `None` = the datagram was truncated to the slot size (oversized);
+                // skip it, the waiter falls back to its timeout.
+                let Some(packet) = batch.message(i) else {
+                    continue;
+                };
+                match self.inflight.complete(packet) {
+                    Completion::Delivered => {
+                        recv_count += 1;
+                        // Yield every 100 dispatched responses to prevent monopolizing
+                        // the Tokio worker during sustained bursts.
+                        if recv_count >= 100 {
+                            recv_count = 0;
+                            tokio::task::yield_now().await;
+                        }
                     }
+                    Completion::Mismatch(_id) => {}
+                    Completion::NoWaiter => {}
                 }
-                Completion::Mismatch(_id) => {}
-                Completion::NoWaiter => {}
             }
         }
     }

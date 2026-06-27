@@ -13,7 +13,7 @@
 
 use crate::dns;
 use anyhow::{anyhow, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -111,11 +111,11 @@ impl InflightRegistry {
         Err(anyhow!("upstream {name} inflight table is full"))
     }
 
-    /// Validate the response in `buf[..len]` and, when the question matches the
+    /// Validate the response in `packet` and, when the question matches the
     /// registered entry, rewrite the ID back to the client's and complete the
-    /// waiter.  On delivery the response bytes are split out of `buf`.
-    pub(super) fn complete(&self, buf: &mut BytesMut, len: usize) -> Completion {
-        let packet = &buf[..len];
+    /// waiter.  `packet` is the exact received datagram bytes (one message);
+    /// taking a slice lets the single-recv and `recvmmsg` batch paths share this.
+    pub(super) fn complete(&self, packet: &mut [u8]) -> Completion {
         if !dns::is_reply(packet) {
             return Completion::NoWaiter;
         }
@@ -142,8 +142,8 @@ impl InflightRegistry {
         }
         drop(entry); // release shared ref before taking ownership
         if let Some((_, entry)) = self.entries.remove(&id) {
-            let _ = dns::set_id(&mut buf[..len], entry.client_id);
-            let _ = entry.tx.send(Bytes::copy_from_slice(&buf[..len]));
+            let _ = dns::set_id(packet, entry.client_id);
+            let _ = entry.tx.send(Bytes::copy_from_slice(packet));
             return Completion::Delivered;
         }
         Completion::NoWaiter

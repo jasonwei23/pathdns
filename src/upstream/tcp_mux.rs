@@ -382,7 +382,7 @@ async fn mux_reader_loop(
             return;
         }
 
-        let _ = pending.complete(&mut buf, resp_len);
+        let _ = pending.complete(&mut buf[..resp_len]);
     }
 }
 

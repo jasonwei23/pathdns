@@ -493,6 +493,107 @@ fn write_sockaddr(
     }
 }
 
+/// Reusable storage for one `recvmmsg(2)` batch on a **connected** socket.
+///
+/// Drains up to `capacity` datagrams per syscall.  Each slot is `slot_size` bytes;
+/// sized to the maximum DNS message it never truncates.  The backing allocation is
+/// left uninitialised (no memset), so resident memory tracks only the bytes the
+/// kernel actually writes — large slots stay cheap even when mostly unused.
+pub(crate) struct RecvMmsgBatch {
+    /// Backing storage: `capacity * slot_size` bytes of uninitialised capacity.
+    /// `len` stays 0; the region is accessed only through the raw pointers below,
+    /// and only the bytes the kernel reported as written are ever read.
+    buf: Vec<u8>,
+    slot_size: usize,
+    /// One iovec per slot, pointed at by `messages[i].msg_hdr.msg_iov`. Written once
+    /// in `new`; kept alive (never re-read in Rust) so those kernel pointers stay valid.
+    #[allow(dead_code)]
+    iovecs: Vec<libc::iovec>,
+    messages: Vec<libc::mmsghdr>,
+}
+
+// SAFETY: every raw pointer stored permanently points into one of this type's own
+// fixed Vec allocations (never reallocated). Moving the handles between threads does
+// not move those heap allocations, so the pointers remain valid.
+unsafe impl Send for RecvMmsgBatch {}
+
+impl RecvMmsgBatch {
+    pub(crate) fn new(capacity: usize, slot_size: usize) -> Self {
+        let capacity = capacity.max(1);
+        let slot_size = slot_size.max(1);
+        let mut buf: Vec<u8> = Vec::with_capacity(capacity * slot_size);
+        let base = buf.as_mut_ptr();
+        // SAFETY: an all-zero iovec is a valid starting state before wiring.
+        let mut iovecs = vec![unsafe { mem::zeroed::<libc::iovec>() }; capacity];
+        // SAFETY: an all-zero mmsghdr is valid before its fields are wired below.
+        let mut messages = vec![unsafe { mem::zeroed::<libc::mmsghdr>() }; capacity];
+        for i in 0..capacity {
+            // SAFETY: `base + i*slot_size` stays within the single `capacity*slot_size`
+            // allocation reserved above.
+            iovecs[i].iov_base = unsafe { base.add(i * slot_size) } as *mut libc::c_void;
+            iovecs[i].iov_len = slot_size;
+            messages[i].msg_hdr.msg_iov = &mut iovecs[i];
+            messages[i].msg_hdr.msg_iovlen = 1 as _;
+            // Connected socket: no source address and no control data are needed,
+            // so msg_name / msg_control stay null (zeroed above).
+        }
+        Self {
+            buf,
+            slot_size,
+            iovecs,
+            messages,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Receive up to `capacity` datagrams in one non-blocking syscall.  Returns the
+    /// number received; bytes for message `i` are obtained via [`Self::message`].
+    /// Surfaces `WouldBlock` (EAGAIN) so a `tokio::io::async_io` caller can wait.
+    pub(crate) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+        for m in &mut self.messages {
+            m.msg_len = 0;
+            m.msg_hdr.msg_flags = 0;
+        }
+        loop {
+            // SAFETY: `messages`/`iovecs` are initialised and point into the owned
+            // buffer; recvmmsg writes only into those iovec regions and sets msg_len.
+            let n = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    self.messages.as_mut_ptr(),
+                    self.capacity() as libc::c_uint,
+                    libc::MSG_DONTWAIT as _,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The received bytes of message `index` (`index < count` from the last `recv`).
+    /// Returns `None` if the datagram was truncated to the slot size (oversized).
+    pub(crate) fn message(&mut self, index: usize) -> Option<&mut [u8]> {
+        let flags = self.messages[index].msg_hdr.msg_flags;
+        if flags & libc::MSG_TRUNC != 0 {
+            return None;
+        }
+        let len = self.messages[index].msg_len as usize;
+        let offset = index * self.slot_size;
+        // SAFETY: the kernel wrote exactly `len` (<= slot_size) bytes at base+offset,
+        // and slots do not overlap, so this is a unique, initialised view.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(offset), len) })
+    }
+}
+
 /// Enumerate host interface names while guaranteeing `freeifaddrs` on every exit.
 pub(crate) fn interface_names() -> io::Result<Vec<String>> {
     struct IfAddrs(*mut libc::ifaddrs);
