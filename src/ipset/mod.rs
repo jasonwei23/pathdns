@@ -74,8 +74,12 @@ impl IpSetManager {
 
         let mut netfilter_client = NetfilterClient::new()?;
 
-        // At startup, query the NFT_SET_INTERVAL flag for every masked NftSet entry.
-        // This avoids a per-IP query at runtime.
+        // At startup, query the NFT_SET_INTERVAL flag for every NftSet entry — both
+        // masked (prefix ranges) and unmasked (single hosts). Interval sets require
+        // the range representation (two interval endpoints) for *any* element: a
+        // bare host written to an interval set is otherwise stored as an open-ended
+        // interval start, matching far more addresses than intended. Querying once
+        // here avoids a per-IP lookup at runtime.
         let mut interval_nft_sets: HashSet<SetName> = HashSet::new();
         for (_, pair) in &add_rules {
             for set in [pair.v4.as_ref(), pair.v6.as_ref()].into_iter().flatten() {
@@ -83,7 +87,7 @@ impl IpSetManager {
                     family,
                     table,
                     set: set_name,
-                    mask: Some(_),
+                    ..
                 } = set
                 {
                     match netfilter_client.query_nft_interval_flag(*family, table, set_name) {

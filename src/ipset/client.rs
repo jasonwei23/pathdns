@@ -82,8 +82,11 @@ impl NetfilterClient {
 
     /// Add `ips` to `set`.  Relies on `EEXIST` for duplicates (blind add).
     ///
-    /// `interval` is only used for nftset entries that have a mask: when
-    /// `true` each masked IP is written as a prefix range `[net, net_end)`.
+    /// `interval` selects the nftset element representation: when `true` (the
+    /// target set carries `NFT_SET_INTERVAL`) each element is written as a
+    /// half-open range via two interval endpoints — `[net, next_net)` for a
+    /// masked prefix or `[ip, ip+1)` for a single host. When `false`, elements
+    /// are written as plain single keys.
     ///
     /// Fire-and-forget: the kernel processes the add within the `send()` syscall, so no
     /// recv round-trip is needed (errors on these background adds are non-fatal).
