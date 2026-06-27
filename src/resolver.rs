@@ -918,11 +918,30 @@ async fn resolve_none_rule_with_ipset(
 
     let primary_packet = packet.clone();
     let secondary_packet = packet;
+    // Fire both upstreams concurrently. The ipset verdict can usually be decided
+    // from the primary's answer alone (its IPs are in the set → use primary), so
+    // we drive both but return the moment the primary resolves the decision,
+    // without blocking on a possibly-slow secondary. The secondary query is still
+    // in flight, so when its answer *is* needed there is no extra round-trip.
     let primary_query =
         primary_upstream.exchange_observed(primary_packet, info.id, client_proto, count_hedge);
     let secondary_query =
         secondary_upstream.exchange_observed(secondary_packet, info.id, client_proto, count_hedge);
-    let (primary_resp, secondary_resp) = tokio::join!(primary_query, secondary_query);
+    tokio::pin!(primary_query);
+    tokio::pin!(secondary_query);
+
+    // Drive both until the primary completes, stashing the secondary's result if
+    // it happens to finish first (the disabled branch then stops re-polling it).
+    let mut secondary_done: Option<Result<Bytes>> = None;
+    let primary_resp = loop {
+        tokio::select! {
+            biased;
+            pr = &mut primary_query => break pr,
+            sr = &mut secondary_query, if secondary_done.is_none() => {
+                secondary_done = Some(sr);
+            }
+        }
+    };
 
     match primary_resp {
         Ok(resp) => {
@@ -935,6 +954,8 @@ async fn resolve_none_rule_with_ipset(
             match verdict {
                 TestVerdict::PrimaryIp => {
                     state.verdict_cache.add(&info.qname, true);
+                    // Decision is "use primary"; the secondary's answer is not
+                    // needed, so return now and let its in-flight query be dropped.
                     Ok(resp)
                 }
                 TestVerdict::NoIpFound if noip_as_primary => Ok(resp),
@@ -942,15 +963,27 @@ async fn resolve_none_rule_with_ipset(
                     if matches!(verdict, TestVerdict::SecondaryIp) {
                         state.verdict_cache.add(&info.qname, false);
                     }
+                    // Decision needs the secondary's answer: use the stashed result
+                    // or finish awaiting the already-in-flight query.
+                    let secondary_resp = match secondary_done {
+                        Some(sr) => sr,
+                        None => (&mut secondary_query).await,
+                    };
                     secondary_resp.or(Ok(resp))
                 }
             }
         }
-        Err(primary_err) => secondary_resp.map_err(|secondary_err| {
-            anyhow!(
-                "primary upstream failed: {primary_err:#}; secondary upstream failed: {secondary_err:#}"
-            )
-        }),
+        Err(primary_err) => {
+            let secondary_resp = match secondary_done {
+                Some(sr) => sr,
+                None => (&mut secondary_query).await,
+            };
+            secondary_resp.map_err(|secondary_err| {
+                anyhow!(
+                    "primary upstream failed: {primary_err:#}; secondary upstream failed: {secondary_err:#}"
+                )
+            })
+        }
     }
 }
 
