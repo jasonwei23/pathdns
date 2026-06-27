@@ -38,7 +38,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 /// Receive slot payload size. This holds an inbound *query*, which is tiny — even
 /// with EDNS options a query is well under 1 KiB; 2 KiB is ample headroom. (The
@@ -52,6 +54,10 @@ const CONTROL_LEN: usize = 128;
 // Provided buffers per shard are configured via `runtime.uring-recv-buffers`
 // (default 256). Each holds one query plus its recvmsg header, address and control
 // area, so memory per shard ≈ bufs * (MAX_PKT + ~290) ≈ 0.58 MiB at the default.
+/// Per-shard slow-path reply queue depth. Bounded by the inflight cap in practice;
+/// when momentarily full, a completing task sends its reply directly instead of
+/// queueing, so replies are never dropped here.
+const SLOW_REPLY_CAP: usize = 1024;
 /// Buffer group id for the provided buffer ring (one ring per shard, id is local).
 const BGID: u16 = 0;
 /// Size of `struct io_uring_recvmsg_out` (4 × u32) prepended to each delivered
@@ -499,6 +505,7 @@ fn process_packet(
     socket: &Arc<UdpSocket>,
     send_buf: &mut BytesMut,
     send_items: &mut Vec<(Bytes, SocketAddr)>,
+    reply_tx: &mpsc::Sender<(Bytes, SocketAddr)>,
 ) {
     send_buf.clear();
     match try_fast_path_into(pkt, peer, ClientProto::Udp, state, send_buf) {
@@ -525,6 +532,7 @@ fn process_packet(
             };
             let state2 = state.clone();
             let socket2 = socket.clone();
+            let reply_tx = reply_tx.clone();
             tokio::spawn(async move {
                 let query = packet.clone();
                 let send_state = state2.clone();
@@ -539,9 +547,65 @@ fn process_packet(
                 .await
                 {
                     let resp = dns::maybe_truncate_for_udp(resp, &query);
-                    send_one_response(&socket2, &resp, peer, &send_state).await;
+                    // Hand the reply to the per-shard flusher so concurrently-completing
+                    // cache misses coalesce into one sendmmsg. If the queue is momentarily
+                    // full, fall back to an immediate send rather than block or drop.
+                    if let Err(mpsc::error::TrySendError::Full((resp, peer))) =
+                        reply_tx.try_send((resp, peer))
+                    {
+                        send_one_response(&socket2, &resp, peer, &send_state).await;
+                    }
                 }
             });
+        }
+    }
+}
+
+/// Per-shard flusher for slow-path (cache-miss) replies: drains the reply queue and
+/// coalesces concurrently-completing responses into one `sendmmsg`. At low load each
+/// wakeup carries a single reply (≈ a direct send); under load many flush per syscall.
+async fn slow_reply_flush_loop(
+    socket: Arc<UdpSocket>,
+    mut rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+    state: Arc<AppState>,
+) {
+    let fd = socket.as_raw_fd();
+    let mut bs = SendBatch::new(crate::udp_send::BATCH_SIZE);
+    let mut staging: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(crate::udp_send::BATCH_SIZE);
+    while let Some(first) = rx.recv().await {
+        staging.clear();
+        staging.push(first);
+        while staging.len() < crate::udp_send::BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(item) => staging.push(item),
+                Err(_) => break,
+            }
+        }
+        let mut off = 0;
+        while off < staging.len() {
+            let res = socket
+                .async_io(Interest::WRITABLE, || {
+                    bs.send(fd, staging[off..].iter().map(|(r, p)| (r.as_ref(), *p)))
+                })
+                .await;
+            match res {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                Err(_) => {
+                    let dropped = (staging.len() - off) as u64;
+                    state
+                        .querylog
+                        .counters
+                        .udp_send_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .querylog
+                        .counters
+                        .udp_send_drops
+                        .fetch_add(dropped, Ordering::Relaxed);
+                    break;
+                }
+            }
         }
     }
 }
@@ -620,6 +684,15 @@ pub(crate) async fn serve_udp_uring(
     let mut send_items: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(batch_size);
     let mut pending_sends: VecDeque<(Bytes, SocketAddr)> = VecDeque::new();
     let mut send_buf = BytesMut::with_capacity(512);
+    // Slow-path (cache-miss) replies complete in independent tasks; route them
+    // through a per-shard flusher that coalesces them into batched sendmmsg sends,
+    // mirroring the fast path's batching.
+    let (reply_tx, reply_rx) = mpsc::channel::<(Bytes, SocketAddr)>(SLOW_REPLY_CAP);
+    tokio::spawn(slow_reply_flush_loop(
+        socket.clone(),
+        reply_rx,
+        state.clone(),
+    ));
     // Last-seen cumulative SO_RXQ_OVFL value; deltas feed udp_rx_overflow.
     let mut last_rxq_ovfl: u32 = 0;
     // Throttle SO_MEMINFO sampling to ~1 Hz.
@@ -645,7 +718,15 @@ pub(crate) async fn serve_udp_uring(
 
         send_items.clear();
         let stats = recv.drain(|payload, peer| {
-            process_packet(payload, peer, &state, &socket, &mut send_buf, &mut send_items);
+            process_packet(
+                payload,
+                peer,
+                &state,
+                &socket,
+                &mut send_buf,
+                &mut send_items,
+                &reply_tx,
+            );
         });
         if stats.truncated > 0 {
             state
