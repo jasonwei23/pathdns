@@ -1,6 +1,11 @@
 use crate::config::EcsSubnet;
 use std::net::IpAddr;
 
+/// IANA EDNS(0) option code for Client Subnet (RFC 7871 §6). Note: this is 8,
+/// not 11 (0x000b is edns-tcp-keepalive) — getting it wrong means upstreams do
+/// not recognise the subnet and `ecs=strip` fails to remove real clients' ECS.
+pub(super) const ECS_OPTION_CODE: u16 = 0x0008;
+
 /// Clear all option data from the OPT RDATA in a DNS *response*.
 ///
 /// Keeps the OPT fixed header (extended RCODE, EDNS version, DO bit) but removes
@@ -62,7 +67,7 @@ pub fn strip_opt_rdata(packet: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Strip the EDNS Client Subnet option (code 0x000b) from a DNS query packet.
+/// Strip the EDNS Client Subnet option (code 8) from a DNS query packet.
 ///
 /// Returns `Some(new_packet)` only when ECS was found and removed.
 /// Returns `None` when no ECS is present (fast path: no allocation).
@@ -115,7 +120,7 @@ pub fn strip_edns_ecs(packet: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Rebuild the OPT RDATA without the ECS option (0x000b).
+/// Rebuild the OPT RDATA without the ECS option (code 8).
 fn strip_ecs_from_opt(packet: &[u8], rdata_start: usize, rdata_end: usize) -> Option<Vec<u8>> {
     let rdata = &packet[rdata_start..rdata_end];
     let mut pos = 0usize;
@@ -129,7 +134,7 @@ fn strip_ecs_from_opt(packet: &[u8], rdata_start: usize, rdata_end: usize) -> Op
         if end > rdata.len() {
             return None; // malformed OPT RDATA
         }
-        if code == 0x000b {
+        if code == ECS_OPTION_CODE {
             found_ecs = true;
         } else {
             new_rdata.extend_from_slice(&rdata[pos..end]);
@@ -210,7 +215,7 @@ pub fn inject_or_replace_ecs(packet: &[u8], subnet: &EcsSubnet) -> Option<Vec<u8
                 if end > rdata.len() {
                     return None;
                 }
-                if code != 0x000b {
+                if code != ECS_OPTION_CODE {
                     new_rdata.extend_from_slice(&rdata[p..end]);
                 }
                 p = end;
@@ -247,7 +252,7 @@ pub fn inject_or_replace_ecs(packet: &[u8], subnet: &EcsSubnet) -> Option<Vec<u8
     Some(out)
 }
 
-/// Encode subnet as an EDNS option (code 0x000b) ready to embed in OPT RDATA.
+/// Encode subnet as an EDNS option (code 8) ready to embed in OPT RDATA.
 fn encode_ecs_option(subnet: &EcsSubnet) -> Vec<u8> {
     let (family, full_addr): (u16, [u8; 16]) = match subnet.addr {
         IpAddr::V4(v4) => {
@@ -269,7 +274,7 @@ fn encode_ecs_option(subnet: &EcsSubnet) -> Vec<u8> {
     // ECS data: family(2) + source_prefix_len(1) + scope_prefix_len(1) + address bytes
     let data_len = 4 + byte_count;
     let mut opt = Vec::with_capacity(4 + data_len);
-    opt.extend_from_slice(&0x000b_u16.to_be_bytes()); // option code
+    opt.extend_from_slice(&ECS_OPTION_CODE.to_be_bytes()); // option code
     opt.extend_from_slice(&(data_len as u16).to_be_bytes()); // option length
     opt.extend_from_slice(&family.to_be_bytes());
     opt.push(prefix_len);

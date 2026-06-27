@@ -221,7 +221,7 @@ fn make_ecs_query(src_ip_last_octet: u8) -> (Vec<u8>, usize) {
         0x00, 0x00, // flags
     ]);
     query.extend_from_slice(&opt_rdata_len.to_be_bytes()); // RDLEN
-    query.extend_from_slice(&[0x00, 0x0b]); // OPTION-CODE = 11 (ECS)
+    query.extend_from_slice(&[0x00, 0x08]); // OPTION-CODE = 8 (ECS, RFC 7871)
     query.extend_from_slice(&(ecs_data.len() as u16).to_be_bytes()); // OPTION-LENGTH
     query.extend_from_slice(&ecs_data);
     (query, question_end)

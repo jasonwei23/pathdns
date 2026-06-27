@@ -172,7 +172,7 @@ pub fn extract_variant(packet: &[u8], question_end: usize) -> QueryVariant {
 /// other option codes that influence the upstream response.
 ///
 /// The hash is FNV-1a over the sorted set of option codes, excluding:
-/// - ECS (`0x000b`) — handled separately via `ecs_src`
+/// - ECS (`8`) — handled separately via `ecs_src`
 /// - PADDING (`12`) — does not affect response content
 ///
 /// Zero is returned when no such options are present.
@@ -191,7 +191,7 @@ fn extract_opt_data(rdata: &[u8]) -> (Option<EcsSrc>, u64) {
         if end > rdata.len() {
             break;
         }
-        if code == 0x000b && opt_len >= 4 {
+        if code == ecs::ECS_OPTION_CODE && opt_len >= 4 {
             ecs_src = parse_ecs_src(&rdata[pos..end]);
         } else if code != 12 {
             // Collect unknown/non-padding option codes.
