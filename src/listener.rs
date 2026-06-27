@@ -226,7 +226,7 @@ async fn handle_tcp_conn(
         // Try the synchronous fast path (cache hit) before the full async resolver.
         // On a warm cache this avoids any heap allocation or task spawn.
         resp_buf.clear();
-        match try_fast_path_into(pkt, peer, &state, &mut resp_buf) {
+        match try_fast_path_into(pkt, peer, ClientProto::Tcp, &state, &mut resp_buf) {
             FastPathOutcome::Response { resp } => {
                 let mut w = write_half.lock().await;
                 if write_tcp_response(&mut *w, &resp, &mut framing_buf)

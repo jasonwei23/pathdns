@@ -104,6 +104,7 @@ fn record_query_received(ql: &crate::querylog::QueryLogHandle, proto: ClientProt
 pub(crate) fn try_fast_path_into(
     packet: &[u8],
     peer: SocketAddr,
+    proto: ClientProto,
     state: &AppState,
     send_buf: &mut BytesMut,
 ) -> FastPathOutcome {
@@ -111,7 +112,7 @@ pub(crate) fn try_fast_path_into(
 
     // Non-QUERY opcodes: return NOTIMP per RFC 1035.
     if packet.len() >= 3 && (packet[2] & 0x80) == 0 && (packet[2] >> 3) & 0x0f != 0 {
-        record_query_received(&state.querylog, ClientProto::Udp);
+        record_query_received(&state.querylog, proto);
         return FastPathOutcome::Response {
             resp: Bytes::from(dns::notimp_opcode_reply(packet)),
         };
@@ -121,7 +122,7 @@ pub(crate) fn try_fast_path_into(
         Ok(info) => info,
         Err(_) => return FastPathOutcome::Drop,
     };
-    record_query_received(&state.querylog, ClientProto::Udp);
+    record_query_received(&state.querylog, proto);
 
     // Non-IN/non-ANY QCLASS: return NOTIMP.
     {

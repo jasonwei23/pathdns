@@ -501,7 +501,7 @@ fn process_packet(
     send_items: &mut Vec<(Bytes, SocketAddr)>,
 ) {
     send_buf.clear();
-    match try_fast_path_into(pkt, peer, state, send_buf) {
+    match try_fast_path_into(pkt, peer, ClientProto::Udp, state, send_buf) {
         FastPathOutcome::Response { resp } => {
             let resp = dns::maybe_truncate_for_udp(resp, pkt);
             send_items.push((resp, peer));
