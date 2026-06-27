@@ -1,5 +1,5 @@
-//! DNS query pipeline: fast path (parse → qtype filter → cache), slow path (classify →
-//! upstream → cache store).
+//! DNS query pipeline: fast path (parse → opcode/qclass checks → cache), slow path
+//! (classify → qtype filter → upstream → cache store).
 //!
 //! Listener code owns sockets and framing; this module owns packet lifecycle after a DNS
 //! message has been received.

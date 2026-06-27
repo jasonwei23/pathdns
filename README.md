@@ -229,7 +229,7 @@ Rules are matched top-to-bottom. The first rule whose GeoSite tags match the que
 | `upstream` | string array | Real upstream resolvers (see [Upstream URLs](#upstream-urls)). Fixed/synthesised responses (`A://`, `AAAA://`, `CNAME://`, `RCODE://`) are **not** allowed here — configure them in [`route.answer`](#answer-map) instead. |
 | `add-ip` | string | `"v4set,v6set"` — add resolved IPs to these ipset/nftset sets. Append `/N` (ipset) or `@N` (nftset) for a CIDR mask: `"chnroute/24,chnroute6@48"` writes each IP as its enclosing prefix. |
 | `cache` | object | Per-rule cache overrides (see [Rule-level cache overrides](#rule-level-cache-overrides)). |
-| `filter-qtype` | int or int array | Drop queries of the given QTYPE(s) for this rule (e.g. `28` = AAAA, `65` = HTTPS). |
+| `filter-qtype` | int or int array | Suppress the given QTYPE(s) for this rule by returning an empty `NOERROR`/NODATA response, with no upstream query (e.g. `28` = AAAA, `65` = HTTPS). Returning NODATA — rather than dropping — lets clients fail over immediately instead of waiting for a timeout. |
 | `collapse` | bool | Collapse CNAME chains in A/AAAA answers to a single record at the query name (default `false`). A chain `www.paypal.com → … → CNAME e5308.x.akamaiedge.net → A 95.100.196.60` is rewritten to `www.paypal.com. A 95.100.196.60` (the address record's TTL is kept). Only applies to A/AAAA; other qtypes and non-CNAME answers pass through unchanged. The EDNS OPT record is preserved; the authority section is dropped (incompatible with DNSSEC validation). |
 
 **Tag matching:** a domain matches a rule if it appears in any included tag and none of the excluded tags. A rule with no positive tags matches everything not otherwise excluded — use this for catch-all rules.
