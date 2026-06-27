@@ -431,6 +431,35 @@ impl SendMmsgBatch {
             return Ok(0);
         }
 
+        self.flush(fd, count)
+    }
+
+    /// Send every payload in `items` on a **connected** socket in one syscall.
+    /// No destination address is attached (`msg_namelen = 0`), so the datagrams go
+    /// to the socket's connected peer.  Returns the number of messages accepted by
+    /// the kernel (a short count means the caller should retry the remainder).
+    pub(crate) fn send_connected<'a, I>(&mut self, fd: RawFd, items: I) -> io::Result<usize>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut count = 0usize;
+        for payload in items {
+            if count == self.capacity() {
+                break; // caller retries the rest in the next batch
+            }
+            self.messages[count].msg_hdr.msg_namelen = 0;
+            self.iovecs[count].iov_base = payload.as_ptr() as *mut libc::c_void;
+            self.iovecs[count].iov_len = payload.len();
+            self.messages[count].msg_len = 0;
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        self.flush(fd, count)
+    }
+
+    fn flush(&mut self, fd: RawFd, count: usize) -> io::Result<usize> {
         loop {
             // SAFETY: all `count` headers point to initialized, live address/iovec
             // storage; each iovec points to a payload borrowed for this method call.

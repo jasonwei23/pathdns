@@ -19,10 +19,19 @@ const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 /// reservation modest (slots are lazily committed, so unused capacity costs nothing).
 const RECV_BATCH: usize = 16;
 
+/// Outbound queries coalesced per `sendmmsg` syscall on each upstream socket.
+const SEND_BATCH: usize = 16;
+
+/// Per-socket outbound queue depth. The per-upstream inflight cap bounds how many
+/// queries can be queued at once; this just sets the backpressure point.
+const SEND_QUEUE_CAP: usize = 1024;
+
 pub(super) struct UdpUpstream {
     pub(super) name: String,
     remote: SocketAddr,
     sockets: Vec<Arc<UdpSocket>>,
+    /// One outbound queue per socket; a flusher task drains each with `sendmmsg`.
+    send_qs: Vec<tokio::sync::mpsc::Sender<Bytes>>,
     send_idx: AtomicUsize,
     timeout: Duration,
     inflight: InflightRegistry,
@@ -50,6 +59,8 @@ impl UdpUpstream {
             "0.0.0.0:0"
         };
         let mut sockets = Vec::with_capacity(pool_size);
+        let mut send_qs = Vec::with_capacity(pool_size);
+        let mut receivers = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             let socket = UdpSocket::bind(bind)
                 .await
@@ -69,11 +80,15 @@ impl UdpUpstream {
                 .with_context(|| format!("upstream {name} udp connect failed: {remote}"))?;
             super::set_socket_buf_size(&socket, buf_size);
             sockets.push(Arc::new(socket));
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(SEND_QUEUE_CAP);
+            send_qs.push(tx);
+            receivers.push(rx);
         }
         let upstream = Arc::new(Self {
             name,
             remote,
             sockets,
+            send_qs,
             send_idx: AtomicUsize::new(0),
             timeout,
             inflight: InflightRegistry::new(max_inflight),
@@ -93,6 +108,12 @@ impl UdpUpstream {
                     delay_ms = (delay_ms * 2).min(5_000);
                 }
             });
+        }
+        // One flusher task per socket: drains its queue and coalesces ready queries
+        // into a single sendmmsg.
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let socket = upstream.sockets[i].clone();
+            tokio::spawn(send_flush_loop(socket, rx));
         }
         Ok(upstream)
     }
@@ -115,11 +136,13 @@ impl UdpUpstream {
                 .unwrap_or(0));
         dns::mix_qname_case(&mut packet, q_end, seed_0x20);
 
-        let socket_idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
-        let socket = &self.sockets[socket_idx];
-
-        if let Err(err) = socket.send(&packet).await {
-            return Err(err.into());
+        // Freeze so the wire bytes can be handed to the per-socket send flusher
+        // (cheap refcounted clone) while this task keeps a copy for the 0x20 echo
+        // check and any TC TCP fallback below.
+        let packet = packet.freeze();
+        let socket_idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.send_qs.len();
+        if self.send_qs[socket_idx].send(packet.clone()).await.is_err() {
+            return Err(anyhow!("upstream {} send flusher stopped", self.name));
         }
 
         match tokio::time::timeout(self.timeout, rx).await {
@@ -197,6 +220,44 @@ impl UdpUpstream {
                     Completion::Mismatch(_id) => {}
                     Completion::NoWaiter => {}
                 }
+            }
+        }
+    }
+}
+
+/// Drain a socket's outbound queue, coalescing ready queries into one `sendmmsg`
+/// per wakeup. At low load each wakeup carries a single packet (≈ a direct send);
+/// under load the queue backs up and many are flushed per syscall.
+async fn send_flush_loop(socket: Arc<UdpSocket>, mut rx: tokio::sync::mpsc::Receiver<Bytes>) {
+    let fd = socket.as_raw_fd();
+    let mut batch = sys::SendMmsgBatch::new(SEND_BATCH);
+    let mut staging: Vec<Bytes> = Vec::with_capacity(SEND_BATCH);
+    while let Some(first) = rx.recv().await {
+        staging.clear();
+        staging.push(first);
+        // Opportunistically drain anything already queued, up to a full batch.
+        while staging.len() < SEND_BATCH {
+            match rx.try_recv() {
+                Ok(b) => staging.push(b),
+                Err(_) => break,
+            }
+        }
+        // Flush, advancing past any short count from a partial sendmmsg (EAGAIN
+        // after some messages were accepted).
+        let mut off = 0;
+        while off < staging.len() {
+            match socket
+                .async_io(tokio::io::Interest::WRITABLE, || {
+                    batch.send_connected(fd, staging[off..].iter().map(|b| b.as_ref()))
+                })
+                .await
+            {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                // Send error (e.g. ICMP-unreachable surfaced on this socket): drop the
+                // rest. Those queries fall back to their per-query timeout — the same
+                // outcome a synchronous send error produced before.
+                Err(_) => break,
             }
         }
     }
