@@ -310,9 +310,57 @@ pub fn client_udp_payload_size(packet: &[u8], question_end: usize) -> u16 {
     MIN
 }
 
+/// Whether `packet`'s additional section carries an EDNS OPT record (type 41).
+/// Used to decide whether a truncated reply must echo an OPT (RFC 6891 §7).
+fn has_opt_record(packet: &[u8], question_end: usize) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+    let arcount = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+    if arcount == 0 || question_end >= packet.len() {
+        return false;
+    }
+    let mut pos = question_end;
+    for _ in 0..arcount {
+        let Some(name_end) = skip_name(packet, pos) else {
+            break;
+        };
+        if name_end + 10 > packet.len() {
+            break;
+        }
+        let rr_type = u16::from_be_bytes([packet[name_end], packet[name_end + 1]]);
+        if rr_type == 41 {
+            return true;
+        }
+        let rdlen = u16::from_be_bytes([packet[name_end + 8], packet[name_end + 9]]) as usize;
+        let Some(rdata_end) = (name_end + 10)
+            .checked_add(rdlen)
+            .filter(|&e| e <= packet.len())
+        else {
+            break;
+        };
+        pos = rdata_end;
+    }
+    false
+}
+
+/// Minimal EDNS OPT RR to attach to a truncated reply: root name, type 41,
+/// a conservative 1232-byte advertised UDP size, extended-RCODE/version/flags 0,
+/// no rdata. 1232 follows the DNS flag-day recommendation for the safe payload size.
+const TC_OPT_RR: [u8; 11] = [
+    0x00, // root name
+    0x00, 0x29, // TYPE = 41 (OPT)
+    0x04, 0xD0, // CLASS = advertised UDP payload size = 1232
+    0x00, 0x00, 0x00, 0x00, // TTL = extended-RCODE(0) | version(0) | flags(0)
+    0x00, 0x00, // RDLEN = 0
+];
+
 /// If `resp` fits within the client's UDP payload limit it is returned unchanged (zero-copy).
 /// If it exceeds the limit, returns a minimal TC=1 stub containing only the DNS header and
 /// question section so the client retries over TCP (RFC 1035 §4.2.1).
+///
+/// When the client used EDNS, the stub also carries a minimal OPT record so the client
+/// learns the server is EDNS-capable (RFC 6891 §7).
 ///
 /// `resp` must already have the correct client ID and original question case applied;
 /// those bytes are carried into the TC stub as-is.
@@ -330,15 +378,23 @@ pub fn maybe_truncate_for_udp(resp: Bytes, query: &[u8]) -> Bytes {
     if resp.len() < qe || qe < 12 {
         return resp; // unexpected state — don't corrupt
     }
-    let mut stub = BytesMut::with_capacity(qe);
+    let client_edns = has_opt_record(query, qe);
+    let cap = if client_edns { qe + TC_OPT_RR.len() } else { qe };
+    let mut stub = BytesMut::with_capacity(cap);
     stub.extend_from_slice(&resp[..qe]);
     stub[2] |= 0x02; // set TC (truncated) bit
     stub[6] = 0;
     stub[7] = 0; // ANCOUNT = 0
     stub[8] = 0;
     stub[9] = 0; // NSCOUNT = 0
-    stub[10] = 0;
-    stub[11] = 0; // ARCOUNT = 0
+    if client_edns {
+        stub.extend_from_slice(&TC_OPT_RR);
+        stub[10] = 0;
+        stub[11] = 1; // ARCOUNT = 1 (OPT)
+    } else {
+        stub[10] = 0;
+        stub[11] = 0; // ARCOUNT = 0
+    }
     stub.freeze()
 }
 

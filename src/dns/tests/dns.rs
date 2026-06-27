@@ -94,16 +94,24 @@ fn oversized_non_edns_response_becomes_tc_stub() {
 }
 
 #[test]
-fn oversized_edns_response_becomes_tc_stub() {
+fn oversized_edns_response_becomes_tc_stub_with_opt() {
     let payload = 1232u16;
     let (q, qe) = edns_query(payload);
     // Build a response larger than the declared EDNS payload size.
     let resp = large_response(&q, qe, (payload as usize) + 100);
     assert!(resp.len() > payload as usize);
     let stub = maybe_truncate_for_udp(resp, &q);
-    assert_eq!(stub.len(), qe);
+    // EDNS client → stub carries header + question + a minimal OPT RR (RFC 6891 §7).
+    assert_eq!(stub.len(), qe + 11);
     assert_ne!(stub[2] & 0x02, 0, "TC bit not set");
-    assert_eq!(&stub[6..12], &[0, 0, 0, 0, 0, 0]);
+    // ANCOUNT/NSCOUNT zeroed, ARCOUNT = 1 (the OPT).
+    assert_eq!(&stub[6..12], &[0, 0, 0, 0, 0, 1]);
+    // The OPT record: root name, type 41, advertised size 1232.
+    assert_eq!(stub[qe], 0x00, "OPT name must be root");
+    let opt_type = u16::from_be_bytes([stub[qe + 1], stub[qe + 2]]);
+    assert_eq!(opt_type, 41, "additional RR must be OPT");
+    let opt_size = u16::from_be_bytes([stub[qe + 3], stub[qe + 4]]);
+    assert_eq!(opt_size, 1232);
 }
 
 #[test]
