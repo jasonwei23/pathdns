@@ -8,6 +8,7 @@
 use crate::server::AppState;
 pub(crate) use crate::sys::SendMmsgBatch as SendBatch;
 use bytes::Bytes;
+use std::os::fd::AsRawFd;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
@@ -15,6 +16,7 @@ use std::{
 };
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 /// Hard upper bound on batch size.
 pub const MAX_BATCH: usize = 64;
@@ -162,6 +164,51 @@ pub(crate) async fn send_one_response(
                 .counters
                 .udp_send_drops
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-socket outbound flusher: block for a reply, opportunistically drain up to
+/// `batch_size` more that are already queued, then dispatch them in one `sendmmsg`
+/// (advancing past any short count). Shared by the upstream-query and client-reply
+/// send paths; the only per-path differences are the item type, the actual send call
+/// (`send` vs `send_connected`, supplied by `send_chunk`), and what to do on a send
+/// error (`on_drop`, called with the number of items dropped).
+pub(crate) async fn run_send_flush_loop<T, S, E>(
+    socket: &UdpSocket,
+    mut rx: mpsc::Receiver<T>,
+    batch_size: usize,
+    mut send_chunk: S,
+    on_drop: E,
+) where
+    S: FnMut(&mut SendBatch, libc::c_int, &[T]) -> std::io::Result<usize>,
+    E: Fn(usize),
+{
+    let fd = socket.as_raw_fd();
+    let mut batch = SendBatch::new(batch_size);
+    let mut staging: Vec<T> = Vec::with_capacity(batch_size);
+    while let Some(first) = rx.recv().await {
+        staging.clear();
+        staging.push(first);
+        while staging.len() < batch_size {
+            match rx.try_recv() {
+                Ok(item) => staging.push(item),
+                Err(_) => break,
+            }
+        }
+        let mut off = 0;
+        while off < staging.len() {
+            match socket
+                .async_io(Interest::WRITABLE, || send_chunk(&mut batch, fd, &staging[off..]))
+                .await
+            {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                Err(_) => {
+                    on_drop(staging.len() - off);
+                    break;
+                }
+            }
         }
     }
 }

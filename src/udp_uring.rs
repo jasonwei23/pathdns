@@ -38,7 +38,6 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -566,48 +565,30 @@ fn process_packet(
 /// wakeup carries a single reply (≈ a direct send); under load many flush per syscall.
 async fn slow_reply_flush_loop(
     socket: Arc<UdpSocket>,
-    mut rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+    rx: mpsc::Receiver<(Bytes, SocketAddr)>,
     state: Arc<AppState>,
 ) {
-    let fd = socket.as_raw_fd();
-    let mut bs = SendBatch::new(crate::udp_send::BATCH_SIZE);
-    let mut staging: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(crate::udp_send::BATCH_SIZE);
-    while let Some(first) = rx.recv().await {
-        staging.clear();
-        staging.push(first);
-        while staging.len() < crate::udp_send::BATCH_SIZE {
-            match rx.try_recv() {
-                Ok(item) => staging.push(item),
-                Err(_) => break,
-            }
-        }
-        let mut off = 0;
-        while off < staging.len() {
-            let res = socket
-                .async_io(Interest::WRITABLE, || {
-                    bs.send(fd, staging[off..].iter().map(|(r, p)| (r.as_ref(), *p)))
-                })
-                .await;
-            match res {
-                Ok(0) => break,
-                Ok(n) => off += n,
-                Err(_) => {
-                    let dropped = (staging.len() - off) as u64;
-                    state
-                        .querylog
-                        .counters
-                        .udp_send_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    state
-                        .querylog
-                        .counters
-                        .udp_send_drops
-                        .fetch_add(dropped, Ordering::Relaxed);
-                    break;
-                }
-            }
-        }
-    }
+    crate::udp_send::run_send_flush_loop(
+        &socket,
+        rx,
+        crate::udp_send::BATCH_SIZE,
+        |bs, fd, items: &[(Bytes, SocketAddr)]| {
+            bs.send(fd, items.iter().map(|(r, p)| (r.as_ref(), *p)))
+        },
+        move |dropped| {
+            state
+                .querylog
+                .counters
+                .udp_send_errors
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .querylog
+                .counters
+                .udp_send_drops
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        },
+    )
+    .await;
 }
 
 /// Send queued fast-path responses via batched `sendmmsg`, pushing anything the

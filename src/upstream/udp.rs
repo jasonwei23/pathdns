@@ -225,42 +225,19 @@ impl UdpUpstream {
     }
 }
 
-/// Drain a socket's outbound queue, coalescing ready queries into one `sendmmsg`
-/// per wakeup. At low load each wakeup carries a single packet (≈ a direct send);
-/// under load the queue backs up and many are flushed per syscall.
-async fn send_flush_loop(socket: Arc<UdpSocket>, mut rx: tokio::sync::mpsc::Receiver<Bytes>) {
-    let fd = socket.as_raw_fd();
-    let mut batch = sys::SendMmsgBatch::new(SEND_BATCH);
-    let mut staging: Vec<Bytes> = Vec::with_capacity(SEND_BATCH);
-    while let Some(first) = rx.recv().await {
-        staging.clear();
-        staging.push(first);
-        // Opportunistically drain anything already queued, up to a full batch.
-        while staging.len() < SEND_BATCH {
-            match rx.try_recv() {
-                Ok(b) => staging.push(b),
-                Err(_) => break,
-            }
-        }
-        // Flush, advancing past any short count from a partial sendmmsg (EAGAIN
-        // after some messages were accepted).
-        let mut off = 0;
-        while off < staging.len() {
-            match socket
-                .async_io(tokio::io::Interest::WRITABLE, || {
-                    batch.send_connected(fd, staging[off..].iter().map(|b| b.as_ref()))
-                })
-                .await
-            {
-                Ok(0) => break,
-                Ok(n) => off += n,
-                // Send error (e.g. ICMP-unreachable surfaced on this socket): drop the
-                // rest. Those queries fall back to their per-query timeout — the same
-                // outcome a synchronous send error produced before.
-                Err(_) => break,
-            }
-        }
-    }
+/// Drain a socket's outbound query queue, coalescing ready queries into one
+/// `sendmmsg` per wakeup (connected socket → no per-message address). On a send
+/// error the remaining queries are dropped and fall back to their per-query
+/// timeout — the same outcome a synchronous send error produced before.
+async fn send_flush_loop(socket: Arc<UdpSocket>, rx: tokio::sync::mpsc::Receiver<Bytes>) {
+    crate::udp_send::run_send_flush_loop(
+        &socket,
+        rx,
+        SEND_BATCH,
+        |batch, fd, items: &[Bytes]| batch.send_connected(fd, items.iter().map(|b| b.as_ref())),
+        |_dropped| {},
+    )
+    .await;
 }
 
 /// Enable `IP_RECVERR` (or `IPV6_RECVERR`) so ICMP errors are queued with full
