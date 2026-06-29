@@ -28,6 +28,8 @@ relative to the current working directory.
 | `test_match.py` | 30-case domain-matching matrix (full / domain / keyword / regex / GeoSite tag include+exclude / precedence / rule routing / normalisation). Self-contained with `cfg_match.json`. |
 | `test_client.py` | Core client behaviour over UDP + TCP against a running server. |
 | `test_edge.py` | Edge cases + dashboard counter assertions (`/api/stats`). |
+| **Benchmark** | |
+| [`benchmark/`](benchmark/README.md) | Pure-forwarding throughput comparison vs unbound / smartdns / mosdns (dnsperf + fast mock upstream). |
 | `cfg_match.json` | pathdns config used by `test_match.py` (answer-map + rules + GeoSite). |
 | `geosite_match.json` | Plain-JSON GeoSite source consumed by `cfg_match.json`. |
 
