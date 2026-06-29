@@ -66,6 +66,12 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
+### Testing
+
+Behaviour is verified by black-box integration scripts that drive a running
+binary over real DNS — see [`testing/`](testing/README.md) (e.g.
+`testing/test_match.py`, a 30-case domain-matching matrix).
+
 ---
 
 ## CLI

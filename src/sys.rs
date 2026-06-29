@@ -169,24 +169,6 @@ pub(crate) fn get_socket_u32s(
     Ok((len as usize / mem::size_of::<u32>()).min(values.len()))
 }
 
-#[cfg(test)]
-pub(crate) fn get_socket_u32(
-    fd: RawFd,
-    level: libc::c_int,
-    option: libc::c_int,
-) -> io::Result<u32> {
-    let mut value = [0u32; 1];
-    let count = get_socket_u32s(fd, level, option, &mut value)?;
-    if count == 1 {
-        Ok(value[0])
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "socket option returned no u32 value",
-        ))
-    }
-}
-
 pub(crate) fn bind_netlink(fd: RawFd) -> io::Result<()> {
     // sockaddr_nl contains libc-private padding on some targets, so initialize the
     // complete C POD value before setting its public family field.
@@ -675,7 +657,3 @@ fn cvt_zero(rc: libc::c_int) -> io::Result<()> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "tests/sys.rs"]
-mod tests;

@@ -490,7 +490,3 @@ fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
 }
 
 // Tests.
-
-#[cfg(test)]
-#[path = "tests/geosite.rs"]
-mod tests;

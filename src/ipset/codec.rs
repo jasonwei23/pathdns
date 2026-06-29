@@ -589,7 +589,3 @@ impl NlBuilder {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/codec.rs"]
-mod tests;

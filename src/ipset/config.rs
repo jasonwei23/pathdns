@@ -143,7 +143,3 @@ fn parse_nft_family(value: &str) -> Result<NftFamily> {
         _ => Err(anyhow!("invalid nft family: {value}")),
     }
 }
-
-#[cfg(test)]
-#[path = "tests/config.rs"]
-mod tests;

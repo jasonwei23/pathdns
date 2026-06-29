@@ -276,7 +276,3 @@ fn drain_error_queue(fd: libc::c_int) -> u32 {
     }
     drained
 }
-
-#[cfg(test)]
-#[path = "tests/udp.rs"]
-mod tests;

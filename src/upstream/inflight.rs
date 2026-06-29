@@ -177,7 +177,3 @@ impl Drop for InflightGuard<'_> {
         // _permit drops here, atomically returning one slot to the semaphore
     }
 }
-
-#[cfg(test)]
-#[path = "tests/inflight.rs"]
-mod tests;

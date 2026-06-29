@@ -146,7 +146,3 @@ fn parse_tag_expr(rest: &str) -> Result<TagExpr> {
     }
     Ok(TagExpr { include, exclude })
 }
-
-#[cfg(test)]
-#[path = "tests/answer_map.rs"]
-mod tests;

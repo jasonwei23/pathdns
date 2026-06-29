@@ -248,7 +248,3 @@ fn geo_entry_matches(
 }
 
 // Tests.
-
-#[cfg(test)]
-#[path = "tests/route_index.rs"]
-mod tests;

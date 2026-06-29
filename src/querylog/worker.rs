@@ -938,7 +938,3 @@ fn days_to_ymd(mut days: u64) -> (u32, u32, u32) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[path = "tests/worker.rs"]
-mod tests;

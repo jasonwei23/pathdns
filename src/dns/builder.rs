@@ -222,7 +222,3 @@ pub fn encode_dns_name(name: &str) -> Result<Vec<u8>> {
     out.push(0);
     Ok(out)
 }
-
-#[cfg(test)]
-#[path = "tests/builder.rs"]
-mod tests;

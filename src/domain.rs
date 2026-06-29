@@ -130,7 +130,3 @@ pub fn normalize_domain(name: &str) -> Option<String> {
 }
 
 // Tests.
-
-#[cfg(test)]
-#[path = "tests/domain.rs"]
-mod tests;

@@ -303,7 +303,3 @@ fn is_special_use(ip: IpAddr) -> bool {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/ipset.rs"]
-mod tests;

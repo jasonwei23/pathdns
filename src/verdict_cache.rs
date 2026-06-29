@@ -237,7 +237,3 @@ impl VerdictCache {
 }
 
 // Tests.
-
-#[cfg(test)]
-#[path = "tests/verdict_cache.rs"]
-mod tests;

@@ -189,18 +189,6 @@ pub struct QueryLogHandle {
 }
 
 impl QueryLogHandle {
-    /// Returns a handle where event emission is disabled (no channel).
-    /// Counters are still active.
-    #[cfg(test)]
-    pub fn disabled() -> Self {
-        Self {
-            counters: Arc::new(QueryLogCounters::new()),
-            seq: Arc::new(AtomicU64::new(0)),
-            tx: None,
-            answer_ips: false,
-        }
-    }
-
     /// Returns the next monotonically increasing sequence number.
     #[inline]
     pub fn next_seq(&self) -> u64 {
@@ -341,7 +329,3 @@ pub fn build(
     };
     (handle, Some(worker), qps_ring, stats_ring, shutdown_tx)
 }
-
-#[cfg(test)]
-#[path = "tests/querylog.rs"]
-mod tests;

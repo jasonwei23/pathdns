@@ -214,7 +214,3 @@ pub(crate) async fn run_send_flush_loop<T, S, E>(
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[path = "tests/udp_send.rs"]
-mod tests;

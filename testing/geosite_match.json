@@ -1,0 +1,6 @@
+{"entries":[
+  {"tag":"cn","domains":["domain:bilibili.com","full:exactcn.test","keyword:cnkw","regexp:^cnreg[0-9]+\\.org$","domain:both-cn-gfw.test","full:both.test"]},
+  {"tag":"gfw","domains":["domain:blocked.com","domain:both-cn-gfw.test"]},
+  {"tag":"ads","domains":["keyword:doubleclick"]},
+  {"tag":"apple","domains":["domain:apple.com"]}
+]}

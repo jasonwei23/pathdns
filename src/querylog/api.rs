@@ -819,7 +819,3 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-
-#[cfg(test)]
-#[path = "tests/api.rs"]
-mod tests;

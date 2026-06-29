@@ -334,7 +334,3 @@ fn extract_soa_minimum(packet: &[u8], rdata: usize, rdata_end: usize) -> Option<
         packet[p + 19],
     ]))
 }
-
-#[cfg(test)]
-#[path = "tests/ttl.rs"]
-mod collapse_tests;

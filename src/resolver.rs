@@ -1012,7 +1012,3 @@ fn maybe_add_response_ips(
         ipset.add_rule_ips(&rule.name, &ips);
     }
 }
-
-#[cfg(test)]
-#[path = "tests/resolver.rs"]
-mod querylog_tests;

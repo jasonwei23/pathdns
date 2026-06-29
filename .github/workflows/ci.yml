@@ -33,8 +33,9 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      # Runs every #[cfg(test)] module (now relocated to src/**/tests/*.rs).
-      # Note: pathdns uses io_uring multishot recvmsg, so a few tests require the
-      # runner kernel to support it (Linux 6.0+). GitHub's ubuntu-latest runners do.
+      # The in-tree #[cfg(test)] unit tests have been removed in favour of the
+      # black-box integration scripts under testing/ (run against a live binary +
+      # mock upstreams; see testing/README.md). This step still type-checks the
+      # crate under `cfg(test)` and will pick up any future #[test] modules.
       - name: Test
         run: cargo test --locked

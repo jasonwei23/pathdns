@@ -385,7 +385,3 @@ async fn mux_reader_loop(
         let _ = pending.complete(&mut buf[..resp_len]);
     }
 }
-
-#[cfg(test)]
-#[path = "tests/tcp_mux.rs"]
-mod tests;

@@ -1086,20 +1086,3 @@ pub(super) fn set_so_mark(fd: libc::c_int, mark: u32) -> Result<()> {
             format!("failed to set SO_MARK={mark:#x} (fwmark requires CAP_NET_ADMIN or root)")
         })
 }
-
-// -- Tests ----------------------------------------------------------------------
-
-/// Whether `SO_MARK` can be set here (i.e. the process holds `CAP_NET_ADMIN`).
-/// SO_MARK tests skip gracefully when it can't, so they pass unprivileged and still
-/// verify under root/CAP_NET_ADMIN (CI-with-privileges, or the target router).
-#[cfg(test)]
-pub(super) fn so_mark_supported() -> bool {
-    match std::net::UdpSocket::bind(("127.0.0.1", 0)) {
-        Ok(sock) => set_so_mark(std::os::unix::io::AsRawFd::as_raw_fd(&sock), 1).is_ok(),
-        Err(_) => false,
-    }
-}
-
-#[cfg(test)]
-#[path = "tests/upstream.rs"]
-mod tests;

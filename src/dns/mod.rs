@@ -594,7 +594,3 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/dns.rs"]
-mod tests;

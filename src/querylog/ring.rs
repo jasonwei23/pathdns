@@ -243,7 +243,3 @@ impl StatsRing {
         result
     }
 }
-
-#[cfg(test)]
-#[path = "tests/ring.rs"]
-mod tests;

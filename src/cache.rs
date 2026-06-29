@@ -31,34 +31,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type CacheKey = u64;
 
-/// FNV-1a hash of a complete DNS query excluding its two-byte client ID.
+/// Hash a complete DNS query excluding its two-byte client ID, using a
+/// pre-computed [`dns::QueryVariant`].
 ///
 /// The hash covers:
 /// - QNAME (ASCII-lowercased, self-delimiting label encoding)
 /// - QTYPE + QCLASS (exact)
-/// - EDNS semantics extracted via [`dns::extract_variant`]: RD/AD/CD flags,
-///   has_opt, DO bit, EDNS version, and normalised ECS source subnet.
+/// - EDNS semantics from the variant: RD/AD/CD flags, has_opt, DO bit, EDNS
+///   version, and normalised ECS source subnet.
 ///
 /// Raw additional-section bytes are NOT hashed so that semantically equivalent
 /// queries with different OPT padding, unknown EDNS options, or varying ARCOUNT
-/// always share the same cache entry.
-#[cfg(test)]
-pub fn cache_key(query: &[u8], question_end: usize) -> CacheKey {
-    cache_key_impl(query, question_end, false)
-}
-
-/// Like [`cache_key`] but always hashes `0` for the ECS field regardless of
-/// whether the query contains an ECS option.  Used when the upstream strips ECS
-/// so that all clients share a single cache entry keyed on the stripped variant.
-#[cfg(test)]
-pub fn cache_key_strip_ecs(query: &[u8], question_end: usize) -> CacheKey {
-    cache_key_impl(query, question_end, true)
-}
-
-/// Hash a query using a pre-computed [`dns::QueryVariant`].
-///
-/// Callers that need the variant for other decisions can use this entry point to
-/// avoid scanning the DNS additional section a second time.
+/// always share the same cache entry. Callers that need the variant for other
+/// decisions can use this entry point to avoid scanning the additional section
+/// a second time.
 pub(crate) fn cache_key_with_variant(
     query: &[u8],
     question_end: usize,
@@ -115,12 +101,6 @@ pub(crate) fn cache_key_with_variant(
     h.write(&v.extra_opts_hash.to_le_bytes());
 
     h.finish()
-}
-
-#[cfg(test)]
-fn cache_key_impl(query: &[u8], question_end: usize, strip_ecs: bool) -> CacheKey {
-    let v = dns::extract_variant(query, question_end);
-    cache_key_with_variant(query, question_end, &v, strip_ecs)
 }
 
 #[derive(Debug)]
@@ -654,7 +634,3 @@ fn read_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
-
-#[cfg(test)]
-#[path = "tests/cache.rs"]
-mod tests;

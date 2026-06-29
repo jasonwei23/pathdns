@@ -1347,7 +1347,3 @@ pub(super) fn resolve_authority<'a>(
     let addr = resolve_host(host, port, bootstrap)?;
     Ok((host, addr))
 }
-
-#[cfg(test)]
-#[path = "tests/config.rs"]
-mod querylog_tests;

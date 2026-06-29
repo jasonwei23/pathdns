@@ -1,0 +1,70 @@
+{
+  "bind": {
+    "addr": "127.0.0.1",
+    "port": 5353,
+    "proto": "udp"
+  },
+  "route": {
+    "geosite": [
+      "geosite_match.json"
+    ],
+    "answer": {
+      "full:exact.test": "A://1.1.1.1",
+      "domain:zone.test": "A://2.2.2.2",
+      "keyword:trackme": "A://3.3.3.3",
+      "regexp:^reg[0-9]+\\.net$": "A://4.4.4.4",
+      "tag:cn,!gfw": "A://5.5.5.5",
+      "tag:ads": "RCODE://NXDOMAIN",
+      "full:both.test": "A://6.6.6.6",
+      "domain:inner.zone.test": "A://7.7.7.7",
+      "keyword:bili": "A://8.8.8.8"
+    },
+    "rules": [
+      {
+        "name": "domestic",
+        "tag": [
+          "cn"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "apple-rule",
+        "tag": [
+          "apple"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "overseas",
+        "tag": [
+          "gfw"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "noncn",
+        "tag": [
+          "!cn"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      }
+    ],
+    "final": "domestic"
+  },
+  "cache": {
+    "size": 0
+  },
+  "dashboard": {
+    "port": 8080,
+    "token": "secret",
+    "answer-ips": true
+  }
+}

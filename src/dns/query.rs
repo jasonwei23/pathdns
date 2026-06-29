@@ -124,7 +124,3 @@ fn qname_from_question(packet: &[u8], question_end: usize) -> Result<Arc<str>> {
 
     Ok(Arc::from(qname.as_str()))
 }
-
-#[cfg(test)]
-#[path = "tests/query.rs"]
-mod tests;

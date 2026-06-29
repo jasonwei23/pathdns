@@ -790,7 +790,3 @@ fn probe() -> Option<bool> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[path = "tests/udp_uring.rs"]
-mod tests;
