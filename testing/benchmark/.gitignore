@@ -1,4 +1,5 @@
 queries.txt
+queries_cache.txt
 rustmock
 *.out
 *.log

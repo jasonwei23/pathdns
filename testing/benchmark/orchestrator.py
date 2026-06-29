@@ -22,15 +22,29 @@ OUTSTANDING = int(os.environ.get("OUTSTANDING", "500"))
 DNSPERF_THREADS = int(os.environ.get("DT", "4"))
 NQUERIES = int(os.environ.get("NQUERIES", "500000"))
 
+# MODE selects the workload:
+#   forward (default): every query is a unique name -> a real upstream forward
+#   cache: a small repeating working set -> after warmup ~all served from the
+#          resolver's own cache (measures the cache hot path, not forwarding)
+MODE = os.environ.get("MODE", "forward")
+NCACHE = int(os.environ.get("NCACHE", "2000"))
+SUFFIX = "_cache" if MODE == "cache" else ""
+QFILE = "queries_cache.txt" if MODE == "cache" else "queries.txt"
+
 def have(cmd):
     from shutil import which
     return which(cmd) or (os.path.isabs(cmd) and os.path.exists(cmd))
 
 def bootstrap():
-    """Generate the unique-name query file and compile the Rust mock if absent."""
-    if not os.path.exists("queries.txt"):
-        print(f"generating queries.txt ({NQUERIES} unique names)...")
-        with open("queries.txt", "w") as f:
+    """Generate the query file for the active MODE and compile the Rust mock."""
+    if MODE == "cache":
+        if not os.path.exists(QFILE):
+            print(f"generating {QFILE} ({NCACHE} repeating names)...")
+            with open(QFILE, "w") as f:
+                f.write("\n".join(f"h{i}.bench.test A" for i in range(NCACHE)))
+    elif not os.path.exists(QFILE):
+        print(f"generating {QFILE} ({NQUERIES} unique names)...")
+        with open(QFILE, "w") as f:
             f.write("\n".join(f"h{i}.bench.test A" for i in range(NQUERIES)))
     if not os.path.exists("./rustmock"):
         if have("rustc"):
@@ -79,7 +93,7 @@ def kill(p):
 REPEATS = int(os.environ.get("REPEATS", "3"))
 
 def run_dnsperf(port):
-    cmd = pin(["dnsperf", "-s", "127.0.0.1", "-p", str(port), "-d", "queries.txt",
+    cmd = pin(["dnsperf", "-s", "127.0.0.1", "-p", str(port), "-d", QFILE,
                "-c", str(CLIENTS), "-T", str(DNSPERF_THREADS), "-q", str(OUTSTANDING),
                "-l", str(DURATION)], DNSPERF_CPU)
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=BENCH).stdout
@@ -119,10 +133,10 @@ print(f"mock upstream: {label} on :{MOCK_PORT}")
 
 RESOLVER_CORES = len(RESOLVER_CPU.split(",")) if PIN else os.cpu_count()
 ALL_RESOLVERS = [
-    ("pathdns",  [PR, "-c", "pathdns.json"],                         5301),
-    ("unbound",  ["unbound", "-d", "-c", "unbound.conf"],            5302),
-    ("smartdns", ["smartdns", "-f", "-c", "smartdns.conf"],          5303),
-    ("mosdns",   [MOSDNS, "start", "-c", "mosdns.yaml", "-d", BENCH,
+    ("pathdns",  [PR, "-c", f"pathdns{SUFFIX}.json"],                5301),
+    ("unbound",  ["unbound", "-d", "-c", f"unbound{SUFFIX}.conf"],   5302),
+    ("smartdns", ["smartdns", "-f", "-c", f"smartdns{SUFFIX}.conf"], 5303),
+    ("mosdns",   [MOSDNS, "start", "-c", f"mosdns{SUFFIX}.yaml", "-d", BENCH,
                   "--cpu", str(RESOLVER_CORES)],                     5304),
 ]
 # Skip any resolver whose binary is not installed.
@@ -163,9 +177,12 @@ for name, cmd, port in RESOLVERS:
 
 for p in list(procs): kill(p)
 
+title = "CACHE-HIT" if MODE == "cache" else "PURE-FORWARDING"
 print("\n" + "=" * 72)
-print(f"PURE-FORWARDING BENCHMARK  ({os.cpu_count()} cores, {DURATION}s x{REPEATS} median, "
+print(f"{title} BENCHMARK  ({os.cpu_count()} cores, {DURATION}s x{REPEATS} median, "
       f"-c{CLIENTS} -q{OUTSTANDING})")
+if MODE == "cache":
+    print(f"working set: {NCACHE} names (repeating) -> served from each resolver's cache")
 print(f"mock upstream ceiling (dnsperf->mock direct): {cq:,.0f} q/s")
 print("=" * 72)
 print(f"{'resolver':<10} {'q/s (median)':>14} {'avg lat (ms)':>14} {'NOERROR%':>10} {'lost':>8}")

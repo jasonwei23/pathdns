@@ -58,19 +58,29 @@ python3 orchestrator.py
 # dnsperf->core3, so the load generator and upstream never starve the resolver.
 PIN=1 MOCK_CPU=0 RESOLVER_CPU=1,2 DNSPERF_CPU=3 \
   DURATION=15 REPEATS=3 CLIENTS=8 OUTSTANDING=500 python3 orchestrator.py
+
+# cache-hit mode: a small repeating working set served from each resolver's
+# own cache (measures the cache hot path, not forwarding). Uses the *_cache
+# configs and a 2000-name query file.
+MODE=cache NCACHE=2000 PIN=1 MOCK_CPU=0 RESOLVER_CPU=1,2 DNSPERF_CPU=3 \
+  DURATION=15 REPEATS=3 python3 orchestrator.py
 ```
 
-Key env knobs: `DURATION`, `REPEATS`, `CLIENTS` (`-c`), `OUTSTANDING` (`-q`),
-`PIN`, `*_CPU`, `MOCK` (`rust`/`py`), `PATHDNS_BIN`, `MOSDNS_BIN`, `NQUERIES`.
+Key env knobs: `MODE` (`forward`/`cache`), `DURATION`, `REPEATS`, `CLIENTS`
+(`-c`), `OUTSTANDING` (`-q`), `PIN`, `*_CPU`, `MOCK` (`rust`/`py`),
+`PATHDNS_BIN`, `MOSDNS_BIN`, `NQUERIES`, `NCACHE`.
 
-## Configs (all pure-forward, cache disabled)
+## Configs
+
+Forward mode (`*.json`/`.conf`/`.yaml`) — pure-forward, cache disabled.
+Cache mode (`*_cache.*`) — caching enabled, same single upstream.
 
 | File | Resolver | Notes |
 |------|----------|-------|
-| `pathdns.json` | pathdns :5301 | catch-all rule → upstream; `cache.size=0`; `runtime.upstream-max-inflight` raised (see below) |
-| `unbound.conf` | unbound :5302 | `forward-zone "."`; `cache-*-ttl: 0`; `local-zone "test." nodefault` |
-| `smartdns.conf` | smartdns :5303 | single `server`; `cache-size 0`; `speed-check-mode none` |
-| `mosdns.yaml` | mosdns :5304 | v5 `forward` + `udp_server`, no cache plugin |
+| `pathdns.json` / `pathdns_cache.json` | pathdns :5301 | catch-all rule → upstream; `cache.size` 0 vs 1M; `runtime.upstream-max-inflight` raised (see below) |
+| `unbound.conf` / `unbound_cache.conf` | unbound :5302 | `forward-zone "."`; `local-zone "test." nodefault`; cache off (`*-ttl 0`) vs big msg/rrset cache |
+| `smartdns.conf` / `smartdns_cache.conf` | smartdns :5303 | single `server`; `speed-check-mode none`; `cache-size` 0 vs 1M |
+| `mosdns.yaml` / `mosdns_cache.yaml` | mosdns :5304 | v5 `forward` + `udp_server`; cache variant adds a `cache` plugin + `has_resp`→`accept` short-circuit |
 
 ## Results
 
@@ -94,6 +104,29 @@ unbound) and was the only one besides smartdns with zero dropped queries.
 Caveat: with pathdns left at its **default `upstream-max-inflight: 256`**, the
 same run produced ~61k q/s but only **~77–86% NOERROR** (the rest SERVFAIL) — see
 below. The number above uses the raised cap.
+
+### Cache-hit mode (`MODE=cache`, 2000-name working set)
+
+Same box/setup; every query (after a tiny warmup) is served from the resolver's
+own in-memory cache, so the upstream is idle — this measures the cache hot path.
+
+| resolver | q/s (median) | avg latency | NOERROR% | vs forward |
+|----------|-------------:|------------:|---------:|-----------:|
+| unbound  | 274,931 | 0.64 ms | 100.0% | 4.8× |
+| **pathdns** | **184,556** | **0.80 ms** | **100.0%** | **3.0×** |
+| smartdns | 158,097 | 3.13 ms | 100.0% | 2.3× |
+| mosdns   | 150,788 | 0.88 ms | 100.0% | 2.4× (dropped ~1.1k/run) |
+
+Cache serving spreads the field much more than forwarding does. **unbound is the
+clear leader** (~275k q/s) — cache lookup is the core of a recursive resolver and
+it is heavily optimised for it. **pathdns is a solid second** at ~185k q/s and
+3× its own forwarding rate, ahead of smartdns and mosdns. smartdns posts notably
+higher cache latency here (~3 ms); mosdns again dropped ~1k queries/run.
+
+Every resolver was verified to *actually* cache before timing (100 repeated
+queries → exactly 1 upstream forward); mosdns needed an explicit
+`has_resp`→`accept` short-circuit, otherwise its sequence re-forwarded on every
+hit.
 
 ## Important: `upstream-max-inflight`
 

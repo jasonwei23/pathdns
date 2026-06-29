@@ -1,0 +1,24 @@
+log:
+  level: error
+plugins:
+  - tag: cache
+    type: cache
+    args:
+      size: 1000000
+  - tag: forward
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://127.0.0.1:5300"
+  - tag: main
+    type: sequence
+    args:
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - exec: $forward
+  - tag: udp_server
+    type: udp_server
+    args:
+      entry: main
+      listen: 127.0.0.1:5304
