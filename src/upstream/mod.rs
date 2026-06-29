@@ -28,6 +28,7 @@
 
 mod doh;
 mod inflight;
+pub(crate) use inflight::InflightCapReached;
 #[cfg(any(feature = "doq", feature = "h3"))]
 mod quic;
 mod tcp_mux;

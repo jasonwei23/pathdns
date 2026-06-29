@@ -578,6 +578,7 @@ fn render_stats(
     let up_ok = c.upstream_ok.load(Ordering::Relaxed);
     let up_err = c.upstream_err.load(Ordering::Relaxed);
     let drops = c.inflight_drops.load(Ordering::Relaxed);
+    let upstream_inflight_drops = c.upstream_inflight_drops.load(Ordering::Relaxed);
     let udp_truncated = c.udp_truncated.load(Ordering::Relaxed);
     let udp_send_drops = c.udp_send_drops.load(Ordering::Relaxed);
     let udp_send_errors = c.udp_send_errors.load(Ordering::Relaxed);
@@ -618,6 +619,7 @@ fn render_stats(
         "upstream_ok": up_ok,
         "upstream_err": up_err,
         "inflight_drops": drops,
+        "upstream_inflight_drops": upstream_inflight_drops,
         "udp_truncated": udp_truncated,
         "udp_send_drops": udp_send_drops,
         "udp_send_errors": udp_send_errors,

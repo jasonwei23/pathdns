@@ -746,6 +746,18 @@ async fn exchange_with_dedupe(
                     .counters
                     .upstream_err
                     .fetch_add(1, Ordering::Relaxed);
+                // Distinguish saturation of the per-upstream inflight cap from
+                // other upstream failures so it is diagnosable on the dashboard.
+                if err
+                    .chain()
+                    .any(|e| e.is::<crate::upstream::InflightCapReached>())
+                {
+                    state
+                        .querylog
+                        .counters
+                        .upstream_inflight_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             emit_slow_event(&ctx, state, &servfail, "upstream", Some(rule_arc), elapsed);
             Ok(servfail)

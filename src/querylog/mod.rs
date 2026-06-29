@@ -104,6 +104,10 @@ pub struct QueryLogCounters {
     pub upstream_err: AtomicU64,
     pub inflight_queued: AtomicU64,
     pub inflight_drops: AtomicU64,
+    /// Queries that SERVFAIL'd because a chosen upstream's per-upstream inflight
+    /// cap (`runtime.upstream-max-inflight`) was saturated. A persistently rising
+    /// value means the cap is the throughput bottleneck — raise it.
+    pub upstream_inflight_drops: AtomicU64,
     /// UDP datagrams silently dropped because they exceeded MAX_PKT (MSG_TRUNC).
     pub udp_truncated: AtomicU64,
     /// UDP responses dropped because of send backpressure or a permanent send error.
@@ -152,6 +156,7 @@ impl QueryLogCounters {
             upstream_err: AtomicU64::new(0),
             inflight_queued: AtomicU64::new(0),
             inflight_drops: AtomicU64::new(0),
+            upstream_inflight_drops: AtomicU64::new(0),
             udp_truncated: AtomicU64::new(0),
             udp_send_drops: AtomicU64::new(0),
             udp_send_errors: AtomicU64::new(0),

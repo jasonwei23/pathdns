@@ -130,17 +130,21 @@ hit.
 
 ## Important: `upstream-max-inflight`
 
-pathdns defaults to **256** concurrent in-flight queries per upstream
-(`runtime.upstream-max-inflight`). Beyond that it fast-fails excess queries with
-SERVFAIL rather than queueing them. Under a load test with `-q500` outstanding,
-that surfaces as ~15–25% SERVFAIL and caps throughput — **not** an upstream or
-mock problem.
+`runtime.upstream-max-inflight` bounds concurrent in-flight queries **per
+upstream**; beyond it, excess queries SERVFAIL immediately rather than queueing.
 
-By Little's law the per-upstream ceiling is `inflight / RTT`: at the default 256
-and a 20 ms upstream RTT that is only ~12.8k q/s **per upstream**. High-QPS
-deployments forwarding to a small number of upstreams should raise this (the
-benchmark uses `4096`). This is the single most important pathdns tuning knob for
-pure-forwarding throughput.
+This benchmark originally exposed the problem: the old default was a fixed **256**,
+so under `-q500` outstanding ~15–25% of queries SERVFAIL'd and throughput was
+capped — *not* an upstream or mock problem. By Little's law the per-upstream
+ceiling is `inflight / RTT`, so at 256 and a 20 ms RTT that was only ~12.8k q/s
+per upstream.
+
+It is now an **auto default of `max(worker-threads × 256, 1024)`** (so it scales
+with the box like `max-inflight` and clears `-q500` out of the box), and
+saturation is now visible as the **`upstream_inflight_drops`** stat instead of
+indistinguishable SERVFAILs. Still the most important knob for very high QPS
+forwarded to few upstreams — raise it further if `upstream_inflight_drops` climbs.
+The benchmark config sets `4096` explicitly for headroom regardless of core count.
 
 ## Gotchas this harness exposed
 

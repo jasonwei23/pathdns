@@ -332,7 +332,7 @@ Tune these only for special network environments, debugging, or measured bottlen
 | `worker-threads` | int | **auto** (CPU count, min 2) | Tokio worker thread count and number of `SO_REUSEPORT` sockets. |
 | `max-inflight` | int | **auto** (`worker-threads × 1024`) | Max concurrent in-flight client queries. |
 | `inflight-queue-ms` | int (ms) | `0` | When > 0, queries that exceed `max-inflight` wait up to N ms for a slot before being shed with SERVFAIL. `0` = hard-drop immediately. |
-| `upstream-max-inflight` | int | `256` | Per-upstream in-flight query limit. |
+| `upstream-max-inflight` | int | **auto** (`max(worker-threads × 256, 1024)`) | Per-upstream concurrent in-flight query limit (also the ceiling of the per-upstream AIMD window). Queries that exceed it SERVFAIL immediately and are counted in the `upstream_inflight_drops` stat. By Little's law this caps a single upstream at ~`limit ÷ RTT` queries/s; raise it for very high QPS forwarded to few upstreams. |
 | `timeout-ms` | int (ms) | `3000` | Upstream query timeout. |
 | `hedge-delay-ms` | int (ms) | `0` | Fire a second upstream after N ms with no reply. `0` = disabled. |
 | `upstream-max-response-bytes` | int | `0` | Reject TCP/TLS upstream responses larger than this. `0` = no limit. |

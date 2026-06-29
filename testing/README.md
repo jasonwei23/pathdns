@@ -28,6 +28,7 @@ relative to the current working directory.
 | `test_match.py` | 30-case domain-matching matrix (full / domain / keyword / regex / GeoSite tag include+exclude / precedence / rule routing / normalisation). Self-contained with `cfg_match.json`. |
 | `test_client.py` | Core client behaviour over UDP + TCP against a running server. |
 | `test_edge.py` | Edge cases + dashboard counter assertions (`/api/stats`). |
+| `test_inflight_cap.py` | Verifies the per-upstream inflight cap admits exactly `upstream-max-inflight` concurrent queries and that the `upstream_inflight_drops` stat counts the rest. Args: `[pathdns-binary]`. |
 | **Benchmark** | |
 | [`benchmark/`](benchmark/README.md) | Pure-forwarding throughput comparison vs unbound / smartdns / mosdns (dnsperf + fast mock upstream). |
 | `cfg_match.json` | pathdns config used by `test_match.py` (answer-map + rules + GeoSite). |

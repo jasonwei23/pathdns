@@ -26,6 +26,21 @@ struct Entry {
     question: Bytes,
 }
 
+/// Error returned by [`InflightRegistry::register`] when the per-upstream
+/// inflight cap is saturated. A distinct type (rather than a bare `anyhow!`)
+/// so the resolver can count cap saturation separately from other upstream
+/// failures via `err.chain()`. Surfaces to the client as SERVFAIL.
+#[derive(Debug)]
+pub(crate) struct InflightCapReached;
+
+impl std::fmt::Display for InflightCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("inflight cap reached")
+    }
+}
+
+impl std::error::Error for InflightCapReached {}
+
 /// Outcome of [`InflightRegistry::complete`], for caller-side logging.
 pub(super) enum Completion {
     /// Question validated; waiter completed; response bytes consumed from the buffer.
@@ -76,7 +91,11 @@ impl InflightRegistry {
         let permit = if let Some(sem) = &self.cap {
             match sem.clone().try_acquire_owned() {
                 Ok(p) => Some(p),
-                Err(_) => return Err(anyhow!("upstream {name} inflight cap reached")),
+                Err(_) => {
+                    return Err(
+                        anyhow::Error::new(InflightCapReached).context(format!("upstream {name}"))
+                    )
+                }
             }
         } else {
             None

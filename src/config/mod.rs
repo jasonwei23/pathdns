@@ -310,7 +310,14 @@ impl Config {
         }
         let inflight_queue_ms = t.inflight_queue_ms.unwrap_or(0);
 
-        let upstream_max_inflight = t.upstream_max_inflight.unwrap_or(256);
+        // Per-upstream concurrent in-flight cap. Scales with the worker count
+        // (like the global `max_inflight`) so high-QPS boxes are not bottlenecked
+        // by a fixed small value, with a 1024 floor that still bounds outstanding
+        // work to one upstream. By Little's law this caps a single upstream at
+        // roughly `cap / RTT` queries/s; raise it for very high QPS to few upstreams.
+        let upstream_max_inflight = t
+            .upstream_max_inflight
+            .unwrap_or_else(|| (worker_threads * 256).max(1024));
         let hedge_delay_ms = t.hedge_delay_ms.unwrap_or(0);
 
         let route = json.route.unwrap_or_default();
