@@ -1,0 +1,145 @@
+use crate::config::IpSetPair;
+use anyhow::{anyhow, Result};
+use std::net::IpAddr;
+
+#[derive(Debug, Clone)]
+pub(super) struct SetPair {
+    pub(super) v4: Option<SetName>,
+    pub(super) v6: Option<SetName>,
+}
+
+/// A fully-parsed set identifier, optionally with a prefix-length mask.
+///
+/// Syntax:
+/// - ipset:  `"myset"` or `"myset/24"` (`/N` suffix = mask)
+/// - nftset: `"inet@fw4@myset"` or `"inet@fw4@myset@24"` (4th `@` segment = mask)
+///
+/// The mask, when present, is applied to each resolved IP before it is written to
+/// the set (e.g. `1.2.3.100/24` → network address `1.2.3.0`).  For nftset targets
+/// the caller additionally queries whether the set carries the `interval` flag; if
+/// so the entry is written as a prefix range instead of a single host element.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SetName {
+    IpSet {
+        name: String,
+        mask: Option<u8>,
+    },
+    NftSet {
+        family: NftFamily,
+        table: String,
+        set: String,
+        mask: Option<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum NftFamily {
+    Inet,
+    Ip,
+    Ip6,
+    Arp,
+    Bridge,
+    Netdev,
+}
+
+impl SetPair {
+    pub(super) fn parse(pair: &IpSetPair) -> Result<Self> {
+        let parsed = Self {
+            v4: pair.v4.as_deref().map(SetName::parse).transpose()?,
+            v6: pair.v6.as_deref().map(SetName::parse).transpose()?,
+        };
+        if let Some(set) = &parsed.v4 {
+            set.validate_prefix_len(32)?;
+        }
+        if let Some(set) = &parsed.v6 {
+            set.validate_prefix_len(128)?;
+        }
+        Ok(parsed)
+    }
+
+    pub(super) fn set_for(&self, ip: IpAddr) -> Option<&SetName> {
+        match ip {
+            IpAddr::V4(_) => self.v4.as_ref(),
+            IpAddr::V6(_) => self.v6.as_ref(),
+        }
+    }
+}
+
+impl SetName {
+    pub(super) fn parse(raw: &str) -> Result<Self> {
+        if raw.contains('@') {
+            // nftset: "family@table@set" or "family@table@set@mask"
+            let mut parts = raw.splitn(5, '@');
+            let family = parse_nft_family(parts.next().unwrap_or_default())?;
+            let table = parts.next().unwrap_or_default();
+            let set = parts.next().unwrap_or_default();
+            let mask_str = parts.next().unwrap_or_default();
+            if table.is_empty() || set.is_empty() || parts.next().is_some() {
+                return Err(anyhow!("invalid nftset name: {raw}"));
+            }
+            let mask = parse_mask(mask_str)?;
+            Ok(Self::NftSet {
+                family,
+                table: table.to_string(),
+                set: set.to_string(),
+                mask,
+            })
+        } else {
+            // ipset: "name" or "name/prefix"
+            let (name, mask) = if let Some(slash) = raw.rfind('/') {
+                let mask = parse_mask(&raw[slash + 1..])?
+                    .ok_or_else(|| anyhow!("invalid ipset mask in: {raw}"))?;
+                (&raw[..slash], Some(mask))
+            } else {
+                (raw, None)
+            };
+            if name.is_empty() {
+                return Err(anyhow!("empty ipset name in: {raw}"));
+            }
+            Ok(Self::IpSet {
+                name: name.to_string(),
+                mask,
+            })
+        }
+    }
+
+    fn mask(&self) -> Option<u8> {
+        match self {
+            Self::IpSet { mask, .. } | Self::NftSet { mask, .. } => *mask,
+        }
+    }
+
+    fn validate_prefix_len(&self, max: u8) -> Result<()> {
+        if let Some(mask) = self.mask() {
+            if mask > max {
+                return Err(anyhow!("prefix length {mask} exceeds maximum {max}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_mask(s: &str) -> Result<Option<u8>> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let n: u8 = s
+        .parse()
+        .map_err(|_| anyhow!("invalid prefix length '{s}': must be 0–128"))?;
+    if n > 128 {
+        return Err(anyhow!("invalid prefix length '{s}': must be 0–128"));
+    }
+    Ok(Some(n))
+}
+
+fn parse_nft_family(value: &str) -> Result<NftFamily> {
+    match value {
+        "inet" => Ok(NftFamily::Inet),
+        "ip" => Ok(NftFamily::Ip),
+        "ip6" => Ok(NftFamily::Ip6),
+        "arp" => Ok(NftFamily::Arp),
+        "bridge" => Ok(NftFamily::Bridge),
+        "netdev" => Ok(NftFamily::Netdev),
+        _ => Err(anyhow!("invalid nft family: {value}")),
+    }
+}
