@@ -57,3 +57,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+      - name: Notify openwrt packages repo (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token ${{ secrets.PACKAGES_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/jasonwei23/packages/dispatches \
+            -d "{\"event_type\":\"pathdns-release\",\"client_payload\":{\"version\":\"${GITHUB_REF_NAME#v}\"}}"
