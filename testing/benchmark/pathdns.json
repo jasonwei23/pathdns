@@ -1,0 +1,9 @@
+{
+  "bind": { "addr": "127.0.0.1", "port": 5301, "proto": "udp" },
+  "route": {
+    "rules": [ { "name": "all", "upstream": ["udp://127.0.0.1:5300"] } ],
+    "final": "all"
+  },
+  "cache": { "size": 0 },
+  "runtime": { "worker-threads": 2, "upstream-max-inflight": 4096 }
+}

@@ -1,0 +1,71 @@
+{
+  "bind": {
+    "addr": "127.0.0.1",
+    "port": 5353,
+    "proto": "udp"
+  },
+  "route": {
+    "ruleset": [
+      { "tag": "cn", "format": "text", "behavior": "domain", "path": "ruleset_cn.list" },
+      { "tag": "gfw", "format": "text", "behavior": "domain", "path": "ruleset_gfw.list" },
+      { "tag": "ads", "format": "text", "behavior": "domain", "path": "ruleset_ads.list" },
+      { "tag": "apple", "format": "mrs", "behavior": "domain", "path": "ruleset_apple.mrs" }
+    ],
+    "answer": {
+      "exact.test": "A://1.1.1.1",
+      "+.zone.test": "A://2.2.2.2",
+      "*.wild.test": "A://3.3.3.3",
+      "tag:cn,!gfw": "A://5.5.5.5",
+      "tag:ads": "RCODE://NXDOMAIN",
+      "both.test": "A://6.6.6.6",
+      "+.inner.zone.test": "A://7.7.7.7"
+    },
+    "rules": [
+      {
+        "name": "domestic",
+        "tag": [
+          "cn"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "apple-rule",
+        "tag": [
+          "apple"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "overseas",
+        "tag": [
+          "gfw"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      },
+      {
+        "name": "noncn",
+        "tag": [
+          "!cn"
+        ],
+        "upstream": [
+          "udp://127.0.0.1:5300"
+        ]
+      }
+    ],
+    "final": "domestic"
+  },
+  "cache": {
+    "size": 0
+  },
+  "dashboard": {
+    "port": 8080,
+    "token": "secret",
+    "answer-ips": true
+  }
+}

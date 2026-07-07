@@ -1,0 +1,32 @@
+name: Clean up old workflow runs
+
+# Actions run history has no automatic retention — every CI/release run stays
+# listed forever unless something deletes it. Schedule-only, deliberately no
+# workflow_dispatch: GitHub requires picking a branch to launch any manual
+# dispatch run, and this workflow is meant to need zero manual interaction —
+# it always deletes repository-wide regardless of branch anyway, so there is
+# nothing a manual run would let you control.
+#
+# keep_minimum_runs is intentionally small: with a young/low-traffic repo,
+# a floor close to each workflow's total run count leaves retain_days almost
+# nothing to actually prune (e.g. 10 kept out of 13 total runs), which is why
+# a previous, more generous floor looked like it wasn't cleaning much.
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # 03:00 UTC every Sunday
+
+jobs:
+  delete-old-runs:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 2

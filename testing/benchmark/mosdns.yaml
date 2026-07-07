@@ -1,0 +1,13 @@
+log:
+  level: error
+plugins:
+  - tag: fwd
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://127.0.0.1:5300"
+  - tag: udp_server
+    type: udp_server
+    args:
+      entry: fwd
+      listen: 127.0.0.1:5304

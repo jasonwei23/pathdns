@@ -1,0 +1,36 @@
+[package]
+name = "pathdns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.pathdns]
+path = ".."
+
+[[bin]]
+name = "fuzz_dns_wire"
+path = "fuzz_targets/fuzz_dns_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mrs_domain"
+path = "fuzz_targets/fuzz_mrs_domain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mrs_ipcidr"
+path = "fuzz_targets/fuzz_mrs_ipcidr.rs"
+test = false
+doc = false
+bench = false

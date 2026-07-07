@@ -1,0 +1,48 @@
+name: Build aarch64 binary (jemalloc test)
+
+# Manual one-off build for A/B testing the jemalloc allocator on real hardware.
+# Same cross-rs aarch64-unknown-linux-musl target as release-aarch64.yml, but
+# with --features jemalloc and no release/tag attachment — just an artifact
+# to download and run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: aarch64-unknown-linux-musl (jemalloc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-aarch64-jemalloc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-aarch64-jemalloc-
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --locked --target aarch64-unknown-linux-musl --features jemalloc
+
+      - name: Stage artifact
+        run: |
+          install -Dm755 target/aarch64-unknown-linux-musl/release/pathdns \
+            dist/pathdns-linux-aarch64-jemalloc
+          cd dist && sha256sum pathdns-linux-aarch64-jemalloc > pathdns-linux-aarch64-jemalloc.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathdns-linux-aarch64-jemalloc
+          path: dist/*
