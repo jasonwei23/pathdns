@@ -54,13 +54,9 @@ pub(super) fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
 
     let proto = parse_upstream_scheme(scheme)?;
     let (rest_no_query, query) = rest.split_once('?').map_or((rest, ""), |(a, q)| (a, q));
-    let no_sni = query.split('&').any(|p| p == "no-sni");
-    let sni_override = query
-        .split('&')
-        .find_map(|p| p.strip_prefix("sni="))
-        .map(str::to_string);
-    let ecs_param = query.split('&').find_map(|p| p.strip_prefix("ecs="));
-    let ecs_mode: Option<EcsMode> = match ecs_param {
+    let params = parse_upstream_query(query, raw)?;
+
+    let ecs_mode = match params.ecs {
         None => None,
         Some("strip") => Some(EcsMode::Strip),
         Some("forward") => Some(EcsMode::Forward),
@@ -69,40 +65,25 @@ pub(super) fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
                 .with_context(|| format!("invalid upstream '{raw}': ?ecs={val}"))?,
         )),
     };
-    let bootstrap_param = query.split('&').find_map(|p| p.strip_prefix("bootstrap="));
-    let bootstrap_addr: Option<SocketAddr> = match bootstrap_param {
-        None => None,
-        Some(val) => {
-            Some(parse_bootstrap_addr(val).with_context(|| format!("invalid upstream '{raw}'"))?)
-        }
-    };
+    let bootstrap_addr: Option<SocketAddr> = params
+        .bootstrap
+        .map(|val| parse_bootstrap_addr(val).with_context(|| format!("invalid upstream '{raw}'")))
+        .transpose()?;
     let bootstrap_slice: &[SocketAddr] = bootstrap_addr.as_slice();
 
-    let mark: Option<u32> = match query.split('&').find_map(|p| p.strip_prefix("mark=")) {
+    let mark: Option<u32> = match params.mark {
         None => None,
         Some(val) => Some(
             parse_fwmark(val).with_context(|| format!("invalid upstream '{raw}': ?mark={val}"))?,
         ),
     };
 
-    for param in query.split('&').filter(|p| !p.is_empty()) {
-        if param != "no-sni"
-            && !param.starts_with("sni=")
-            && !param.starts_with("ecs=")
-            && !param.starts_with("bootstrap=")
-            && !param.starts_with("mark=")
-        {
-            return Err(anyhow!(
-                "invalid upstream '{raw}': unknown query parameter '{param}'"
-            ));
-        }
-    }
-    if no_sni && !matches!(proto, UpstreamProto::Tls) {
+    if params.no_sni && !matches!(proto, UpstreamProto::Tls) {
         return Err(anyhow!(
             "invalid upstream '{raw}': ?no-sni is only valid for tls:// upstreams"
         ));
     }
-    if sni_override.is_some() && !proto.uses_tls_name() {
+    if params.sni.is_some() && !proto.uses_tls_name() {
         return Err(anyhow!(
             "invalid upstream '{raw}': ?sni= is only valid for TLS-based upstreams"
         ));
@@ -112,7 +93,7 @@ pub(super) fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
     let port = proto.default_port();
     let (host, addr) = resolve_authority(authority, port, bootstrap_slice)
         .with_context(|| format!("upstream '{raw}'"))?;
-    let server_name = sni_override.or_else(|| {
+    let server_name = params.sni.map(str::to_string).or_else(|| {
         proto
             .uses_tls_name()
             .then(|| strip_ipv6_brackets(host).to_string())
@@ -134,13 +115,44 @@ pub(super) fn parse_upstream(raw: &str) -> Result<Vec<UpstreamEndpoint>> {
         addr,
         server_name,
         path,
-        no_sni,
+        params.no_sni,
         ecs_mode,
         mark,
     )])
 }
 
 const DEFAULT_DOH_PATH: &str = "/dns-query";
+
+#[derive(Default)]
+struct UpstreamQueryParams<'a> {
+    no_sni: bool,
+    sni: Option<&'a str>,
+    ecs: Option<&'a str>,
+    bootstrap: Option<&'a str>,
+    mark: Option<&'a str>,
+}
+
+fn parse_upstream_query<'a>(query: &'a str, raw: &str) -> Result<UpstreamQueryParams<'a>> {
+    let mut params = UpstreamQueryParams::default();
+    for param in query.split('&').filter(|p| !p.is_empty()) {
+        if param == "no-sni" {
+            params.no_sni = true;
+        } else if let Some(value) = param.strip_prefix("sni=") {
+            params.sni = Some(value);
+        } else if let Some(value) = param.strip_prefix("ecs=") {
+            params.ecs = Some(value);
+        } else if let Some(value) = param.strip_prefix("bootstrap=") {
+            params.bootstrap = Some(value);
+        } else if let Some(value) = param.strip_prefix("mark=") {
+            params.mark = Some(value);
+        } else {
+            return Err(anyhow!(
+                "invalid upstream '{raw}': unknown query parameter '{param}'"
+            ));
+        }
+    }
+    Ok(params)
+}
 
 /// Parse a `?mark=` fwmark value: hex (`0x1`) or decimal (`1`), into a `u32`.
 fn parse_fwmark(s: &str) -> Result<u32> {
@@ -196,7 +208,7 @@ fn parse_ecs_subnet(s: &str) -> Result<EcsSubnet> {
 }
 
 pub(super) fn parse_rcode_name(name: &str) -> Result<u8> {
-    match name.to_ascii_uppercase().as_str() {
+    let rcode = match name.to_ascii_uppercase().as_str() {
         "NOERROR" => Ok(0),
         "FORMERR" => Ok(1),
         "SERVFAIL" => Ok(2),
@@ -206,7 +218,11 @@ pub(super) fn parse_rcode_name(name: &str) -> Result<u8> {
         other => other
             .parse::<u8>()
             .map_err(|_| anyhow!("unknown RCODE \"{other}\" — use NOERROR/NXDOMAIN/SERVFAIL/REFUSED or a number 0–15")),
+    }?;
+    if rcode > 15 {
+        return Err(anyhow!("RCODE {rcode} is out of range (0–15)"));
     }
+    Ok(rcode)
 }
 
 fn parse_upstream_scheme(scheme: &str) -> Result<UpstreamProto> {
@@ -243,5 +259,35 @@ impl UpstreamProto {
 
     fn uses_tls_name(self) -> bool {
         matches!(self, Self::Tls | Self::Https | Self::Quic | Self::H3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rcode_name_rejects_values_outside_header_nibble() {
+        assert_eq!(parse_rcode_name("NOERROR").unwrap(), 0);
+        assert_eq!(parse_rcode_name("15").unwrap(), 15);
+        assert!(parse_rcode_name("16").is_err());
+        assert!(parse_rcode_name("255").is_err());
+    }
+
+    #[test]
+    fn parse_upstream_query_accepts_known_params_once() {
+        let endpoints =
+            parse_upstream("tls://1.1.1.1?no-sni&sni=example.com&ecs=strip&mark=0x2").unwrap();
+        let endpoint = &endpoints[0];
+        assert!(endpoint.no_sni);
+        assert_eq!(endpoint.server_name.as_deref(), Some("example.com"));
+        assert!(matches!(endpoint.ecs_mode, Some(EcsMode::Strip)));
+        assert_eq!(endpoint.mark, Some(2));
+    }
+
+    #[test]
+    fn parse_upstream_query_rejects_unknown_params() {
+        let err = parse_upstream("udp://127.0.0.1?unknown=1").unwrap_err();
+        assert!(err.to_string().contains("unknown query parameter"));
     }
 }

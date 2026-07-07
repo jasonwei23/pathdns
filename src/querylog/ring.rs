@@ -105,6 +105,10 @@ impl EventRing {
         self.buf.lock().map(|b| b.len()).unwrap_or(0)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn enabled(&self) -> bool {
         self.capacity > 0
     }
@@ -142,6 +146,12 @@ impl QpsRing {
         };
         let take = n.min(3600).min(data.len());
         data.iter().skip(data.len() - take).copied().collect()
+    }
+}
+
+impl Default for QpsRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -241,5 +251,11 @@ impl StatsRing {
             result.push(agg);
         }
         result
+    }
+}
+
+impl Default for StatsRing {
+    fn default() -> Self {
+        Self::new()
     }
 }

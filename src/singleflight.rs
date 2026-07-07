@@ -31,6 +31,12 @@ impl InflightTable {
     }
 }
 
+impl Default for InflightTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Register interest in `key`. Returns `None` if this caller is the leader (must send
 /// upstream and call `publish`). Returns `Some(rx)` if another caller is already in
 /// flight; await `rx.changed()` to receive the result.

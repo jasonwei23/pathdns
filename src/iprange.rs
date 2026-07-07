@@ -30,6 +30,10 @@ impl IpRangeSet {
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
 }
 
 /// Accumulates `(from, to)` ranges (in the unified 128-bit space, any order,

@@ -4,8 +4,8 @@
 
 use super::json::{self, JsonBindSection, JsonRuleCacheSection, JsonRuleEntry, JsonRuleSetEntry};
 use super::*;
-use anyhow::{anyhow, Context, Result};
 use crate::ruleset::{RuleSetBehavior, RuleSetFormat, RuleSetSpec};
+use anyhow::{anyhow, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 // ── Config parsing helpers ───────────────────────────────────────────────────
@@ -211,7 +211,9 @@ pub(super) fn parse_ruleset_specs(entries: Vec<JsonRuleSetEntry>) -> Result<Vec<
     Ok(specs)
 }
 
-pub(super) fn parse_rule_cache_policy(cache: Option<JsonRuleCacheSection>) -> Result<Option<RuleCachePolicy>> {
+pub(super) fn parse_rule_cache_policy(
+    cache: Option<JsonRuleCacheSection>,
+) -> Result<Option<RuleCachePolicy>> {
     let Some(c) = cache else {
         return Ok(None);
     };
@@ -361,7 +363,9 @@ pub(super) fn parse_rcode_list(value: Option<serde_json::Value>) -> Result<Vec<u
                     anyhow!("response-rcode must be a non-negative integer or name")
                 })?;
                 u8::try_from(n)
-                    .map_err(|_| anyhow!("response-rcode value {n} is out of range (0–15)"))
+                    .ok()
+                    .filter(|&rcode| rcode <= 15)
+                    .ok_or_else(|| anyhow!("response-rcode value {n} is out of range (0–15)"))
             }
             serde_json::Value::String(s) => parse_rcode_name(&s),
             _ => Err(anyhow!(

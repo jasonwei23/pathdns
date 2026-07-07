@@ -182,6 +182,12 @@ impl QueryLogCounters {
     }
 }
 
+impl Default for QueryLogCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Handle ───────────────────────────────────────────────────────────────────
 
 /// Cheap-clone handle held by the hot path.
