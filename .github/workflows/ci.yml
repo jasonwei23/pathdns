@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked
+
+      # The in-tree #[cfg(test)] unit tests have been removed in favour of the
+      # black-box integration scripts under testing/ (run against a live binary +
+      # mock upstreams; see testing/README.md). This step still type-checks the
+      # crate under `cfg(test)` and will pick up any future #[test] modules.
+      - name: Test
+        run: cargo test --locked
+
+  fuzz:
+    name: fuzz targets (smoke run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly, for -Z sanitizer instrumentation)
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      - name: Cache cargo registry and fuzz build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Not continuous fuzzing (that needs persistent corpus storage and far
+      # more than a CI job's budget) — just a short timed run per target on
+      # every push/PR, so a change that introduces a panic/overflow reachable
+      # from raw wire bytes (DNS packets, `.mrs` ruleset files) fails CI
+      # immediately instead of waiting to be found by a human or an attacker.
+      - name: Fuzz smoke run (60s per target)
+        run: |
+          for target in fuzz_dns_wire fuzz_mrs_domain fuzz_mrs_ipcidr; do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+            echo "::endgroup::"
+          done

@@ -1,0 +1,8 @@
+queries.txt
+queries_cache.txt
+rustmock
+*.out
+*.log
+*.pid
+__pycache__/
+mosdns_bin/

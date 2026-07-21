@@ -1,0 +1,53 @@
+[package]
+name = "pathdns"
+version = "0.1.2"
+edition = "2021"
+license = "MIT"
+
+[features]
+# DoT + DoH are on by default; build with --no-default-features for a minimal
+# UDP/TCP-only resolver that drops the rustls/tokio-rustls/h2/webpki-roots stack.
+default = ["dot", "doh"]
+jemalloc = ["dep:tikv-jemallocator"]
+# DNS-over-TLS (RFC 7858); pulls the rustls + tokio-rustls + webpki-roots stack.
+dot = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+# DNS-over-HTTPS (HTTP/2); builds on `dot`'s TLS stack and adds the h2/http crates.
+doh = ["dot", "dep:h2", "dep:http"]
+# DNS-over-QUIC (RFC 9250); adds the quinn QUIC library (~600 kB on amd64 musl).
+doq = ["dep:quinn", "dep:rustls", "dep:webpki-roots"]
+# HTTP/3 DoH; requires doq and adds the h3 and h3-quinn crates.
+h3 = ["doq", "dep:h3", "dep:h3-quinn", "dep:http"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+anyhow = "1"
+bytes = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+regex = "1"
+inotify = { version = "0.9", default-features = false }
+rustc-hash = "2"
+smallvec = "1"
+arc-swap = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+rmp-serde = "1"
+flate2 = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"], optional = true }
+h3 = { version = "0.0", optional = true }
+h3-quinn = { version = "0.0", optional = true }
+io-uring = "0.7.12"
+ruzstd = "0.8.3"
+quick_cache = { version = "0.7.0", default-features = false, features = ["custom-hasher"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,87 @@
+name: Build aarch64 binary
+
+# Cross-compiles a release pathdns binary for 64-bit ARM Linux
+# (aarch64-unknown-linux-musl → a static binary that runs on routers/SBCs
+# without a matching glibc). Uses cross-rs so the musl toolchain and ring's
+# C/asm build are handled in a container.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.2). Leave empty for a build-only run.'
+        required: false
+        default: ''
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-aarch64-
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Stage artifact
+        run: |
+          install -Dm755 target/aarch64-unknown-linux-musl/release/pathdns \
+            dist/pathdns-linux-aarch64
+          cd dist && sha256sum pathdns-linux-aarch64 > pathdns-linux-aarch64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathdns-linux-aarch64
+          path: dist/*
+
+      # Resolve the release tag from either the pushed tag ref or the manual
+      # workflow_dispatch input, so a release can be minted without a tag push.
+      - name: Resolve release tag
+        id: rel
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach to release
+        if: steps.rel.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          files: dist/*
+
+      - name: Notify openwrt packages repo
+        if: steps.rel.outputs.tag != ''
+        run: |
+          version="${{ steps.rel.outputs.tag }}"
+          version="${version#v}"
+          curl -fsSL -X POST \
+            -H "Authorization: token ${{ secrets.PACKAGES_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/jasonwei23/packages/dispatches \
+            -d "{\"event_type\":\"pathdns-release\",\"client_payload\":{\"version\":\"${version}\"}}"

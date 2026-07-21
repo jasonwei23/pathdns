@@ -1,0 +1,111 @@
+{
+  "bind": {
+    "addr": "127.0.0.1",
+    "port": 5353,
+    "proto": "udp"
+  },
+  "route": {
+    "servers": {
+      "pinned": "udp://127.0.0.1:5300",
+      "domestic": "udp://127.0.0.1:5300",
+      "apple-rule": "udp://127.0.0.1:5300",
+      "overseas": "udp://127.0.0.1:5300",
+      "noncn": "udp://127.0.0.1:5300",
+      "exact-answer": "A://1.1.1.1",
+      "zone-answer": "A://2.2.2.2",
+      "inner-zone-answer": "A://7.7.7.7",
+      "wild-answer": "A://3.3.3.3",
+      "cn-answer": "A://5.5.5.5",
+      "ads-answer": "RCODE://NXDOMAIN",
+      "both-answer": "A://6.6.6.6"
+    },
+    "ruleset": [
+      { "tag": "cn", "format": "text", "behavior": "domain", "path": "ruleset_cn.list" },
+      { "tag": "gfw", "format": "text", "behavior": "domain", "path": "ruleset_gfw.list" },
+      { "tag": "ads", "format": "text", "behavior": "domain", "path": "ruleset_ads.list" },
+      { "tag": "apple", "format": "mrs", "behavior": "domain", "path": "ruleset_apple.mrs" }
+    ],
+    "rules": [
+      {
+        "matcher": [
+          "pinorder.test"
+        ],
+        "upstream": "pinned"
+      },
+      {
+        "matcher": [
+          "exact.test"
+        ],
+        "upstream": "exact-answer"
+      },
+      {
+        "matcher": [
+          "both.test"
+        ],
+        "upstream": "both-answer"
+      },
+      {
+        "matcher": [
+          "+.inner.zone.test"
+        ],
+        "upstream": "inner-zone-answer"
+      },
+      {
+        "matcher": [
+          "+.zone.test"
+        ],
+        "upstream": "zone-answer"
+      },
+      {
+        "matcher": [
+          "*.wild.test"
+        ],
+        "upstream": "wild-answer"
+      },
+      {
+        "matcher": [
+          "tag:cn,!gfw"
+        ],
+        "upstream": "cn-answer"
+      },
+      {
+        "matcher": [
+          "tag:ads"
+        ],
+        "upstream": "ads-answer"
+      },
+      {
+        "matcher": [
+          "tag:cn"
+        ],
+        "upstream": "domestic"
+      },
+      {
+        "matcher": [
+          "tag:apple"
+        ],
+        "upstream": "apple-rule"
+      },
+      {
+        "matcher": [
+          "tag:gfw"
+        ],
+        "upstream": "overseas"
+      },
+      {
+        "matcher": [
+          "tag:!cn"
+        ],
+        "upstream": "noncn"
+      }
+    ],
+    "final": "domestic"
+  },
+  "cache": {
+    "size": 0
+  },
+  "dashboard": {
+    "port": 8080,
+    "token": "secret"
+  }
+}

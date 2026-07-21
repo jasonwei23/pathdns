@@ -1,0 +1,1481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pathdns</title>
+<script>(function(){try{var t=localStorage.getItem('pathdns-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  /* Miuix / HyperOS-inspired palette. Light is the primary surface (white
+     cards on a tinted page background -- elevation via color contrast, not
+     shadow, the way MIUI settings screens do it); dark follows automatically
+     via prefers-color-scheme, since Miuix treats both as first-class rather
+     than dark-only. --accent is Miuix's own doc-referenced seed blue
+     (#3482ff); every other hue was checked against the dataviz skill's
+     categorical-palette validator (lightness band, chroma floor, CVD
+     separation, contrast) for both surfaces before being picked. */
+  --bg:#f6f6fa;
+  --surface:#ffffff;
+  --surface2:#eeeef4;
+  --surface-press:#e2e2ea;
+  --border:#e6e6ee;
+  --text:#1c1c1e;
+  --text2:#86868f;
+  --accent:#3482ff;
+  --accent-ink:#ffffff;
+  --accent-dim:rgba(52,130,255,.12);
+  --green:#2fb463;
+  --red:#ff3b30;
+  --amber:#ff9500;
+  --blue:#0ea5e9;
+  --violet:#6ba4ff;
+  --shadow:0 1px 2px rgba(28,28,30,.04),0 8px 20px rgba(28,28,30,.05);
+  --r-xl:24px;
+  --r-l:18px;
+  --r-m:12px;
+  --r-pill:999px;
+  color-scheme:light;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#08080a;
+    --surface:#1a1a1d;
+    --surface2:#232326;
+    --surface-press:#2c2c30;
+    --border:#2d2d31;
+    --text:#f4f4f6;
+    --text2:#96969e;
+    --accent:#4a8fe8;
+    --accent-ink:#ffffff;
+    --accent-dim:rgba(74,143,232,.18);
+    --green:#2fa968;
+    --red:#e8574f;
+    --amber:#c77a1b;
+    --blue:#2496c7;
+    --violet:#8fb8f2;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 24px rgba(0,0,0,.35);
+    color-scheme:dark;
+  }
+}
+/* Explicit theme choice (data-theme, set via the sidebar switcher) always
+   wins over the prefers-color-scheme media query above, in both directions --
+   this lets a user force light while their OS is dark, or vice versa. Auto
+   (the default) means no data-theme attribute is set, so the media query
+   above is what applies. */
+:root[data-theme="light"]{
+  --bg:#f6f6fa;
+  --surface:#ffffff;
+  --surface2:#eeeef4;
+  --surface-press:#e2e2ea;
+  --border:#e6e6ee;
+  --text:#1c1c1e;
+  --text2:#86868f;
+  --accent:#3482ff;
+  --accent-ink:#ffffff;
+  --accent-dim:rgba(52,130,255,.12);
+  --green:#2fb463;
+  --red:#ff3b30;
+  --amber:#ff9500;
+  --blue:#0ea5e9;
+  --violet:#6ba4ff;
+  --shadow:0 1px 2px rgba(28,28,30,.04),0 8px 20px rgba(28,28,30,.05);
+  color-scheme:light;
+}
+:root[data-theme="dark"]{
+  --bg:#08080a;
+  --surface:#1a1a1d;
+  --surface2:#232326;
+  --surface-press:#2c2c30;
+  --border:#2d2d31;
+  --text:#f4f4f6;
+  --text2:#96969e;
+  --accent:#4a8fe8;
+  --accent-ink:#ffffff;
+  --accent-dim:rgba(74,143,232,.18);
+  --green:#2fa968;
+  --red:#e8574f;
+  --amber:#c77a1b;
+  --blue:#2496c7;
+  --violet:#8fb8f2;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 24px rgba(0,0,0,.35);
+  color-scheme:dark;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased}
+.num{font-family:ui-rounded,"SF Pro Rounded","Segoe UI Rounded",-apple-system,sans-serif;font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:-.01em}
+
+/* Sidebar */
+#sidebar{width:212px;background:var(--bg);display:flex;flex-direction:column;flex-shrink:0;padding:20px 12px}
+#sidebar-title{font-family:ui-rounded,"SF Pro Rounded",-apple-system,sans-serif;padding:8px 12px 22px;font-size:19px;font-weight:800;color:var(--text);letter-spacing:-.01em}
+#sidebar-title span{color:var(--accent)}
+#sidebar nav{flex:1;display:flex;flex-direction:column;gap:3px}
+.nav-item{display:flex;align-items:center;gap:11px;padding:10px 14px;cursor:pointer;color:var(--text2);font-size:13.5px;font-weight:600;border-radius:var(--r-pill);text-decoration:none;transition:background .15s,color .15s}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--accent-ink);background:var(--accent)}
+.nav-icon{width:17px;height:17px;opacity:.85;flex-shrink:0}
+.nav-item.active .nav-icon{opacity:1}
+.theme-switch{display:flex;gap:2px;padding:3px;margin-top:auto;background:var(--surface2);border-radius:var(--r-pill)}
+.theme-btn{flex:1;display:flex;align-items:center;justify-content:center;padding:8px 0;border:none;background:transparent;cursor:pointer;border-radius:var(--r-pill);color:var(--text2);transition:background .15s,color .15s}
+.theme-btn svg{width:15px;height:15px}
+.theme-btn:hover{color:var(--text)}
+.theme-btn.active{background:var(--surface);color:var(--accent);box-shadow:var(--shadow)}
+
+/* Main */
+#main{flex:1;overflow-y:auto;padding:28px 32px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.view{display:none;animation:fadeUp .2s ease}
+.view.active{display:block}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.view-title{font-family:ui-rounded,"SF Pro Rounded",-apple-system,sans-serif;font-size:25px;font-weight:800;margin-bottom:20px;color:var(--text);letter-spacing:-.015em}
+
+/* Stat grid */
+.stat-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:16px}
+.stat-box{background:var(--surface);border-radius:var(--r-xl);box-shadow:var(--shadow);transition:box-shadow .15s;display:flex;flex-direction:column;overflow:hidden}
+.stat-box:hover{box-shadow:var(--shadow),0 0 0 1.5px var(--accent)}
+.stat-box-body{padding:18px 20px 14px}
+.stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.07em;font-weight:700;margin-bottom:8px}
+.stat-value{font-family:ui-rounded,"SF Pro Rounded","Segoe UI Rounded",-apple-system,sans-serif;font-variant-numeric:tabular-nums;font-size:27px;font-weight:800;line-height:1.15;color:var(--text);letter-spacing:-.01em}
+.stat-sub{font-size:11.5px;color:var(--text2);margin-top:5px}
+.spark{display:block;width:100%;height:36px;margin-top:auto}
+.spark svg{display:block;width:100%;height:100%;overflow:visible}
+
+/* Cards */
+.card{background:var(--surface);border-radius:var(--r-xl);box-shadow:var(--shadow);padding:20px 20px 8px;margin-bottom:16px}
+.card-title{font-family:ui-rounded,"SF Pro Rounded",-apple-system,sans-serif;font-size:15.5px;font-weight:800;color:var(--text);letter-spacing:-.01em;margin-bottom:14px;padding:0 4px}
+
+/* Tables */
+.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.toolbar input{flex:1;padding:9px 15px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;border-radius:var(--r-pill);outline:none;transition:border-color .12s,box-shadow .12s;min-width:120px}
+.toolbar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+.toolbar input::placeholder{color:var(--text2)}
+.btn{padding:8px 16px;border:none;background:var(--surface2);cursor:pointer;font-size:13px;font-weight:600;color:var(--text);border-radius:var(--r-pill);transition:background .12s;white-space:nowrap}
+.btn:hover{background:var(--surface-press)}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{filter:brightness(1.08)}
+.toggle-label{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--text2);white-space:nowrap;user-select:none}
+.toggle-label input{display:none}
+.toggle-track{width:34px;height:20px;background:var(--border);border-radius:var(--r-pill);position:relative;transition:background .15s;flex-shrink:0}
+.toggle-label input:checked~.toggle-track{background:var(--accent)}
+.toggle-track::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .15s;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.toggle-label input:checked~.toggle-track::after{transform:translateX(14px)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:0 12px 10px;color:var(--text2);font-weight:700;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+td{padding:12px;border-top:1px solid var(--border);color:var(--text);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr:first-child td{border-top:none}
+.ql-row{cursor:pointer}
+.ql-row:hover td{background:var(--surface2)}
+.badge{display:inline-block;padding:3px 9px;border-radius:var(--r-pill);font-size:11px;font-weight:700;letter-spacing:.02em}
+.badge-cache{background:rgba(47,180,99,.13);color:var(--green)}
+.badge-upstream{background:rgba(14,165,233,.13);color:var(--blue)}
+.badge-sf{background:var(--accent-dim);color:var(--accent)}
+.badge-null{background:rgba(255,59,48,.13);color:var(--red)}
+.badge-filtered{background:var(--surface2);color:var(--text2)}
+.badge-overload{background:rgba(255,59,48,.13);color:var(--red)}
+.badge-answer{background:rgba(255,149,0,.13);color:var(--amber)}
+.badge-ok{background:rgba(47,180,99,.13);color:var(--green)}
+.badge-err{background:rgba(255,59,48,.13);color:var(--red)}
+.more-btn-wrap{text-align:center;margin-top:14px;padding-bottom:16px}
+
+/* Query detail modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(6px);animation:fadeIn .15s ease}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.modal-card{background:var(--surface);border-radius:var(--r-xl);padding:24px 28px 28px;width:min(540px,92vw);max-height:80vh;overflow-y:auto;position:relative;box-shadow:0 24px 64px rgba(0,0,0,.28);animation:fadeUp .18s ease}
+.modal-hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;gap:12px}
+.modal-title{font-family:ui-rounded,"SF Pro Rounded",-apple-system,sans-serif;font-size:16px;font-weight:800;color:var(--text);word-break:break-all}
+.modal-close{background:var(--surface2);border:none;color:var(--text2);font-size:16px;cursor:pointer;padding:6px 10px;border-radius:var(--r-pill);line-height:1;flex-shrink:0}
+.modal-close:hover{background:var(--surface-press);color:var(--text)}
+.modal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px 24px}
+.modal-item{display:flex;flex-direction:column;gap:3px}
+.modal-lbl{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+.modal-val{font-size:13px;color:var(--text);word-break:break-all}
+.modal-val.nil{color:var(--text2)}
+
+/* Collapsible rules */
+/* Routing Rules — Miuix list treatment: no full-width rules between rows,
+   rounded hover surfaces, numeric columns clustered right with tabular digits,
+   child upstream rows as an inset rounded sub-surface. */
+.rules-table td{border-top:none;padding:13px 12px}
+.rules-table th.num-col,.rules-table td.num-cell{text-align:right;width:84px}
+.rules-table td.num-cell{font-variant-numeric:tabular-nums}
+.rules-table th:last-child,.rules-table td:last-child{padding-right:18px}
+.rule-row{cursor:pointer;user-select:none}
+.rule-row td:first-child{border-radius:var(--r-m) 0 0 var(--r-m)}
+.rule-row td:last-child{border-radius:0 var(--r-m) var(--r-m) 0}
+.rule-row:hover td{background:var(--surface2)}
+.rule-toggle{display:inline-block;width:14px;color:var(--text2);font-size:10px;margin-right:6px;transition:transform .18s ease}
+.rule-toggle.open{transform:rotate(90deg)}
+.upstream-row td{background:var(--surface2);font-size:12.5px}
+.upstream-row:hover td{background:var(--surface-press)}
+.upstream-row.grp-first td:first-child{border-top-left-radius:var(--r-m)}
+.upstream-row.grp-first td:last-child{border-top-right-radius:var(--r-m)}
+.upstream-row.grp-last td:first-child{border-bottom-left-radius:var(--r-m)}
+.upstream-row.grp-last td:last-child{border-bottom-right-radius:var(--r-m)}
+.tag-static{background:var(--surface2);color:var(--text2)}
+
+.arch-count{font-size:11.5px;color:var(--text2);margin-bottom:10px;padding:0 4px}
+.archive-controls{display:none;margin-bottom:14px;padding:14px 16px;background:var(--surface2);border-radius:var(--r-l)}
+.archive-range{width:100%;min-width:0}
+.archive-range-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}
+.archive-range-title{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+.archive-range-value{font-size:12px;color:var(--text);font-variant-numeric:tabular-nums;text-align:right}
+.range-slider{height:24px;position:relative;margin:0 8px}
+.range-slider-track,.range-slider-fill{position:absolute;left:0;right:0;top:10px;height:4px;border-radius:2px}
+.range-slider-track{background:var(--border)}
+.range-slider-fill{right:auto;background:var(--accent)}
+.range-slider input[type=range]{position:absolute;inset:0;width:100%;height:24px;margin:0;background:transparent;appearance:none;-webkit-appearance:none;pointer-events:none;outline:none}
+.range-slider input[type=range]::-webkit-slider-runnable-track{height:4px;background:transparent}
+.range-slider input[type=range]::-webkit-slider-thumb{width:18px;height:18px;margin-top:-7px;border:3px solid var(--accent);border-radius:50%;background:var(--surface);box-shadow:0 1px 4px rgba(0,0,0,.3);appearance:none;-webkit-appearance:none;pointer-events:auto;cursor:grab}
+.range-slider input[type=range]:active::-webkit-slider-thumb{cursor:grabbing;background:var(--accent)}
+.range-slider input[type=range]::-moz-range-track{height:4px;background:transparent}
+.range-slider input[type=range]::-moz-range-thumb{width:14px;height:14px;border:3px solid var(--accent);border-radius:50%;background:var(--surface);box-shadow:0 1px 4px rgba(0,0,0,.3);pointer-events:auto;cursor:grab}
+.range-slider input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 4px var(--accent-dim)}
+.range-slider input[type=range]:focus-visible::-moz-range-thumb{box-shadow:0 0 0 4px var(--accent-dim)}
+.range-slider input[type=range]:disabled::-webkit-slider-thumb{border-color:var(--text2);cursor:not-allowed}
+.range-slider input[type=range]:disabled::-moz-range-thumb{border-color:var(--text2);cursor:not-allowed}
+.archive-range-limits{display:flex;justify-content:space-between;gap:12px;margin-top:4px;color:var(--text2);font-size:11px;font-variant-numeric:tabular-nums}
+.archive-range-reset{border:0;background:none;color:var(--accent);font:inherit;font-size:11px;font-weight:700;cursor:pointer;padding:0;white-space:nowrap}
+.archive-range-reset:hover{text-decoration:underline}
+.archive-range-reset:disabled{color:var(--text2);cursor:default;text-decoration:none}
+.archive-pager{display:none;align-items:center;justify-content:center;gap:10px;margin-top:14px;padding-bottom:16px}
+.archive-page-label{font-size:12px;color:var(--text2);min-width:64px;text-align:center;font-weight:600}
+
+/* Range buttons (segmented pill control) */
+
+/* Rules table */
+.tag-pill{display:inline-block;padding:2px 9px;border-radius:var(--r-pill);font-size:11px;font-weight:700;margin:1px 2px}
+.tag-include{background:rgba(47,180,99,.13);color:var(--green)}
+.tag-exclude{background:rgba(255,59,48,.13);color:var(--red)}
+.tag-catchall{color:var(--text2);font-style:italic}
+
+/* Mode toggle (segmented pill control) */
+.mode-btns{display:inline-flex;gap:2px;padding:3px;background:var(--surface2);border-radius:var(--r-pill);flex-shrink:0}
+.mode-btn{padding:7px 15px;background:transparent;border:none;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--text2);border-radius:var(--r-pill);transition:background .15s,color .15s;white-space:nowrap}
+.mode-btn:hover{color:var(--text)}
+.mode-btn.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
+
+/* File picker */
+.file-picker{background:var(--surface2);border-radius:var(--r-l);margin-bottom:14px;overflow:hidden}
+.file-picker-empty{padding:16px;color:var(--text2);font-size:13px;text-align:center}
+.file-item{display:flex;align-items:center;gap:12px;padding:11px 16px;cursor:pointer;border-top:1px solid var(--border);transition:background .1s;user-select:none}
+.file-item:first-child{border-top:none}
+.file-item:hover{background:var(--surface-press)}
+.file-item.selected{background:var(--accent-dim)}
+.fi-dot{width:8px;height:8px;border-radius:50%;border:1.5px solid var(--text2);flex-shrink:0;transition:background .12s,border-color .12s}
+.file-item.selected .fi-dot{background:var(--accent);border-color:var(--accent)}
+.fi-info{flex:1;min-width:0}
+.fi-range{font-size:13px;color:var(--text);font-weight:600}
+.fi-name{font-size:11px;color:var(--text2);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fi-size{font-size:12px;color:var(--text2);white-space:nowrap;flex-shrink:0}
+
+/* Upstream health dot */
+.health-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0;vertical-align:middle;margin-right:6px}
+.health-good{background:var(--green)}
+.health-warn{background:var(--amber)}
+.health-bad{background:var(--red)}
+.health-idle{background:var(--border)}
+
+/* Auth overlay */
+#auth-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px)}
+#auth-box{background:var(--surface);border-radius:var(--r-xl);box-shadow:0 24px 64px rgba(0,0,0,.28);padding:34px 36px;width:320px;text-align:center}
+#auth-box h2{font-family:ui-rounded,"SF Pro Rounded",-apple-system,sans-serif;margin-bottom:6px;font-size:19px;font-weight:800;color:var(--text)}
+#auth-box p{color:var(--text2);font-size:13px;margin-bottom:18px}
+#auth-input{width:100%;padding:10px 14px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;margin-bottom:12px;outline:none;border-radius:var(--r-pill);text-align:center;transition:border-color .12s,box-shadow .12s}
+#auth-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+#auth-btn{width:100%;padding:11px;background:var(--accent);color:var(--accent-ink);border:none;font-size:13px;cursor:pointer;font-weight:700;border-radius:var(--r-pill);transition:filter .12s}
+#auth-btn:hover{filter:brightness(1.08)}
+
+@media(max-width:1400px){
+  .stat-grid{grid-template-columns:repeat(3,1fr)}
+}
+@media(max-width:900px){
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:600px){
+  #sidebar{width:56px;padding:20px 6px}
+  #sidebar-title,#sidebar-title span,.nav-item span{display:none}
+  .nav-item{justify-content:center;padding:10px}
+  #main{padding:16px}
+  .theme-switch{flex-direction:column}
+}
+</style>
+</head>
+<body>
+<div id="detail-modal" class="modal-overlay" style="display:none" onclick="handleModalClick(event)">
+  <div class="modal-card">
+    <div class="modal-hdr">
+      <span class="modal-title" id="modal-title">Query Detail</span>
+      <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+        <button class="modal-close" id="modal-copy-btn" onclick="copyModalDomain()" title="Copy domain">⎘</button>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+    </div>
+    <div class="modal-grid" id="modal-grid"></div>
+  </div>
+</div>
+
+<div id="auth-overlay" style="display:none">
+  <div id="auth-box">
+    <h2>pathdns</h2>
+    <p>Enter your API token to continue</p>
+    <input id="auth-input" type="password" placeholder="Bearer token" autocomplete="current-password">
+    <button id="auth-btn" onclick="submitToken()">Sign in</button>
+  </div>
+</div>
+
+<div id="sidebar">
+  <div id="sidebar-title">path<span>dns</span></div>
+  <nav>
+    <a class="nav-item active" href="#dashboard" onclick="showView('dashboard');return false" data-view="dashboard">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span>Dashboard</span>
+    </a>
+    <a class="nav-item" href="#querylog" onclick="showView('querylog');return false" data-view="querylog">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 8h6M9 16h4M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z"/></svg>
+      <span>Query Log</span>
+    </a>
+  </nav>
+  <div class="theme-switch" role="group" aria-label="Theme">
+    <button class="theme-btn" data-theme-choice="light" onclick="setTheme('light')" title="Light">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    </button>
+    <button class="theme-btn" data-theme-choice="dark" onclick="setTheme('dark')" title="Dark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+    </button>
+    <button class="theme-btn active" data-theme-choice="auto" onclick="setTheme('auto')" title="Follow system">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+    </button>
+  </div>
+</div>
+
+<div id="main">
+
+  <!-- Dashboard -->
+  <div id="view-dashboard" class="view active">
+    <div class="view-title">Dashboard</div>
+
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Total Queries</div>
+          <div class="stat-value" id="stat-queries">—</div>
+          <div class="stat-sub" id="stat-qps">— qps now</div>
+        </div>
+        <div class="spark" id="spark-queries"></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Cache Hit Rate</div>
+          <div class="stat-value" id="stat-cache-rate">—</div>
+          <div class="stat-sub" id="stat-cache-hits">— hits</div>
+        </div>
+        <div class="spark" id="spark-cache-rate"></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Filtered</div>
+          <div class="stat-value" id="stat-filtered">—</div>
+        </div>
+        <div class="spark" id="spark-filtered"></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Hedged</div>
+          <div class="stat-value" id="stat-hedged">—</div>
+          <div class="stat-sub">racing fallback fires</div>
+        </div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Drops</div>
+          <div class="stat-value" id="stat-drops">—</div>
+          <div class="stat-sub" id="stat-drops-sub">send/inflight/trunc</div>
+        </div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-box-body">
+          <div class="stat-label">Avg Resolution</div>
+          <div class="stat-value" id="stat-rtt">—</div>
+          <div class="stat-sub" id="stat-rtt-sub">current average</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Routing Rules</div>
+      <div style="overflow-x:auto">
+        <table class="rules-table">
+          <thead><tr>
+            <th style="width:24px"></th><th>Server</th><th>Match Rules</th><th class="num-col">OK</th><th class="num-col">Errors</th><th class="num-col">Timeouts</th><th class="num-col">Cancelled</th><th class="num-col" style="width:96px">Avg RTT</th>
+          </tr></thead>
+          <tbody id="rules-tbody"><tr><td colspan="8" style="color:var(--text2);text-align:center">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Query Log -->
+  <div id="view-querylog" class="view">
+    <div class="view-title">Query Log</div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="mode-btns">
+          <button class="mode-btn active" data-mode="live" onclick="switchMode('live')">Live</button>
+          <button class="mode-btn" data-mode="archive" onclick="switchMode('archive')">Archive</button>
+        </div>
+        <input id="ql-filter" type="text"
+               placeholder="Search…"
+               title="Space-separated terms, all must match (AND). A bare word matches the domain. Prefixes: rcode:  source:  upstream:  client:  type: — value can be a name or number. Prefix a term with - to exclude. Examples: mi.com rcode:NXDOMAIN · upstream:domestic -source:cache"
+               oninput="filterChanged()">
+        <button class="btn btn-danger" id="ql-clear-btn" onclick="clearLog()">Clear</button>
+        <label class="toggle-label" id="ql-auto-label"><input type="checkbox" id="ql-auto" checked onchange="toggleAuto()"><span class="toggle-track"></span>Auto-refresh</label>
+      </div>
+
+      <!-- Archive file picker -->
+      <div id="file-picker" class="file-picker" style="display:none"></div>
+      <div id="archive-controls" class="archive-controls">
+        <div class="archive-range">
+          <div class="archive-range-head">
+            <span class="archive-range-title">Time range</span>
+            <span id="arch-range-value" class="archive-range-value">Select an archived log</span>
+            <button id="arch-range-reset" class="archive-range-reset" onclick="resetArchiveRange()" disabled>Full range</button>
+          </div>
+          <div class="range-slider">
+            <div class="range-slider-track"></div>
+            <div id="arch-range-fill" class="range-slider-fill" style="left:0;width:100%"></div>
+            <input id="arch-range-start" type="range" min="0" max="10000" value="0" aria-label="Start time"
+              oninput="previewArchiveRange('start')" onchange="commitArchiveRange()" disabled>
+            <input id="arch-range-end" type="range" min="0" max="10000" value="10000" aria-label="End time"
+              oninput="previewArchiveRange('end')" onchange="commitArchiveRange()" disabled>
+          </div>
+          <div class="archive-range-limits">
+            <span id="arch-range-min">—</span><span id="arch-range-max">—</span>
+          </div>
+        </div>
+      </div>
+      <div id="arch-count" class="arch-count" style="display:none"></div>
+
+      <div style="overflow-x:auto">
+        <table id="ql-table">
+          <thead><tr>
+            <th>Time</th><th>Client</th><th>QName</th>
+            <th>Type</th><th>RCode</th><th>Elapsed</th><th>Source</th>
+            <th>Upstream</th>
+          </tr></thead>
+          <tbody id="ql-tbody"><tr><td colspan="8" style="color:var(--text2);text-align:center">No entries</td></tr></tbody>
+        </table>
+      </div>
+      <div class="more-btn-wrap">
+        <button class="btn" id="ql-more" onclick="loadMore()" style="display:none">Load more</button>
+      </div>
+      <div id="archive-pager" class="archive-pager">
+        <button class="btn" id="arch-prev" onclick="archivePrev()">Previous</button>
+        <span id="arch-page-label" class="archive-page-label">Page 1</span>
+        <button class="btn" id="arch-next" onclick="archiveNext()">Next</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('pathdns_token') || '';
+let currentView = 'dashboard';
+let sseSource = null;   // active EventSource for live querylog
+let qlAfterSeq = null;  // highest seq seen; used for SSE dedup and delta fetch
+let dashTimer = null;
+let filterTimer = null;
+let savedAutoRefresh = null; // auto-refresh state saved while in archive mode
+
+// ── Theme (light/dark/auto) ─────────────────────────────────────────────────────
+const THEME_KEY = 'pathdns-theme';
+
+function applyTheme(choice) {
+  if (choice === 'light' || choice === 'dark') document.documentElement.setAttribute('data-theme', choice);
+  else document.documentElement.removeAttribute('data-theme');
+  document.querySelectorAll('.theme-btn').forEach(b => b.classList.toggle('active', b.dataset.themeChoice === choice));
+}
+
+function setTheme(choice) {
+  try { localStorage.setItem(THEME_KEY, choice); } catch (e) {}
+  applyTheme(choice);
+}
+
+applyTheme((() => { try { return localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) { return 'auto'; } })());
+
+// ── Search filter ─────────────────────────────────────────────────────────────
+// The single search box is parsed into a list of predicates (see parseFilter),
+// applied client-side in live mode and translated to server query params in
+// archive mode. Recognized `key:value` prefixes; a bare word matches the domain.
+const FILTER_KEYS = new Set(['rcode', 'source', 'upstream', 'client', 'type', 'domain', 'qname']);
+let qlFilterSpec = [];
+
+// ── Query log mode state ──────────────────────────────────────────────────────
+let qlMode = 'live';
+let qlEvents = [];
+let qlBeforeSeq = null;
+let archFiles = [];
+let archFile = null;
+let archEvents = [];
+let archCursor = null;
+let archNextCursor = null;
+let archCursorStack = [];
+let archPage = 1;
+let archMeta = null;
+let archRangeMin = null;
+let archRangeMax = null;
+let archRangeFrom = null;
+let archRangeTo = null;
+let archRangeCommittedFrom = null;
+let archRangeCommittedTo = null;
+const ARCH_RANGE_STEPS = 10000;
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+function api(path, opts) {
+  return fetch(path, {
+    headers: TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {},
+    ...opts
+  });
+}
+
+async function tryFetch(path, opts) {
+  try {
+    const r = await api(path, opts);
+    if (r.status === 401) { showAuth(); return null; }
+    return r;
+  } catch(e) { return null; }
+}
+
+function showAuth() {
+  document.getElementById('auth-overlay').style.display = 'flex';
+}
+
+function submitToken() {
+  TOKEN = document.getElementById('auth-input').value.trim();
+  sessionStorage.setItem('pathdns_token', TOKEN);
+  document.getElementById('auth-overlay').style.display = 'none';
+  if (currentView === 'querylog' && qlMode === 'live') {
+    closeSSE();
+    if (document.getElementById('ql-auto').checked) openSSE();
+  }
+  refreshAll();
+}
+
+// ── SSE (live querylog push) ──────────────────────────────────────────────────
+
+function openSSE() {
+  closeSSE();
+  const params = new URLSearchParams();
+  if (TOKEN) params.set('token', TOKEN);
+  // last_seq for initial URL; on reconnect browser sends Last-Event-Id header automatically
+  if (qlAfterSeq !== null) params.set('last_seq', String(qlAfterSeq));
+  const url = '/api/querylog/stream?' + params.toString();
+  sseSource = new EventSource(url);
+  sseSource.onmessage = handleSSEEvent;
+  // onerror: EventSource reconnects automatically; no action needed
+}
+
+function closeSSE() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+}
+
+function handleSSEEvent(e) {
+  let ev;
+  try { ev = JSON.parse(e.data); } catch { return; }
+  // Guard the shape too, not just JSON-validity: a malformed/partial payload
+  // (missing seq/qname) would otherwise throw inside this handler further
+  // down (ev.qname.includes, seq comparisons), silently dropping the event
+  // and poisoning qlAfterSeq with undefined instead of just skipping it.
+  if (!ev || typeof ev.qname !== 'string' || !Number.isFinite(ev.seq)) return;
+  // Deduplicate against events already shown from initial loadQueryLog()
+  if (qlAfterSeq !== null && ev.seq <= qlAfterSeq) return;
+  if (qlAfterSeq === null || ev.seq > qlAfterSeq) qlAfterSeq = ev.seq;
+  qlEvents.unshift(ev);
+  if (qlEvents.length > 1000) qlEvents.pop();
+  // Skip if the current search filter excludes this event.
+  if (!matchesSpec(ev, qlFilterSpec)) return;
+  prependEventRow(ev);
+}
+
+document.getElementById('auth-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitToken();
+});
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+
+function showView(v) {
+  document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById('view-' + v);
+  if (!el) return;
+  el.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(el => {
+    if (el.dataset.view === v) el.classList.add('active');
+  });
+  currentView = v;
+  history.replaceState(null, '', v === 'dashboard' ? location.pathname : '#' + v);
+  if (v === 'dashboard') {
+    closeSSE();
+    loadDashboard();
+  } else if (v === 'querylog') {
+    if (qlMode === 'live') {
+      qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
+      loadQueryLog().then(() => {
+        if (document.getElementById('ql-auto').checked) openSSE();
+      });
+    } else if (archFiles.length === 0) loadArchiveFiles();
+    else if (archFile) renderArchiveView();
+  }
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+// The dashboard shows a single fixed window: the last 24 hours, rendered as 24
+// hourly sparkline buckets. This matches the stats ring's retention.
+const STATS_WINDOW_SECS = 86400;
+const STATS_BUCKETS = 24;
+
+const QTYPE_NAMES = {1:'A',2:'NS',5:'CNAME',6:'SOA',12:'PTR',15:'MX',16:'TXT',17:'RP',28:'AAAA',33:'SRV',35:'NAPTR',36:'KX',37:'CERT',39:'DNAME',43:'DS',44:'SSHFP',45:'IPSECKEY',46:'RRSIG',47:'NSEC',48:'DNSKEY',49:'DHCID',50:'NSEC3',51:'NSEC3PARAM',52:'TLSA',55:'HIP',59:'CDS',60:'CDNSKEY',61:'OPENPGPKEY',63:'SMIMEA',64:'SVCB',65:'HTTPS',99:'SPF',255:'ANY',256:'URI',257:'CAA'};
+function qtypeName(n) { return QTYPE_NAMES[n] || ('TYPE' + n); }
+
+let lastRuleData = null;
+let lastUpstreamData = null;
+let expandedRules = new Set();
+
+async function loadRulesAndUpstreams() {
+  try {
+    const [rg, ru] = await Promise.all([tryFetch('/api/rules'), tryFetch('/api/upstreams')]);
+    if (!rg || !ru) return;
+    const [rules, upstreamRules] = await Promise.all([rg.json(), ru.json()]);
+    lastRuleData = rules;
+    lastUpstreamData = upstreamRules;
+    renderRulesAndUpstreams(rules, upstreamRules);
+  } catch(e) {}
+}
+
+function toggleRule(i) {
+  if (expandedRules.has(i)) expandedRules.delete(i);
+  else expandedRules.add(i);
+  renderRulesAndUpstreams(lastRuleData, lastUpstreamData);
+}
+
+function renderRulesAndUpstreams(rules, upstreamRules) {
+  const tbody = document.getElementById('rules-tbody');
+  if (!rules || !rules.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text2);text-align:center">No rules configured</td></tr>';
+    return;
+  }
+  const upMap = {};
+  if (upstreamRules) {
+    for (const us of upstreamRules) upMap[us.server] = us.nodes || [];
+  }
+  const nil = '<span style="color:var(--text2)">—</span>';
+  // Numeric cell, colored only when non-zero — a red/amber "0" reads as an
+  // alert where there is none, so zeros recede into the secondary color.
+  const numCell = (v, color) =>
+    '<td class="num-cell" style="color:' + (v > 0 ? color : 'var(--text2)') + '">' + fmt(v) + '</td>';
+  const frag = document.createDocumentFragment();
+  rules.forEach((g, i) => {
+    const nodes = upMap[g.server] || [];
+    const isExpanded = expandedRules.has(i);
+    let totalOk = 0, totalErr = 0, totalTimeout = 0, totalCancelled = 0, totalRttUs = 0, rttCount = 0;
+    for (const n of nodes) {
+      totalOk        += n.queries_ok;
+      totalErr       += n.queries_err;
+      totalTimeout   += n.queries_timeout;
+      totalCancelled += n.queries_cancelled;
+      if (n.avg_rtt_us > 0) { totalRttUs += n.avg_rtt_us; rttCount++; }
+    }
+    const avgRtt = rttCount > 0 ? Math.round(totalRttUs / rttCount) : 0;
+    let namePart = '<strong>' + esc(g.server) + '</strong>';
+    let tagsPart = (!g.matcher || !g.matcher.length)
+      ? '<span class="tag-catchall">catch-all</span>'
+      : g.matcher.map(m => {
+          if (m.kind === 'domain') {
+            return '<span class="tag-pill tag-include">' + esc(m.pattern) + '</span>';
+          }
+          const tagPill = (t, prefix) => {
+            const c = t.count > 0 ? ' (' + fmtCount(t.count) + ')' : '';
+            return '<span class="tag-pill ' + (prefix ? 'tag-exclude' : 'tag-include') + '">'
+              + (prefix ? '!' : '') + esc(t.tag) + c + '</span>';
+          };
+          const inc = (m.include || []).map(t => tagPill(t, false)).join('');
+          const exc = (m.exclude || []).map(t => tagPill(t, true)).join('');
+          return inc + exc;
+        }).join('');
+    const chev = '<span class="rule-toggle' + (isExpanded ? ' open' : '') + '">'
+      + (nodes.length > 0 ? '▸' : '') + '</span>';
+    let statCells;
+    if (nodes.length) {
+      statCells =
+        numCell(totalOk, 'var(--green)') +
+        numCell(totalErr, 'var(--red)') +
+        numCell(totalTimeout, 'var(--amber)') +
+        numCell(totalCancelled, 'var(--text)') +
+        '<td class="num-cell">' + (avgRtt > 0 ? fmtRtt(avgRtt) : nil) + '</td>';
+    } else if (upstreamRules) {
+      // A server absent from /api/upstreams has no real upstream nodes — it's a
+      // fixed-answer server. One quiet label beats a row of five dashes.
+      statCells = '<td colspan="5" class="num-cell"><span class="tag-pill tag-static">static</span></td>';
+    } else {
+      // Upstream stats unavailable (fetch failed): don't guess, show dashes.
+      statCells = ('<td class="num-cell">' + nil + '</td>').repeat(5);
+    }
+    const tr = document.createElement('tr');
+    tr.className = 'rule-row';
+    if (nodes.length > 0) tr.onclick = () => toggleRule(i);
+    tr.innerHTML =
+      '<td style="width:24px;text-align:center">' + chev + '</td>' +
+      '<td>' + namePart + '</td>' +
+      '<td style="white-space:normal;max-width:240px">' + tagsPart + '</td>' +
+      statCells;
+    frag.appendChild(tr);
+    if (isExpanded) {
+      nodes.forEach((n, j) => {
+        const errTotal = n.queries_err;
+        const total = n.queries_ok + errTotal + n.queries_timeout;
+        const errRate = total > 0 ? (errTotal + n.queries_timeout) / total : 0;
+        const dotCls = total === 0 ? 'health-idle' : errRate < 0.05 ? 'health-good' : errRate < 0.2 ? 'health-warn' : 'health-bad';
+        const utr = document.createElement('tr');
+        utr.className = 'upstream-row'
+          + (j === 0 ? ' grp-first' : '')
+          + (j === nodes.length - 1 ? ' grp-last' : '');
+        utr.innerHTML =
+          '<td></td>' +
+          '<td colspan="2"><span class="health-dot ' + dotCls + '"></span>' + esc(n.addr) + '</td>' +
+          numCell(n.queries_ok, 'var(--green)') +
+          numCell(n.queries_err, 'var(--red)') +
+          numCell(n.queries_timeout, 'var(--amber)') +
+          numCell(n.queries_cancelled, 'var(--text)') +
+          '<td class="num-cell">' + fmtRtt(n.avg_rtt_us) + '</td>';
+        frag.appendChild(utr);
+      });
+    }
+  });
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function fmtCount(n) {
+  return n >= 1000 ? (n/1000).toFixed(0)+'K' : String(n);
+}
+
+async function loadDashboard() {
+  const [r1, r2] = await Promise.all([
+    tryFetch('/api/stats'),
+    tryFetch('/api/stats/buckets?seconds=' + STATS_WINDOW_SECS + '&buckets=' + STATS_BUCKETS),
+  ]);
+  if (!r1 || !r2 || !r1.ok || !r2.ok) return;
+  let live, bkts;
+  try {
+    [live, bkts] = await Promise.all([r1.json(), r2.json()]);
+  } catch {
+    // Self-heals on the next 5s tick; just skip this refresh rather than
+    // throwing an unhandled rejection from the dashTimer callback.
+    return;
+  }
+
+  // Summary numbers come from the cumulative counters, so they read correctly
+  // from the first refresh — the windowed ring is empty for the first minute
+  // after startup, which made these look stuck at 0. The sparklines below still
+  // show the windowed 24h trend.
+  const q = live.queries_total || 0;
+  const cHits = live.cache_hits || 0;
+  const hitRate = q > 0 ? (cHits / q * 100).toFixed(1) : '0.0';
+
+  document.getElementById('stat-queries').textContent    = fmt(q);
+  document.getElementById('stat-qps').textContent        = (live.qps_now || 0) + ' qps now';
+  document.getElementById('stat-cache-rate').textContent = hitRate + '%';
+  document.getElementById('stat-cache-hits').textContent = fmt(cHits) + ' hits';
+  document.getElementById('stat-filtered').textContent = fmt(live.filtered || 0);
+
+  // Live-only cards (not range-based)
+  document.getElementById('stat-hedged').textContent = fmt(live.hedged_queries || 0);
+  document.getElementById('stat-rtt').textContent = fmtRtt(live.avg_resolution_us);
+  // Kernel→userspace ingress latency peak (SO_TIMESTAMPNS): scheduling/queue jitter,
+  // distinct from upstream RTT. High values point to a starved worker, not a slow upstream.
+  const ingressUs = live.udp_recv_lat_us || 0;
+  const ingressTxt = ingressUs >= 1000 ? (ingressUs / 1000).toFixed(1) + 'ms' : ingressUs + 'µs';
+  document.getElementById('stat-rtt-sub').textContent = 'avg · ingress peak ' + ingressTxt;
+
+  // Drops / loss health: any non-zero value means dropped packets or shedding.
+  // rx = kernel receive-buffer overflow (SO_RXQ_OVFL), send = response send drops,
+  // inflight = overload shedding (client got SERVFAIL).
+  const dRx = live.udp_rx_overflow || 0, dSend = live.udp_send_drops || 0;
+  const dIn = live.inflight_drops || 0, dTrunc = live.udp_truncated || 0;
+  const dErr = live.udp_send_errors || 0;
+  const dTotal = dRx + dSend + dIn + dTrunc + dErr;
+  const dEl = document.getElementById('stat-drops');
+  dEl.textContent = fmt(dTotal);
+  dEl.style.color = dTotal > 0 ? 'var(--red)' : 'var(--text2)';
+  // buf = peak receive-buffer occupancy this second (SO_MEMINFO); a leading
+  // indicator that climbs toward 100% just before rx overflow drops begin.
+  const dBuf = live.udp_rmem_pct || 0;
+  document.getElementById('stat-drops-sub').textContent =
+    'rx ' + fmt(dRx) + ' · send ' + fmt(dSend) + ' · buf ' + dBuf + '%';
+
+  // Sparklines — each array is one value per bucket; sum = displayed number
+  lastBuckets = bkts;
+  redrawSparklines(bkts);
+  loadRulesAndUpstreams();
+}
+
+// ── Sparklines ────────────────────────────────────────────────────────────────
+
+let lastBuckets = [];
+
+// SVG rather than canvas: a gradient-filled area under a smooth 2px line with
+// an emphasized endpoint dot, per the dashboard's line-chart mark spec. Colors
+// are passed as CSS custom-property references (e.g. "var(--accent)") so the
+// chart re-tints automatically on a light/dark theme change with no redraw.
+function drawSparkline(id, data, color) {
+  const el = document.getElementById(id);
+  if (!el || !data || data.length < 2) return;
+  const W = el.clientWidth;
+  const H = el.clientHeight || 36;
+  if (W <= 0) return;
+  const n = data.length;
+  const max = Math.max(...data, 1);
+  const TOP = 4, BOTTOM = 4;
+  const xp = i => W * i / (n - 1);
+  const yp = v => H - (v / max) * (H - TOP - BOTTOM) - BOTTOM;
+  let d = `M ${xp(0)} ${yp(data[0])}`;
+  for (let i = 1; i < n; i++) {
+    const mx = (xp(i-1) + xp(i)) / 2;
+    d += ` C ${mx} ${yp(data[i-1])}, ${mx} ${yp(data[i])}, ${xp(i)} ${yp(data[i])}`;
+  }
+  const areaD = `${d} L ${W} ${H} L 0 ${H} Z`;
+  const gid = 'sg-' + id;
+  const flat = data.every(v => v === data[0]);
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <path d="${areaD}" fill="url(#${gid})"/>
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    ${flat ? '' : `<circle cx="${xp(n-1)}" cy="${yp(data[n-1])}" r="2.5" fill="${color}"/>`}
+  </svg>`;
+}
+
+function redrawSparklines(bkts) {
+  drawSparkline('spark-queries',       bkts.map(b => b.queries),                   'var(--accent)');
+  drawSparkline('spark-cache-rate',    bkts.map(b => b.cache_hit_rate_pct),        'var(--green)');
+  drawSparkline('spark-filtered',      bkts.map(b => b.filtered),                 'var(--text2)');
+}
+
+window.addEventListener('resize', () => {
+  if (currentView === 'dashboard' && lastBuckets.length) redrawSparklines(lastBuckets);
+});
+
+// ── Query Log — mode switching ─────────────────────────────────────────────────
+
+function switchMode(mode) {
+  if (qlMode === mode) return;
+  qlMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  const isArchive = mode === 'archive';
+  document.getElementById('file-picker').style.display = isArchive ? 'block' : 'none';
+  document.getElementById('ql-clear-btn').style.display = isArchive ? 'none' : '';
+  document.getElementById('ql-auto-label').style.display = isArchive ? 'none' : '';
+  document.getElementById('arch-count').style.display = isArchive ? 'block' : 'none';
+  document.getElementById('archive-controls').style.display = isArchive ? 'flex' : 'none';
+  document.getElementById('archive-pager').style.display = isArchive ? 'flex' : 'none';
+  document.getElementById('ql-more').style.display = isArchive ? 'none' : document.getElementById('ql-more').style.display;
+
+  if (isArchive) {
+    closeSSE();
+    savedAutoRefresh = document.getElementById('ql-auto').checked;
+    document.getElementById('ql-auto').checked = false;
+    if (archFiles.length === 0) loadArchiveFiles();
+    else { renderFilePicker(); if (archFile) renderArchiveView(); }
+  } else {
+    document.getElementById('arch-count').textContent = '';
+    qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
+    if (savedAutoRefresh !== null) {
+      document.getElementById('ql-auto').checked = savedAutoRefresh;
+      savedAutoRefresh = null;
+    }
+    loadQueryLog().then(() => {
+      if (document.getElementById('ql-auto').checked) openSSE();
+    });
+  }
+}
+
+// ── Query Log — live mode ─────────────────────────────────────────────────────
+
+async function loadQueryLog() {
+  // Live mode filters entirely client-side (the ring is bounded and held in
+  // qlEvents), so the fetch is unfiltered and matchesSpec runs at render time.
+  let url = '/api/querylog?limit=100';
+  if (qlBeforeSeq !== null) url += '&before_seq=' + qlBeforeSeq;
+
+  const r = await tryFetch(url);
+  if (!r || !r.ok) return;
+  let events;
+  try {
+    events = await r.json();
+    if (!Array.isArray(events)) throw new Error('not an array');
+  } catch {
+    return;
+  }
+
+  if (qlBeforeSeq === null) qlEvents = events;
+  else qlEvents = qlEvents.concat(events);
+
+  // Track the highest seq for SSE deduplication and reconnect backfill
+  for (const ev of events) {
+    if (qlAfterSeq === null || ev.seq > qlAfterSeq) qlAfterSeq = ev.seq;
+  }
+
+  renderQueryLog(qlEvents);
+
+  const moreBtn = document.getElementById('ql-more');
+  if (events.length >= 100) {
+    qlBeforeSeq = Math.min(...events.map(e => e.seq));
+    moreBtn.style.display = 'inline-block';
+  } else {
+    moreBtn.style.display = 'none';
+  }
+}
+
+// ── Query Log — archive mode ──────────────────────────────────────────────────
+
+function parseFileTime(name) {
+  const m = name.match(/querylog-(\d+)/);
+  if (!m) return null;
+  const us = parseInt(m[1], 10);
+  return (us > 1e12) ? new Date(us / 1000) : null;
+}
+
+function formatDateTime(date, includeSeconds = false) {
+  if (!date) return '—';
+  const p = n => String(n).padStart(2,'0');
+  const now = new Date();
+  const dp = date.getFullYear() === now.getFullYear()
+    ? p(date.getMonth()+1) + '-' + p(date.getDate())
+    : date.getFullYear() + '-' + p(date.getMonth()+1) + '-' + p(date.getDate());
+  const seconds = includeSeconds ? ':' + p(date.getSeconds()) : '';
+  return dp + ' ' + p(date.getHours()) + ':' + p(date.getMinutes()) + seconds;
+}
+
+function dateFromMicros(micros) {
+  return micros ? new Date(Number(micros) / 1000) : null;
+}
+
+function fmtBytes(n) {
+  if (!n) return '—';
+  if (n >= 1024*1024) return (n/1024/1024).toFixed(1)+' MB';
+  if (n >= 1024) return (n/1024).toFixed(0)+' KB';
+  return n+' B';
+}
+
+async function loadArchiveFiles() {
+  const picker = document.getElementById('file-picker');
+  picker.innerHTML = '<div class="file-picker-empty">Loading…</div>';
+  const r = await tryFetch('/api/querylog/files');
+  if (!r || !r.ok) { picker.innerHTML = '<div class="file-picker-empty">Failed to load files</div>'; return; }
+  let raw;
+  try {
+    raw = await r.json();
+    if (!Array.isArray(raw)) throw new Error('not an array');
+  } catch {
+    picker.innerHTML = '<div class="file-picker-empty">Failed to load files</div>';
+    return;
+  }
+  archFiles = raw
+    .map(f => ({...f, time: dateFromMicros(f.start_micros) || parseFileTime(f.name)}))
+    .sort((a,b) => (b.time||0) - (a.time||0));
+  renderFilePicker();
+  if (archFiles.length > 0) selectArchiveFile(archFiles[0].name);
+  else renderQueryLog([]);
+}
+
+function renderFilePicker() {
+  const picker = document.getElementById('file-picker');
+  if (!archFiles.length) {
+    picker.innerHTML = '<div class="file-picker-empty">No archived log files available</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  archFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item' + (f.name === archFile ? ' selected' : '');
+    div.onclick = () => selectArchiveFile(f.name);
+    const startTime = dateFromMicros(f.start_micros) || f.time;
+    const endTime = dateFromMicros(f.end_micros) || (i === 0 ? new Date() : archFiles[i-1].time);
+    const startStr = formatDateTime(startTime);
+    const endStr = formatDateTime(endTime);
+    const rangeStr = startTime ? startStr + '  →  ' + endStr : f.name;
+    const countStr = f.total_entries === null || f.total_entries === undefined
+      ? 'legacy · count unavailable'
+      : Number(f.total_entries).toLocaleString() + ' entries';
+    div.innerHTML =
+      '<div class="fi-dot"></div>' +
+      '<div class="fi-info"><div class="fi-range">' + esc(rangeStr) + '</div><div class="fi-name">' + esc(countStr + ' · ' + f.name) + '</div></div>' +
+      '<div class="fi-size">' + fmtBytes(f.size_bytes) + '</div>';
+    frag.appendChild(div);
+  });
+  picker.innerHTML = '';
+  picker.appendChild(frag);
+}
+
+function selectArchiveFile(name) {
+  if (archFile === name) return;
+  archFile = name;
+  renderFilePicker();
+  const file = archFiles.find(f => f.name === name);
+  setArchiveRange(file ? fMicros(file.start_micros) : null, file ? fMicros(file.end_micros) : null);
+  resetArchiveQuery();
+}
+
+function fMicros(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+function setArchiveRange(min, max) {
+  const valid = min !== null && max !== null && max >= min;
+  archRangeMin = valid ? min : null;
+  archRangeMax = valid ? max : null;
+  archRangeFrom = archRangeMin;
+  archRangeTo = archRangeMax;
+  archRangeCommittedFrom = archRangeFrom;
+  archRangeCommittedTo = archRangeTo;
+  const start = document.getElementById('arch-range-start');
+  const end = document.getElementById('arch-range-end');
+  start.value = 0;
+  end.value = ARCH_RANGE_STEPS;
+  start.disabled = !valid || min === max;
+  end.disabled = !valid || min === max;
+  document.getElementById('arch-range-reset').disabled = !valid;
+  renderArchiveRange();
+}
+
+function sliderMicros(value) {
+  if (archRangeMin === null || archRangeMax === null) return null;
+  const ratio = Number(value) / ARCH_RANGE_STEPS;
+  return Math.round(archRangeMin + (archRangeMax - archRangeMin) * ratio);
+}
+
+function previewArchiveRange(handle) {
+  const start = document.getElementById('arch-range-start');
+  const end = document.getElementById('arch-range-end');
+  if (handle === 'start' && Number(start.value) > Number(end.value)) start.value = end.value;
+  if (handle === 'end' && Number(end.value) < Number(start.value)) end.value = start.value;
+  archRangeFrom = sliderMicros(start.value);
+  archRangeTo = sliderMicros(end.value);
+  renderArchiveRange();
+}
+
+function renderArchiveRange() {
+  const value = document.getElementById('arch-range-value');
+  const min = document.getElementById('arch-range-min');
+  const max = document.getElementById('arch-range-max');
+  const fill = document.getElementById('arch-range-fill');
+  if (archRangeMin === null || archRangeMax === null) {
+    value.textContent = 'Time range unavailable for this legacy log';
+    min.textContent = '—'; max.textContent = '—';
+    fill.style.left = '0'; fill.style.width = '100%';
+    return;
+  }
+  const startValue = Number(document.getElementById('arch-range-start').value);
+  const endValue = Number(document.getElementById('arch-range-end').value);
+  value.textContent = formatDateTime(dateFromMicros(archRangeFrom), true) + '  →  ' + formatDateTime(dateFromMicros(archRangeTo), true);
+  min.textContent = formatDateTime(dateFromMicros(archRangeMin), true);
+  max.textContent = formatDateTime(dateFromMicros(archRangeMax), true);
+  fill.style.left = (startValue / ARCH_RANGE_STEPS * 100) + '%';
+  fill.style.width = ((endValue - startValue) / ARCH_RANGE_STEPS * 100) + '%';
+}
+
+function commitArchiveRange() {
+  if (archRangeFrom === archRangeCommittedFrom && archRangeTo === archRangeCommittedTo) return;
+  archRangeCommittedFrom = archRangeFrom;
+  archRangeCommittedTo = archRangeTo;
+  resetArchiveQuery();
+}
+
+function resetArchiveRange() {
+  if (archRangeMin === null || archRangeMax === null) return;
+  document.getElementById('arch-range-start').value = 0;
+  document.getElementById('arch-range-end').value = ARCH_RANGE_STEPS;
+  archRangeFrom = archRangeMin;
+  archRangeTo = archRangeMax;
+  renderArchiveRange();
+  commitArchiveRange();
+}
+
+function resetArchiveQuery() {
+  archCursor = null;
+  archNextCursor = null;
+  archCursorStack = [];
+  archPage = 1;
+  loadArchive();
+}
+
+async function loadArchive() {
+  if (!archFile) return;
+  let url = '/api/querylog/history?file=' + encodeURIComponent(archFile) + '&limit=100';
+  if (archCursor !== null) url += '&cursor=' + archCursor;
+  url += buildServerFilterParams(parseFilter(document.getElementById('ql-filter').value));
+  if (archRangeFrom !== null && archRangeFrom > archRangeMin) url += '&from=' + archRangeFrom;
+  if (archRangeTo !== null && archRangeTo < archRangeMax) url += '&to=' + archRangeTo;
+  document.getElementById('ql-tbody').innerHTML =
+    '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Loading…</td></tr>';
+  document.getElementById('ql-more').style.display = 'none';
+  let r = await tryFetch(url);
+  if (r && r.status === 503) {
+    document.getElementById('ql-tbody').innerHTML =
+      '<tr><td colspan="8" style="color:var(--text2);text-align:center;padding:20px">Query busy, retrying…</td></tr>';
+    await new Promise(res => setTimeout(res, 1200));
+    r = await tryFetch(url);
+  }
+  if (!r || !r.ok) {
+    document.getElementById('ql-tbody').innerHTML =
+      '<tr><td colspan="8" style="color:var(--red);text-align:center">Failed to load archive</td></tr>';
+    return;
+  }
+  let page;
+  try { page = await r.json(); } catch {
+    // A 200 with an unparseable body (truncated mid-transfer, proxy error page,
+    // etc) would otherwise leave the table stuck on "Loading…" forever, since
+    // this is past the 503-retry and !r.ok branches above.
+    document.getElementById('ql-tbody').innerHTML =
+      '<tr><td colspan="8" style="color:var(--red);text-align:center">Failed to load archive</td></tr>';
+    return;
+  }
+  archEvents = page.items || [];
+  archNextCursor = page.next_cursor;
+  archMeta = page;
+  renderArchiveView();
+}
+
+function renderArchiveView() {
+  renderQueryLog(archEvents);
+  const countEl = document.getElementById('arch-count');
+  const total = archMeta && archMeta.total_entries;
+  if (!archEvents.length) {
+    countEl.textContent = total === null || total === undefined
+      ? 'No matching entries on this page · legacy archive'
+      : 'No matching entries · ' + Number(total).toLocaleString() + ' total in file';
+  } else {
+    countEl.textContent = archEvents.length.toLocaleString() + ' entries on this page'
+      + (total === null || total === undefined
+        ? ' · legacy archive'
+        : ' · ' + Number(total).toLocaleString() + ' total in file');
+  }
+  document.getElementById('arch-page-label').textContent = 'Page ' + archPage;
+  document.getElementById('arch-prev').disabled = archCursorStack.length === 0;
+  document.getElementById('arch-next').disabled = !archMeta || !archMeta.has_more;
+}
+
+function archiveNext() {
+  if (!archMeta || !archMeta.has_more || archNextCursor === null) return;
+  archCursorStack.push(archCursor);
+  archCursor = archNextCursor;
+  archPage += 1;
+  loadArchive();
+}
+
+function archivePrev() {
+  if (!archCursorStack.length) return;
+  archCursor = archCursorStack.pop();
+  archPage = Math.max(1, archPage - 1);
+  loadArchive();
+}
+
+// ── Search filter parsing / matching ──────────────────────────────────────────
+
+// Parse the search box into predicates: [{neg, key, val}]. A bare word is a
+// `domain` predicate; `key:value` uses a recognized prefix (else the whole
+// token is treated as a domain term). A leading `-` negates. All lowercased.
+function parseFilter(text) {
+  const preds = [];
+  for (let raw of (text || '').trim().split(/\s+/)) {
+    if (!raw) continue;
+    let neg = false;
+    if (raw[0] === '-') { neg = true; raw = raw.slice(1); }
+    if (!raw) continue;
+    let key = 'domain', val = raw;
+    const ci = raw.indexOf(':');
+    if (ci > 0) {
+      const k = raw.slice(0, ci).toLowerCase();
+      if (FILTER_KEYS.has(k)) { key = (k === 'qname') ? 'domain' : k; val = raw.slice(ci + 1); }
+    }
+    if (val === '') continue;
+    preds.push({ neg, key, val: val.toLowerCase() });
+  }
+  return preds;
+}
+
+// Translate an rcode:/type: value to a numeric code for the archive query. A
+// bare number passes through; a name is resolved against the code→name tables
+// (looked up lazily so this doesn't depend on their declaration order).
+function nameToCode(val, names) {
+  val = val.toLowerCase();
+  if (/^\d+$/.test(val)) return +val;
+  for (const [k, v] of Object.entries(names)) if (v.toLowerCase() === val) return +k;
+  return null;
+}
+// rcode accepts a name prefix too (`nx` → NXDOMAIN); qtype stays exact because
+// type names collide on prefixes (A / AAAA / ANY).
+function rcodeToCode(val) {
+  const exact = nameToCode(val, RCODE_NAMES);
+  if (exact != null) return exact;
+  val = val.toLowerCase();
+  const pre = Object.entries(RCODE_NAMES).find(([, v]) => v.toLowerCase().startsWith(val));
+  return pre ? +pre[0] : null;
+}
+function qtypeToCode(val) { return nameToCode(val, QTYPE_NAMES); }
+
+// Does one predicate match an event? domain/upstream/client are substring;
+// source/type are exact; rcode matches a number or an rcode-name prefix.
+function predHit(ev, p) {
+  switch (p.key) {
+    case 'domain':   return (ev.qname || '').toLowerCase().includes(p.val);
+    case 'upstream': return (ev.upstream || '').toLowerCase().includes(p.val);
+    case 'client':   return (ev.client || '').toLowerCase().includes(p.val);
+    case 'source':   return (ev.source || '').toLowerCase() === p.val;
+    case 'type':     return qtypeName(ev.qtype).toLowerCase() === p.val || String(ev.qtype) === p.val;
+    case 'rcode':    return String(ev.rcode) === p.val || (RCODE_NAMES[ev.rcode] || '').toLowerCase().startsWith(p.val);
+  }
+  return true;
+}
+
+function matchesSpec(ev, preds) {
+  for (const p of preds) {
+    if (predHit(ev, p) === p.neg) return false;
+  }
+  return true;
+}
+
+// Translate the parsed spec into server query params for archive mode (which is
+// server-paginated, so it can't be filtered client-side). One positive value per
+// key; negation isn't supported server-side and is ignored here.
+function buildServerFilterParams(preds) {
+  const pos = {};
+  for (const p of preds) {
+    if (!p.neg && !(p.key in pos)) pos[p.key] = p.val;
+  }
+  let s = '';
+  if (pos.domain)   s += '&q=' + encodeURIComponent(pos.domain);
+  if (pos.source)   s += '&source=' + encodeURIComponent(pos.source);
+  if (pos.upstream) s += '&upstream=' + encodeURIComponent(pos.upstream);
+  if (pos.client)   s += '&client=' + encodeURIComponent(pos.client);
+  if (pos.rcode != null) { const c = rcodeToCode(pos.rcode); if (c != null) s += '&rcode=' + c; }
+  if (pos.type)     { const c = qtypeToCode(pos.type); if (c != null) s += '&type=' + c; }
+  return s;
+}
+
+// ── Shared query log rendering ────────────────────────────────────────────────
+
+const RCODE_NAMES = {0:'NOERROR',1:'FORMERR',2:'SERVFAIL',3:'NXDOMAIN',4:'NOTIMP',5:'REFUSED',6:'YXDOMAIN',7:'YXRRSET',8:'NXRRSET',9:'NOTAUTH',10:'NOTZONE'};
+const RCODE_OK   = new Set([0]);
+const RCODE_WARN = new Set([3, 5]);
+
+function rcodeTag(code) {
+  const name = RCODE_NAMES[code] || ('RCODE'+code);
+  const cls = RCODE_OK.has(code) ? 'badge-ok' : RCODE_WARN.has(code) ? 'badge-null' : 'badge-err';
+  return '<span class="badge ' + cls + '">' + esc(name) + '</span>';
+}
+
+function sourceTag(src) {
+  const map = {cache:'badge-cache',upstream:'badge-upstream',singleflight:'badge-sf',answer:'badge-answer',forwarded:'badge-answer',filtered:'badge-filtered',overload:'badge-overload'};
+  return '<span class="badge ' + (map[src]||'badge-ok') + '">' + esc(src) + '</span>';
+}
+
+function buildEventRow(ev) {
+  const tr = document.createElement('tr');
+  tr.className = 'ql-row';
+  const t = new Date(ev.time);
+  const timeStr = qlMode === 'archive'
+    ? t.toLocaleDateString([],{month:'2-digit',day:'2-digit'}) + ' ' + t.toLocaleTimeString()
+    : t.toLocaleTimeString();
+  tr.innerHTML =
+    '<td title="' + esc(ev.time) + '">' + timeStr + '</td>' +
+    '<td>' + esc(ev.client) + '</td>' +
+    '<td title="' + esc(ev.qname) + '">' + esc(ev.qname) + '</td>' +
+    '<td>' + esc(qtypeName(ev.qtype)) + '</td>' +
+    '<td>' + rcodeTag(ev.rcode) + '</td>' +
+    '<td>' + elapsedCell(ev.elapsed_us) + '</td>' +
+    '<td>' + sourceTag(ev.source) + '</td>' +
+    '<td>' + (ev.upstream ? esc(ev.upstream) : '<span style="color:var(--text2)">—</span>') + '</td>';
+  tr.onclick = () => openModal(ev);
+  return tr;
+}
+
+// Prepend a single new SSE event row without re-rendering the whole table.
+function prependEventRow(ev) {
+  const tbody = document.getElementById('ql-tbody');
+  // Remove placeholder "No entries" row if present
+  if (tbody.rows.length === 1 && tbody.rows[0].cells.length === 1) tbody.innerHTML = '';
+  tbody.insertBefore(buildEventRow(ev), tbody.firstChild);
+  // Keep the table bounded to avoid unbounded DOM growth
+  while (tbody.rows.length > 500) tbody.deleteRow(-1);
+}
+
+function renderQueryLog(events) {
+  const display = (qlMode === 'live') ? events.filter(ev => matchesSpec(ev, qlFilterSpec)) : events;
+  const tbody = document.getElementById('ql-tbody');
+  if (!display || !display.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text2);text-align:center">No entries</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const ev of display) frag.appendChild(buildEventRow(ev));
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function modalItem(lbl, val) {
+  const isNil = val === null || val === undefined || val === '';
+  return '<div class="modal-item"><span class="modal-lbl">' + esc(lbl) + '</span>' +
+    '<span class="modal-val' + (isNil ? ' nil' : '') + '">' + esc(isNil ? '—' : String(val)) + '</span></div>';
+}
+
+function openModal(ev) {
+  document.getElementById('modal-title').textContent = ev.qname;
+  document.getElementById('modal-grid').innerHTML =
+    modalItem('Client', ev.client + ':' + (ev.client_port || 0)) +
+    modalItem('Time', ev.time) +
+    modalItem('Type', QTYPE_NAMES[ev.qtype] || 'TYPE' + ev.qtype) +
+    modalItem('RCode', RCODE_NAMES[ev.rcode] || 'RCODE' + ev.rcode) +
+    modalItem('Elapsed', fmtElapsed(ev.elapsed_us)) +
+    modalItem('Source', ev.source) +
+    modalItem('Upstream', ev.upstream) +
+    modalItem('Response', (ev.response_bytes || 0) + ' bytes');
+  document.getElementById('detail-modal').style.display = 'flex';
+}
+
+function closeModal() {
+  document.getElementById('detail-modal').style.display = 'none';
+}
+
+function copyModalDomain() {
+  const domain = document.getElementById('modal-title').textContent;
+  if (!navigator.clipboard) return;
+  navigator.clipboard.writeText(domain).then(() => {
+    const btn = document.getElementById('modal-copy-btn');
+    const orig = btn.textContent;
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  });
+}
+
+function handleModalClick(e) {
+  if (e.target === document.getElementById('detail-modal')) closeModal();
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+
+function filterChanged() {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(() => {
+    qlFilterSpec = parseFilter(document.getElementById('ql-filter').value);
+    if (qlMode === 'live') {
+      // Client-side filter: just re-render the held events — no SSE churn.
+      renderQueryLog(qlEvents);
+    } else if (archFile) {
+      resetArchiveQuery();
+    }
+  }, 200);
+}
+
+function loadMore() {
+  if (qlMode === 'live') loadQueryLog();
+}
+
+async function clearLog() {
+  closeSSE();
+  const r = await tryFetch('/api/querylog', {method:'DELETE'});
+  // Only clear the local view if the server confirmed the delete; otherwise
+  // (network error, auth failure, 5xx) the ring still holds those events and
+  // showing an empty table would lie about what's actually on the server.
+  if (r && r.ok) {
+    qlEvents = []; qlBeforeSeq = null; qlAfterSeq = null;
+    renderQueryLog([]);
+  }
+  if (document.getElementById('ql-auto').checked) {
+    await loadQueryLog();
+    openSSE();
+  }
+}
+
+function toggleAuto() {
+  if (document.getElementById('ql-auto').checked) {
+    openSSE();
+  } else {
+    closeSSE();
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function fmt(n) {
+  if (n===undefined||n===null) return '0';
+  if (n>=1e9) return (n/1e9).toFixed(1)+'B';
+  if (n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if (n>=1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+
+function fmtRtt(us) {
+  if (!us) return '—';
+  if (us>=1000) return (us/1000).toFixed(1)+' ms';
+  return us+' us';
+}
+function fmtElapsed(us) {
+  return (us/1000).toFixed(1)+' ms';
+}
+function elapsedCell(us) {
+  const ms = us/1000;
+  const s = ms.toFixed(1)+' ms';
+  if (ms >= 200) return '<span style="color:var(--red)">'  + s + '</span>';
+  if (ms >= 50)  return '<span style="color:var(--amber)">' + s + '</span>';
+  return s;
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function refreshAll() {
+  if (currentView === 'dashboard') loadDashboard();
+  else if (currentView === 'querylog' && qlMode === 'live') {
+    qlEvents=[]; qlBeforeSeq=null; qlAfterSeq=null;
+    loadQueryLog().then(() => {
+      if (document.getElementById('ql-auto').checked) { closeSSE(); openSSE(); }
+    });
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+(async () => {
+  const hash = location.hash.replace('#','');
+  const initView = hash === 'querylog' ? 'querylog' : 'dashboard';
+
+  // tryFetch prompts for auth (showAuth()) on 401 and returns null on any
+  // failure (network error, offline, etc) instead of throwing. Whatever
+  // happens here, dashTimer must still get created below — this is the only
+  // place it's ever set, so a 401 (the normal "enter your token" flow) or a
+  // transient failure at first load must not permanently disable dashboard
+  // auto-refresh; only the initial content load is skipped, not the timer.
+  const r = await tryFetch('/api/stats');
+  if (r) {
+    if (initView !== 'dashboard') showView(initView);
+    else await loadDashboard();
+  }
+
+  dashTimer = setInterval(() => {
+    if (currentView === 'dashboard') loadDashboard();
+  }, 5000);
+})();
+</script>
+</body>
+</html>

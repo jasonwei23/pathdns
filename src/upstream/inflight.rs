@@ -1,0 +1,250 @@
+//! Shared in-flight query registry for multiplexing transports.
+//!
+//! UDP socket pools and the TCP/TLS mux both correlate concurrent queries with
+//! responses through a 16-bit upstream DNS ID.  This module owns that mechanism
+//! in one place: ID allocation (race-free via a per-shard `entry`), the
+//! per-upstream inflight cap, RAII cleanup, and response validation/delivery.
+//!
+//! ## Anti-spoofing order of operations
+//! `complete` peeks the entry first and only removes it after the response
+//! question matches the registered question.  A stale or spoofed response that
+//! recycles a live ID therefore cannot destroy the live waiter's sender; the
+//! real response can still arrive and be delivered.
+
+use crate::dns;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{oneshot, OwnedSemaphorePermit};
+
+/// Number of lock shards. A power of two so the shard index is a cheap mask of
+/// the (already well-mixed) upstream ID; sized to keep cross-thread contention
+/// low without the per-entry sharding overhead `DashMap` carried. Mirrors the
+/// singleflight table's sharding.
+const SHARDS: usize = 64;
+type Shard = Mutex<FxHashMap<u16, Entry>>;
+
+struct Entry {
+    tx: oneshot::Sender<Bytes>,
+    client_id: u16,
+    question: Bytes,
+    /// Unique per-registration token (see `InflightGuard`'s docs for why this
+    /// exists — a plain `id`-keyed removal on drop is not safe once the ID has
+    /// been reused by a later registration).
+    token: u64,
+}
+
+/// Error returned by [`InflightRegistry::register`] when the per-upstream
+/// inflight cap is saturated. A distinct type (rather than a bare `anyhow!`)
+/// so the resolver can count cap saturation separately from other upstream
+/// failures via `err.chain()`. Surfaces to the client as SERVFAIL.
+#[derive(Debug)]
+pub(crate) struct InflightCapReached;
+
+impl std::fmt::Display for InflightCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("inflight cap reached")
+    }
+}
+
+impl std::error::Error for InflightCapReached {}
+
+/// Outcome of [`InflightRegistry::complete`], for caller-side logging.
+pub(super) enum Completion {
+    /// Question validated; waiter completed; response bytes consumed from the buffer.
+    Delivered,
+    /// Not a reply, unparsable ID, or no waiter registered under the ID.
+    NoWaiter,
+    /// Question mismatch: the entry is kept and the response dropped (stale/spoofed).
+    Mismatch(u16),
+}
+
+pub(super) struct InflightRegistry {
+    shards: [Shard; SHARDS],
+    /// Counter seeded from system time at startup; mixed through `mix16` before use
+    /// so that upstream query IDs are non-sequential and unpredictable.
+    next_id: AtomicU32,
+    /// Source of unique per-registration tokens (see `Entry::token`).
+    next_token: AtomicU64,
+    /// Semaphore-based inflight cap: each in-flight query holds one permit for its
+    /// entire lifetime (from `register` until the guard is dropped).  Using an
+    /// `OwnedSemaphorePermit` stored in the guard eliminates the TOCTOU race that
+    /// a `len() >= cap` check-then-insert pattern would have.  None when unlimited.
+    cap: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl InflightRegistry {
+    pub(super) fn new(max_inflight: usize) -> Self {
+        let cap = if max_inflight > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(max_inflight)))
+        } else {
+            None
+        };
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
+            next_id: AtomicU32::new(super::random_id_seed()),
+            next_token: AtomicU64::new(0),
+            cap,
+        }
+    }
+
+    /// The shard owning `id`. The ID is already mixed (see `next_id`), so masking
+    /// its low bits spreads entries evenly across shards.
+    fn shard(&self, id: u16) -> &Shard {
+        &self.shards[(id as usize) & (SHARDS - 1)]
+    }
+
+    /// Register a query: allocate an unused upstream ID and store the responder.
+    /// The returned guard removes the entry on drop (timeout/error paths); a
+    /// delivered response removes it first, making the guard's removal a no-op.
+    /// When a per-upstream cap is configured, the guard also holds a semaphore
+    /// permit that is released atomically on drop.
+    pub(super) fn register(
+        &self,
+        name: &str,
+        client_id: u16,
+        question: Bytes,
+    ) -> Result<(u16, oneshot::Receiver<Bytes>, InflightGuard<'_>)> {
+        let permit = if let Some(sem) = &self.cap {
+            match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return Err(
+                        anyhow::Error::new(InflightCapReached).context(format!("upstream {name}"))
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let (tx, rx) = oneshot::channel();
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..u16::MAX {
+            let id = super::mix16(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let mut shard = self
+                .shard(id)
+                .lock()
+                .map_err(|_| anyhow!("upstream {name} inflight map poisoned"))?;
+            match shard.entry(id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Entry {
+                        tx,
+                        client_id,
+                        question,
+                        token,
+                    });
+                    return Ok((
+                        id,
+                        rx,
+                        InflightGuard {
+                            registry: self,
+                            id,
+                            token,
+                            _permit: permit,
+                        },
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => continue,
+            }
+        }
+        Err(anyhow!("upstream {name} inflight table is full"))
+    }
+
+    /// Validate the response in `packet` and, when the question matches the
+    /// registered entry, rewrite the ID back to the client's and complete the
+    /// waiter.  `packet` is the exact received datagram bytes (one message);
+    /// taking a slice lets the single-recv and `recvmmsg` batch paths share this.
+    pub(super) fn complete(&self, packet: &mut [u8]) -> Completion {
+        if !dns::is_reply(packet) {
+            return Completion::NoWaiter;
+        }
+        // Opcode must be standard QUERY (0); len >= 12 guaranteed by is_reply.
+        if (packet[2] >> 3) & 0x0f != 0 {
+            return Completion::NoWaiter;
+        }
+        // Must have exactly one question.
+        if u16::from_be_bytes([packet[4], packet[5]]) != 1 {
+            return Completion::NoWaiter;
+        }
+        let Ok(id) = dns::get_id(packet) else {
+            return Completion::NoWaiter;
+        };
+        let Ok(mut shard) = self.shard(id).lock() else {
+            return Completion::NoWaiter;
+        };
+        // Peek first; only remove after question validation (see module docs).
+        // The shard lock is held across peek+validate+remove, so a stale/spoofed
+        // response and the real one cannot race to remove the same entry.
+        let question_matches = match shard.get(&id) {
+            None => return Completion::NoWaiter,
+            Some(entry) => {
+                let resp_question = dns::question_end(packet)
+                    .and_then(|end| packet.get(12..end))
+                    .unwrap_or(&[]);
+                dns::questions_match(resp_question, &entry.question)
+            }
+        };
+        if !question_matches {
+            return Completion::Mismatch(id); // entry stays; real response can still arrive
+        }
+        let Some(entry) = shard.remove(&id) else {
+            return Completion::NoWaiter;
+        };
+        drop(shard); // release the shard before the (non-blocking) send
+        let _ = dns::set_id(packet, entry.client_id);
+        let _ = entry.tx.send(Bytes::copy_from_slice(packet));
+        Completion::Delivered
+    }
+
+    /// Returns `true` when no queries are currently in flight.
+    pub(super) fn is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|s| s.lock().map(|m| m.is_empty()).unwrap_or(false))
+    }
+
+    /// Drop all pending entries; waiters observe a closed channel.
+    /// Used by connection-oriented transports when the connection dies.
+    pub(super) fn clear(&self) {
+        for s in &self.shards {
+            if let Ok(mut m) = s.lock() {
+                m.clear();
+            }
+        }
+    }
+}
+
+/// RAII guard: removes the registered entry on drop (timeout / error paths).
+/// A delivered response removes the entry first via `complete`, making the
+/// removal here a no-op.  The optional semaphore permit is also released on
+/// drop, returning capacity to the inflight cap.
+///
+/// Removal is conditioned on `token` still matching the live entry's, not just
+/// on `id`: a 16-bit ID can be reused by a later registration once `complete`
+/// has removed the original entry (e.g. a caller that keeps this guard alive
+/// past the response arriving, such as a UDP-truncated response's TCP
+/// fallback). Without the token check, this guard's drop would evict a
+/// same-ID entry belonging to a different, unrelated in-flight query.
+pub(super) struct InflightGuard<'a> {
+    registry: &'a InflightRegistry,
+    id: u16,
+    token: u64,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut shard) = self.registry.shard(self.id).lock() {
+            // Remove only if the live entry is still this registration's, keyed
+            // on `token` (a reused ID may now belong to a different query).
+            if let std::collections::hash_map::Entry::Occupied(e) = shard.entry(self.id) {
+                if e.get().token == self.token {
+                    e.remove();
+                }
+            }
+        }
+        // _permit drops here, atomically returning one slot to the semaphore
+    }
+}

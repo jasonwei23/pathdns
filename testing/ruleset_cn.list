@@ -1,0 +1,7 @@
+# domestic domains used by test_match.py
++.bilibili.com
+exactcn.test
++.both-cn-gfw.test
+both.test
+*.starcn.test
+pinorder.test

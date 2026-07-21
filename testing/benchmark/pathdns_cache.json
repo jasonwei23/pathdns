@@ -1,0 +1,9 @@
+{
+  "bind": { "addr": "127.0.0.1", "port": 5301, "proto": "udp" },
+  "route": {
+    "servers": { "mock": "udp://127.0.0.1:5300" },
+    "rules": [ { "upstream": "mock" } ]
+  },
+  "cache": { "size": 1000000 },
+  "runtime": { "worker-threads": 2, "upstream-max-inflight": 4096 }
+}
