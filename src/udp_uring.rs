@@ -68,6 +68,9 @@ const FAST_PATH_ARENA_CHUNK: usize = 64 * 1024;
 /// when momentarily full, a completing task sends its reply directly instead of
 /// queueing, so replies are never dropped here.
 const SLOW_REPLY_CAP: usize = 1024;
+/// Per-shard admission wait queue. It is deliberately bounded: overload must
+/// not turn into one sleeping Tokio task (and one copied packet) per datagram.
+const ADMISSION_QUEUE_CAP: usize = 1024;
 /// Buffer group id for the provided buffer ring (one ring per shard, id is local).
 const BGID: u16 = 0;
 /// Size of `struct io_uring_recvmsg_out` (4 × u32) prepended to each delivered
@@ -538,7 +541,7 @@ fn process_packet(
     socket: &Arc<UdpSocket>,
     send_buf: &mut ResponseArena,
     send_items: &mut Vec<(Bytes, SocketAddr)>,
-    reply_tx: &mpsc::Sender<(Bytes, SocketAddr)>,
+    slow: &SlowPathSenders,
 ) {
     match try_fast_path_into(pkt, peer, ClientProto::Udp, state, send_buf) {
         FastPathOutcome::Response { resp } => {
@@ -551,6 +554,24 @@ fn process_packet(
             let permit = match state.limit.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
+                    let queue_ms = state.hot.load().cfg.inflight_queue_ms;
+                    if queue_ms > 0 {
+                        let pending = PendingQuery {
+                            packet,
+                            peer,
+                            info,
+                            probe,
+                            deadline: tokio::time::Instant::now() + Duration::from_millis(queue_ms),
+                        };
+                        if slow.admission.try_send(pending).is_ok() {
+                            state
+                                .querylog
+                                .counters
+                                .inflight_queued
+                                .fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     state
                         .querylog
                         .counters
@@ -564,7 +585,7 @@ fn process_packet(
             };
             let state2 = state.clone();
             let socket2 = socket.clone();
-            let reply_tx = reply_tx.clone();
+            let reply_tx = slow.replies.clone();
             tokio::spawn(async move {
                 let query = packet.clone();
                 let send_state = state2.clone();
@@ -590,6 +611,87 @@ fn process_packet(
                     }
                 }
             });
+        }
+    }
+}
+
+struct SlowPathSenders {
+    replies: mpsc::Sender<(Bytes, SocketAddr)>,
+    admission: mpsc::Sender<PendingQuery>,
+}
+
+struct PendingQuery {
+    packet: Bytes,
+    peer: SocketAddr,
+    info: dns::FastQueryInfo,
+    probe: crate::cache::CacheProbe,
+    deadline: tokio::time::Instant,
+}
+
+fn spawn_slow_query(
+    pending: PendingQuery,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    state: Arc<AppState>,
+    socket: Arc<UdpSocket>,
+    reply_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+) {
+    tokio::spawn(async move {
+        let query = pending.packet.clone();
+        let send_state = state.clone();
+        if let Ok(Some(resp)) = handle_packet_slow_preparsed(
+            pending.packet,
+            pending.peer,
+            ClientProto::Udp,
+            state,
+            pending.info,
+            pending.probe,
+            Some(permit),
+        )
+        .await
+        {
+            let resp = dns::maybe_truncate_for_udp(resp, &query);
+            if let Err(mpsc::error::TrySendError::Full((resp, peer))) =
+                reply_tx.try_send((resp, pending.peer))
+            {
+                send_one_response(&socket, &resp, peer, &send_state).await;
+            }
+        }
+    });
+}
+
+async fn admission_loop(
+    mut rx: mpsc::Receiver<PendingQuery>,
+    state: Arc<AppState>,
+    socket: Arc<UdpSocket>,
+    reply_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+) {
+    while let Some(pending) = rx.recv().await {
+        let permit = tokio::time::timeout_at(pending.deadline, state.limit.clone().acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(permit) = permit {
+            spawn_slow_query(
+                pending,
+                permit,
+                state.clone(),
+                socket.clone(),
+                reply_tx.clone(),
+            );
+        } else {
+            state
+                .querylog
+                .counters
+                .inflight_drops
+                .fetch_add(1, Ordering::Relaxed);
+            if let Ok(resp) = dns::servfail_reply(&pending.packet, pending.info.question_end) {
+                let resp = Bytes::from(resp);
+                if let Err(mpsc::error::TrySendError::Full((resp, peer))) =
+                    reply_tx.try_send((resp, pending.peer))
+                {
+                    send_one_response(&socket, &resp, peer, &state).await;
+                }
+            }
         }
     }
 }
@@ -692,10 +794,7 @@ pub(crate) async fn serve_udp_uring(
     // Provided buffer-ring depth from config (validated to a power of two there).
     let (uring_bufs, diagnostics) = {
         let hot = state.hot.load();
-        (
-            hot.cfg.uring_recv_buffers as u16,
-            hot.cfg.udp_diagnostics,
-        )
+        (hot.cfg.uring_recv_buffers as u16, hot.cfg.udp_diagnostics)
     };
     let mut recv =
         UringRecv::new(fd, uring_bufs, MAX_PKT, diagnostics).context("io_uring: init recv")?;
@@ -715,6 +814,17 @@ pub(crate) async fn serve_udp_uring(
         reply_rx,
         state.clone(),
     ));
+    let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_QUEUE_CAP);
+    tokio::spawn(admission_loop(
+        admission_rx,
+        state.clone(),
+        socket.clone(),
+        reply_tx.clone(),
+    ));
+    let slow_senders = SlowPathSenders {
+        replies: reply_tx,
+        admission: admission_tx,
+    };
     // Last-seen cumulative SO_RXQ_OVFL value; deltas feed udp_rx_overflow.
     let mut last_rxq_ovfl: u32 = 0;
     // Throttle SO_MEMINFO sampling to ~1 Hz.
@@ -747,7 +857,7 @@ pub(crate) async fn serve_udp_uring(
                 &socket,
                 &mut send_buf,
                 &mut send_items,
-                &reply_tx,
+                &slow_senders,
             );
         });
         if stats.truncated > 0 {
@@ -778,7 +888,8 @@ pub(crate) async fn serve_udp_uring(
                 .fetch_max(stats.recv_lat_us, Ordering::Relaxed);
         }
         // SO_MEMINFO: sample receive-buffer occupancy ~1 Hz (peak across shards).
-        if diagnostics >= UdpDiagnostics::Basic && last_meminfo.elapsed() >= Duration::from_secs(1) {
+        if diagnostics >= UdpDiagnostics::Basic && last_meminfo.elapsed() >= Duration::from_secs(1)
+        {
             if let Some(pct) = socket_rmem_pct(fd) {
                 state
                     .querylog

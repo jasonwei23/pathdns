@@ -779,7 +779,15 @@ async fn reload_ruleset(state: &AppState, changed_paths: &HashSet<PathBuf>) -> R
     // reference; a watcher-held snapshot would rebuild the ruleset DB for the
     // old tags and silently turn every newer tag reference into "never
     // matches".
-    let (routing, ruleset_specs, ruleset_specs_len, generation, previous_db, domain_tags, ipcidr_tags) = {
+    let (
+        routing,
+        ruleset_specs,
+        ruleset_specs_len,
+        generation,
+        previous_db,
+        domain_tags,
+        ipcidr_tags,
+    ) = {
         let hot = state.hot.load();
         (
             hot.routing.clone(),
@@ -840,12 +848,18 @@ async fn reload_config(state: &AppState) -> Result<()> {
         Some(p) => p.clone(),
         None => return Ok(()),
     };
-    let json = crate::config::json::load_json_config(&config_path)?;
-    let mut cfg = Config::from_json(json)?;
-    // Same path anchoring as startup (`Config::parse_args`), so the
-    // startup-only-change comparison below never sees a spurious diff from
-    // one side being anchored and the other not.
-    cfg.anchor_paths(&crate::config::config_base_dir(&config_path));
+    // Config preparation may perform bootstrap hostname resolution with a
+    // blocking std::net::UdpSocket. Keep that work off Tokio's worker threads.
+    let parse_path = config_path.clone();
+    let cfg = tokio::task::spawn_blocking(move || {
+        let json = crate::config::json::load_json_config(&parse_path)?;
+        let mut cfg = Config::from_json(json)?;
+        // Same path anchoring as startup (`Config::parse_args`).
+        cfg.anchor_paths(&crate::config::config_base_dir(&parse_path));
+        Ok::<_, anyhow::Error>(cfg)
+    })
+    .await
+    .context("config reload parser task failed")??;
 
     // Serialized against `reload_ruleset` — see `AppState::reload_lock` docs.
     let _reload_guard = state.reload_lock.lock().await;
@@ -1087,7 +1101,9 @@ fn watched_dirs(paths: &[PathBuf]) -> HashMap<PathBuf, Vec<OsString>> {
     let mut dirs = HashMap::new();
     for path in paths {
         let file = path.file_name().map(OsString::from).unwrap_or_default();
-        dirs.entry(watch_parent(path)).or_insert_with(Vec::new).push(file);
+        dirs.entry(watch_parent(path))
+            .or_insert_with(Vec::new)
+            .push(file);
     }
     dirs
 }

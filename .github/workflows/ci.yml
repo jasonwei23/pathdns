@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   test:
-    name: build & test
+    name: format, lint & test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,15 +30,57 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build
+      - name: Format
+        run: rustfmt --edition 2021 --check src/log.rs src/server.rs src/udp_uring.rs
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      - name: Minimal feature test
+        run: cargo test --locked --no-default-features
+
+  integration:
+    name: black-box integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Build pathdns
         run: cargo build --locked
 
-      # The in-tree #[cfg(test)] unit tests have been removed in favour of the
-      # black-box integration scripts under testing/ (run against a live binary +
-      # mock upstreams; see testing/README.md). This step still type-checks the
-      # crate under `cfg(test)` and will pick up any future #[test] modules.
-      - name: Test
-        run: cargo test --locked
+      - name: Run domain matching matrix
+        working-directory: testing
+        run: |
+          set -euo pipefail
+          cleanup() { kill "${PATHDNS_PID:-}" "${MOCK_PID:-}" 2>/dev/null || true; }
+          trap cleanup EXIT
+          python3 fastmock.py 5300 & MOCK_PID=$!
+          ../target/debug/pathdns -c cfg_match.json & PATHDNS_PID=$!
+          for _ in $(seq 1 100); do
+            if python3 - <<'PY'
+import socket
+s = socket.socket()
+s.settimeout(0.05)
+try:
+    s.connect(("127.0.0.1", 8080))
+except OSError:
+    raise SystemExit(1)
+PY
+            then break; fi
+            sleep 0.1
+          done
+          kill -0 "$PATHDNS_PID"
+          python3 test_match.py
+
+      - name: Run inflight cap suite
+        working-directory: testing
+        run: python3 test_inflight_cap.py ../target/debug/pathdns
 
   fuzz:
     name: fuzz targets (smoke run)

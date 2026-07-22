@@ -2,9 +2,11 @@
 //!
 //! - `log_error!`: always printed to stderr; for fatal startup failures.
 //! - `log_info!`: always printed to stderr; for listen addresses at startup.
-//! - `warn!`, `startup!`, `warn_rate_limited!`: silenced (info available via web dashboard).
+//! - `warn!`, `startup!`: printed to stderr so headless deployments remain observable.
+//! - `warn_rate_limited!`: printed to stderr at most once per configured interval.
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn emit_error(args: std::fmt::Arguments<'_>) {
     eprintln!("error: {args}");
@@ -14,9 +16,34 @@ pub fn emit_info(args: std::fmt::Arguments<'_>) {
     eprintln!("{args}");
 }
 
-pub fn emit_warn(_: std::fmt::Arguments<'_>) {}
-pub fn emit_startup(_: std::fmt::Arguments<'_>) {}
-pub fn warn_rate_limited(_: &AtomicU64, _: u64, _: std::fmt::Arguments<'_>) {}
+pub fn emit_warn(args: std::fmt::Arguments<'_>) {
+    eprintln!("warning: {args}");
+}
+
+pub fn emit_startup(args: std::fmt::Arguments<'_>) {
+    eprintln!("{args}");
+}
+
+pub fn warn_rate_limited(last: &AtomicU64, interval_secs: u64, args: std::fmt::Arguments<'_>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .max(1);
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < interval_secs {
+            return;
+        }
+        match last.compare_exchange_weak(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                emit_warn(args);
+                return;
+            }
+            Err(actual) => previous = actual,
+        }
+    }
+}
 
 /// Always printed. Use for fatal startup failures.
 #[macro_export]
@@ -34,7 +61,7 @@ macro_rules! log_info {
     };
 }
 
-/// Silenced — operational events are visible in the web dashboard.
+/// Operational warning, also visible without the web dashboard.
 #[macro_export]
 macro_rules! warn {
     ($($arg:tt)*) => {
@@ -42,7 +69,7 @@ macro_rules! warn {
     };
 }
 
-/// Silenced — startup summaries are visible in the web dashboard.
+/// Startup summary, also visible without the web dashboard.
 #[macro_export]
 macro_rules! startup {
     ($($arg:tt)*) => {
@@ -50,7 +77,7 @@ macro_rules! startup {
     };
 }
 
-/// Silenced.
+/// Operational warning limited by a shared last-emission timestamp.
 #[macro_export]
 macro_rules! warn_rate_limited {
     ($last:expr, $interval:expr, $($arg:tt)*) => {
