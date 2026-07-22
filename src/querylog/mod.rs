@@ -69,7 +69,7 @@ pub struct QueryLogEvent {
     pub rcode: u8,
     pub elapsed_us: u64,
     pub response_bytes: u32,
-    pub source: &'static str, // "cache"|"upstream"|"singleflight"|"filtered"|"forwarded"|"overload"
+    pub source: &'static str, // "cache"|"upstream"|"singleflight"|"filtered"|"forwarded"
     /// The upstream (`route.servers` entry, or `final-><name>`) that answered
     /// this query — see `router::RouteTarget::upstream_name_arc`.
     pub upstream: Option<Arc<str>>,

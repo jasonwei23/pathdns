@@ -379,15 +379,6 @@ async fn handle_packet_slow_with_info(
                         let servfail = dns::servfail_reply(&packet, info.question_end)
                             .map(Bytes::from)
                             .ok();
-                        if let Some(resp) = &servfail {
-                            let ctx = QueryContext {
-                                packet,
-                                info,
-                                peer,
-                                proto,
-                            };
-                            emit_slow_event(&ctx, &state, resp, "overload", None, 0);
-                        }
                         return Ok(servfail);
                     }
                 }
