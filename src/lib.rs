@@ -69,6 +69,14 @@ fn run() -> Result<()> {
             let id = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             format!("pathdns-w{id}")
         })
+        // The resolve pipeline is a deep single future (fast path → slow path →
+        // resolve_query → exchange_with_dedupe → resolve_with_filters →
+        // upstream exchange). Unoptimized debug builds keep every level's locals
+        // live in one frame, which overflows tokio's default 2 MiB worker stack
+        // on the first query. Reserve a larger stack (virtual only until touched)
+        // so debug binaries — used by the black-box integration tests and local
+        // `cargo run` — stay usable and release has headroom for future growth.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_io()
         .enable_time()
         .build()?;

@@ -75,10 +75,8 @@ impl<V> DomainMatcher<V> {
             if let Some(v) = self.suffix.get(&qname[idx..]) {
                 return Some(v);
             }
-            match qname[idx..].find('.') {
-                Some(p) => idx += p + 1,
-                None => return None,
-            }
+            let p = qname[idx..].find('.')?;
+            idx += p + 1;
         }
     }
 
