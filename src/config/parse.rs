@@ -552,8 +552,9 @@ fn name_or_number_to_u64(
     parse_name: impl Fn(&str) -> Result<u64>,
 ) -> Result<u64> {
     match item {
-        NameOrNumber::Number(n) => u64::try_from(n)
-            .map_err(|_| anyhow!("{field} must be a non-negative integer or name")),
+        NameOrNumber::Number(n) => {
+            u64::try_from(n).map_err(|_| anyhow!("{field} must be a non-negative integer or name"))
+        }
         NameOrNumber::Name(s) => parse_name(&s),
     }
 }
@@ -1345,7 +1346,6 @@ mod one_or_many_tests {
         assert_eq!(by_name.response_type, by_num.response_type);
         assert_eq!(by_num.response_type, vec![28u16]);
     }
-
 }
 
 #[cfg(test)]
@@ -1353,13 +1353,21 @@ mod bootstrap_reference_tests {
     use super::*;
     use serde_json::json;
 
-    fn servers(pairs: &[(&str, serde_json::Value)]) -> std::collections::BTreeMap<String, serde_json::Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    fn servers(
+        pairs: &[(&str, serde_json::Value)],
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
     fn bootstrap_ref_extracts_server_name() {
-        assert_eq!(bootstrap_ref("tls://dns.google?bootstrap=base"), Some("base"));
+        assert_eq!(
+            bootstrap_ref("tls://dns.google?bootstrap=base"),
+            Some("base")
+        );
         assert_eq!(
             bootstrap_ref("tls://dns.google?mark=0x1&bootstrap=base&no-sni"),
             Some("base")
@@ -1378,9 +1386,12 @@ mod bootstrap_reference_tests {
 
     #[test]
     fn unknown_reference_is_rejected() {
-        let err = parse_servers(servers(&[("a", json!("tls://dns.google?bootstrap=missing"))]))
-            .unwrap_err()
-            .to_string();
+        let err = parse_servers(servers(&[(
+            "a",
+            json!("tls://dns.google?bootstrap=missing"),
+        )]))
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("no such route.servers entry"), "{err}");
     }
 

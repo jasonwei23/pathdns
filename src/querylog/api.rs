@@ -45,7 +45,8 @@ pub async fn serve(
     state: Arc<AppState>,
 ) {
     let token = Arc::new(token);
-    let gate = CONNECTION_GATE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let gate =
+        CONNECTION_GATE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let Ok((mut conn, _peer)) = listener.accept().await else {
             continue;

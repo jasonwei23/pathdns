@@ -26,7 +26,10 @@ pub(super) fn parse_upstreams(
     Ok(out)
 }
 
-pub(super) fn parse_upstream(raw: &str, bootstrap: BootstrapLookup) -> Result<Vec<UpstreamEndpoint>> {
+pub(super) fn parse_upstream(
+    raw: &str,
+    bootstrap: BootstrapLookup,
+) -> Result<Vec<UpstreamEndpoint>> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(anyhow!("upstream cannot be empty"));
@@ -49,8 +52,7 @@ pub(super) fn parse_upstream(raw: &str, bootstrap: BootstrapLookup) -> Result<Ve
         let normalized = normalize_addr_with_default_port(raw, 53);
         let host = authority_host(&normalized)?;
         let port = authority_port(&normalized, 53);
-        let addr =
-            resolve_host(host, port, &[]).with_context(|| format!("upstream '{raw}'"))?;
+        let addr = resolve_host(host, port, &[]).with_context(|| format!("upstream '{raw}'"))?;
         return Ok(vec![endpoint(
             UpstreamProto::Udp,
             addr,
@@ -295,9 +297,11 @@ mod tests {
 
     #[test]
     fn parse_upstream_query_accepts_known_params_once() {
-        let endpoints =
-            parse_upstream("tls://1.1.1.1?no-sni&sni=example.com&ecs=strip&mark=0x2", &no_bootstrap)
-                .unwrap();
+        let endpoints = parse_upstream(
+            "tls://1.1.1.1?no-sni&sni=example.com&ecs=strip&mark=0x2",
+            &no_bootstrap,
+        )
+        .unwrap();
         let endpoint = &endpoints[0];
         assert!(endpoint.no_sni);
         assert_eq!(endpoint.server_name.as_deref(), Some("example.com"));

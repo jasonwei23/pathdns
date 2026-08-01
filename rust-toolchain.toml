@@ -1,0 +1,9 @@
+# Pin the toolchain so local builds, clippy and rustfmt match CI exactly.
+# Without this, CI's floating `stable` drifts ahead of a developer's local
+# stable and lints/format rules diverge ("passes locally, fails in CI").
+#
+# The fuzz job selects nightly explicitly with `cargo +nightly …`, which
+# overrides this pin, so sanitizer-instrumented fuzzing is unaffected.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]

@@ -151,7 +151,9 @@ impl DoQUpstream {
         // mean the shared connection (and every other query using it) is dead;
         // mirrors the same check in `H3Upstream::do_exchange`.
         if result.is_err() {
-            self.connection.evict_if_unhealthy(is_quic_conn_healthy).await;
+            self.connection
+                .evict_if_unhealthy(is_quic_conn_healthy)
+                .await;
         }
         let body = result?;
         super::finalize_response(body, 0, &req.question, req.client_id)
@@ -263,44 +265,41 @@ impl H3Upstream {
     async fn get_or_connect(&self) -> Result<H3SendReq> {
         let conn = self
             .connection
-            .get_or_connect(
-                |c: &H3Conn| is_quic_conn_healthy(&c.quic),
-                async {
-                    // Establish a new QUIC+h3 connection.
-                    let setup_fut = async {
-                        let connecting = self
-                            .endpoint
-                            .connect(self.remote, &self.server_name)
-                            .map_err(|e| anyhow!("upstream {}: H3 connect error: {e}", self.name))?;
-                        let quic_conn = connecting.await.with_context(|| {
-                            format!("upstream {}: H3 QUIC handshake failed", self.name)
-                        })?;
+            .get_or_connect(|c: &H3Conn| is_quic_conn_healthy(&c.quic), async {
+                // Establish a new QUIC+h3 connection.
+                let setup_fut = async {
+                    let connecting = self
+                        .endpoint
+                        .connect(self.remote, &self.server_name)
+                        .map_err(|e| anyhow!("upstream {}: H3 connect error: {e}", self.name))?;
+                    let quic_conn = connecting.await.with_context(|| {
+                        format!("upstream {}: H3 QUIC handshake failed", self.name)
+                    })?;
 
-                        let h3_conn = h3_quinn::Connection::new(quic_conn.clone());
-                        let (mut driver, send_req) = h3::client::new(h3_conn).await.map_err(|e| {
-                            anyhow!("upstream {}: H3 connection init failed: {e}", self.name)
-                        })?;
+                    let h3_conn = h3_quinn::Connection::new(quic_conn.clone());
+                    let (mut driver, send_req) = h3::client::new(h3_conn).await.map_err(|e| {
+                        anyhow!("upstream {}: H3 connection init failed: {e}", self.name)
+                    })?;
 
-                        tokio::spawn(async move {
-                            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-                        });
+                    tokio::spawn(async move {
+                        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                    });
 
-                        Ok::<(quinn::Connection, H3SendReq), anyhow::Error>((quic_conn, send_req))
-                    };
+                    Ok::<(quinn::Connection, H3SendReq), anyhow::Error>((quic_conn, send_req))
+                };
 
-                    let (quic_conn, send_req) = tokio::time::timeout(self.timeout, setup_fut)
-                        .await
-                        .map_err(|e| {
-                            anyhow::Error::from(e)
-                                .context(format!("upstream {}: H3 connect timeout", self.name))
-                        })??;
+                let (quic_conn, send_req) = tokio::time::timeout(self.timeout, setup_fut)
+                    .await
+                    .map_err(|e| {
+                    anyhow::Error::from(e)
+                        .context(format!("upstream {}: H3 connect timeout", self.name))
+                })??;
 
-                    Ok(H3Conn {
-                        quic: quic_conn,
-                        send_req,
-                    })
-                },
-            )
+                Ok(H3Conn {
+                    quic: quic_conn,
+                    send_req,
+                })
+            })
             .await?;
         Ok(conn.send_req)
     }

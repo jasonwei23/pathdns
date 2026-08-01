@@ -120,8 +120,13 @@ mod tests {
     #[tokio::test]
     async fn leader_then_followers_share_one_published_response() {
         let table = InflightTable::new();
-        assert!(register(&table, 42).unwrap().is_none(), "first caller leads");
-        let rx1 = register(&table, 42).unwrap().expect("second caller follows");
+        assert!(
+            register(&table, 42).unwrap().is_none(),
+            "first caller leads"
+        );
+        let rx1 = register(&table, 42)
+            .unwrap()
+            .expect("second caller follows");
         let rx2 = register(&table, 42).unwrap().expect("third caller follows");
 
         publish_bytes(&table, &42, Bytes::from_static(b"resp"));
@@ -139,7 +144,9 @@ mod tests {
         let rx = register(&table, 7).unwrap().expect("follower");
         publish_drop(&table, &7);
         assert!(
-            rx.await.expect("drop is a delivery, not an error").is_none(),
+            rx.await
+                .expect("drop is a delivery, not an error")
+                .is_none(),
             "followers see 'send nothing'"
         );
     }

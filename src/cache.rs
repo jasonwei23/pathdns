@@ -881,7 +881,8 @@ mod tests {
         for id in 0..300u16 {
             // Each lookup impersonates a different client ID via `fast.id`.
             let fast = dns::FastQueryInfo { id, ..fast };
-            let (meta, _v) = cache.get_into_with_ecs_fallback(&query, &fast, arena.buf_mut(), false);
+            let (meta, _v) =
+                cache.get_into_with_ecs_fallback(&query, &fast, arena.buf_mut(), false);
             assert!(meta.is_some(), "must be a cache hit");
             held.push((id, arena.take()));
         }
@@ -945,9 +946,13 @@ mod tests {
         let names = ["a.test", "b.test", "c.test", "d.test"];
         for (i, n) in names.iter().enumerate() {
             let (query, qe) = dns::synthetic_query(n, 1).unwrap();
-            let resp =
-                dns::a_reply(&query, qe, std::net::Ipv4Addr::new(10, 0, 0, i as u8 + 1), 300)
-                    .unwrap();
+            let resp = dns::a_reply(
+                &query,
+                qe,
+                std::net::Ipv4Addr::new(10, 0, 0, i as u8 + 1),
+                300,
+            )
+            .unwrap();
             let variant = dns::extract_variant(&query, qe);
             let key = cache_key_with_variant(&query, qe, &variant, false);
             cache.add(

@@ -109,7 +109,9 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u8, u64)> {
     // decompression-bomb-style CPU/time sink otherwise caught only after the
     // fact (stream ends before `len` bytes are skipped).
     if extra_len > MAX_ARRAY_BYTES {
-        return Err(anyhow!("mrs extra field length {extra_len} implausibly large"));
+        return Err(anyhow!(
+            "mrs extra field length {extra_len} implausibly large"
+        ));
     }
     skip_exact(r, extra_len).context("truncated mrs extra field")?;
 

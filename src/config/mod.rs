@@ -535,8 +535,8 @@ impl Config {
             Some("off") => UdpDiagnostics::Off,
             Some(other) => {
                 return Err(anyhow!(
-                    "runtime.udp-diagnostics: expected \"off\", \"basic\" or \"full\", got \"{other}\""
-                ))
+                "runtime.udp-diagnostics: expected \"off\", \"basic\" or \"full\", got \"{other}\""
+            ))
             }
         };
         let udp_buf_size = t.udp_buf_size.unwrap_or(4 * 1024 * 1024);

@@ -610,7 +610,7 @@ mod tests {
         resp[2] = 0x80;
         resp[3] = 0x03; // NXDOMAIN
         resp[8..10].copy_from_slice(&1u16.to_be_bytes()); // NSCOUNT = 1
-        // SOA RR in the authority section: TTL 90000, MINIMUM 60.
+                                                          // SOA RR in the authority section: TTL 90000, MINIMUM 60.
         resp.extend_from_slice(&[0xC0, 0x0C]); // NAME
         resp.extend_from_slice(&[0x00, 0x06]); // TYPE SOA
         resp.extend_from_slice(&[0x00, 0x01]); // CLASS IN

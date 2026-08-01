@@ -10,7 +10,9 @@
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
 
 use crate::config::UdpDiagnostics;
-use crate::resolver::{handle_packet_slow_preparsed, try_fast_path_into, FastPathOutcome, ResponseArena};
+use crate::resolver::{
+    handle_packet_slow_preparsed, try_fast_path_into, FastPathOutcome, ResponseArena,
+};
 use crate::server::AppState;
 use crate::sys;
 use crate::upstream::{set_raw_socket_buf_size, ClientProto};

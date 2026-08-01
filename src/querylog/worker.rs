@@ -416,7 +416,9 @@ async fn process_batch(
     if ring.enabled() {
         let evicted = ring.push_batch(&arc_batch);
         if evicted > 0 {
-            counters.ring_evictions.fetch_add(evicted, Ordering::Relaxed);
+            counters
+                .ring_evictions
+                .fetch_add(evicted, Ordering::Relaxed);
         }
     }
 

@@ -130,7 +130,8 @@ impl RefreshGuard {
         {
             return false;
         }
-        self.not_before_ms.store(now + cooldown_ms, Ordering::Relaxed);
+        self.not_before_ms
+            .store(now + cooldown_ms, Ordering::Relaxed);
         true
     }
 
@@ -954,7 +955,12 @@ fn make_tls_transport(
                     .clone()
                     .unwrap_or_else(|| endpoint.addr.ip().to_string()),
             )
-            .map_err(|e| anyhow!("invalid TLS server name for upstream {}: {e}", endpoint.addr))?
+            .map_err(|e| {
+                anyhow!(
+                    "invalid TLS server name for upstream {}: {e}",
+                    endpoint.addr
+                )
+            })?
         };
         crate::startup!(
             "upstream {node_name} proto=tls remote={} sni={}",
@@ -1081,11 +1087,7 @@ pub(super) fn validate_upstream_response(
 /// Build the wire bytes for an outgoing upstream query, shared by every multiplexed
 /// transport (TCP/DoT, DoH, DoQ, DoH3).  Applies the ECS mode and patches the upstream
 /// DNS ID.
-pub(super) fn prepare_query(
-    packet: &Bytes,
-    ecs_mode: &EcsMode,
-    upstream_id: u16,
-) -> Result<Bytes> {
+pub(super) fn prepare_query(packet: &Bytes, ecs_mode: &EcsMode, upstream_id: u16) -> Result<Bytes> {
     let mut pkt = apply_ecs_mode(packet, ecs_mode);
     dns::set_id(&mut pkt, upstream_id)?;
     Ok(pkt.freeze())

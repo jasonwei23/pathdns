@@ -420,7 +420,9 @@ mod tests {
     fn catch_all_matches_everything() {
         let rules = vec![rule(0, Vec::new())];
         let idx = RouteIndex::build(&rules, 0);
-        let r = idx.route(&rules, &Arc::from("anything.example"), None).unwrap();
+        let r = idx
+            .route(&rules, &Arc::from("anything.example"), None)
+            .unwrap();
         assert_eq!(r.index, 0);
     }
 
@@ -432,12 +434,16 @@ mod tests {
         ];
         let idx = RouteIndex::build(&rules, 0);
         assert_eq!(
-            idx.route(&rules, &Arc::from("example.com"), None).unwrap().index,
+            idx.route(&rules, &Arc::from("example.com"), None)
+                .unwrap()
+                .index,
             0,
             "exact match"
         );
         assert_eq!(
-            idx.route(&rules, &Arc::from("other.example"), None).unwrap().index,
+            idx.route(&rules, &Arc::from("other.example"), None)
+                .unwrap()
+                .index,
             1,
             "falls through to catch-all"
         );
@@ -452,7 +458,12 @@ mod tests {
             rule(1, vec![domain("a.example.com")]),
         ];
         let idx = RouteIndex::build(&rules, 0);
-        assert_eq!(idx.route(&rules, &Arc::from("a.example.com"), None).unwrap().index, 0);
+        assert_eq!(
+            idx.route(&rules, &Arc::from("a.example.com"), None)
+                .unwrap()
+                .index,
+            0
+        );
     }
 
     #[test]
@@ -462,7 +473,12 @@ mod tests {
             rule(1, vec![domain("example.com")]),
         ];
         let idx = RouteIndex::build(&rules, 0);
-        assert_eq!(idx.route(&rules, &Arc::from("example.com"), None).unwrap().index, 0);
+        assert_eq!(
+            idx.route(&rules, &Arc::from("example.com"), None)
+                .unwrap()
+                .index,
+            0
+        );
     }
 
     #[test]
@@ -485,7 +501,9 @@ mod tests {
         let idx = RouteIndex::build(&rules, 0);
         assert!(idx.constant_route.is_some());
         assert_eq!(
-            idx.route(&rules, &Arc::from("a.example"), None).unwrap().index,
+            idx.route(&rules, &Arc::from("a.example"), None)
+                .unwrap()
+                .index,
             0
         );
 
@@ -494,7 +512,9 @@ mod tests {
         let idx = RouteIndex::build(&rules, 0);
         assert!(idx.constant_route.is_some());
         assert_eq!(
-            idx.route(&rules, &Arc::from("x.example"), None).unwrap().index,
+            idx.route(&rules, &Arc::from("x.example"), None)
+                .unwrap()
+                .index,
             0,
             "catch-all at index 0 shadows the later rule"
         );
@@ -509,8 +529,18 @@ mod tests {
         let rules = vec![rule(0, vec![domain("x.example")]), rule(1, Vec::new())];
         let idx = RouteIndex::build(&rules, 0);
         assert!(idx.constant_route.is_none());
-        assert_eq!(idx.route(&rules, &Arc::from("x.example"), None).unwrap().index, 0);
-        assert_eq!(idx.route(&rules, &Arc::from("y.example"), None).unwrap().index, 1);
+        assert_eq!(
+            idx.route(&rules, &Arc::from("x.example"), None)
+                .unwrap()
+                .index,
+            0
+        );
+        assert_eq!(
+            idx.route(&rules, &Arc::from("y.example"), None)
+                .unwrap()
+                .index,
+            1
+        );
     }
 
     #[test]
