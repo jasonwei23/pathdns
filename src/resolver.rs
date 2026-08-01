@@ -440,7 +440,12 @@ async fn resolve_query(mut ctx: QueryContext, state: &Arc<AppState>) -> Result<O
             }
         }
     };
-    exchange_with_dedupe(ctx, state, &hot, ruleset, target).await
+    // Box this sub-future: it fans out into the full singleflight + filter +
+    // upstream-exchange chain. Boxing puts that state on the heap so each
+    // ancestor's poll frame holds only a pointer, keeping the synchronous poll
+    // stack shallow (unoptimized debug frames otherwise overflow the worker
+    // stack — see the runtime builder in lib.rs).
+    Box::pin(exchange_with_dedupe(ctx, state, &hot, ruleset, target)).await
 }
 
 /// Run the appropriate upstream exchange for a given route target.
@@ -713,7 +718,7 @@ async fn exchange_with_dedupe(
     // inline on an `accept` match, or hops once to another server's upstream
     // via `forward`); `target` on return is whichever rule ultimately produced
     // the outcome, and governs cache policy/logging below.
-    let (result, target) = resolve_with_filters(&ctx, state, hot, ruleset, target).await;
+    let (result, target) = Box::pin(resolve_with_filters(&ctx, state, hot, ruleset, target)).await;
     let skip_cache = target.skip_cache();
     let upstream_name = target.upstream_name();
     let upstream_arc = target.upstream_name_arc();
@@ -940,7 +945,7 @@ async fn resolve_with_filters<'a>(
 ) -> (Result<StepOutcome>, RouteTarget<'a>) {
     use crate::response_filter::FilterAction;
 
-    let (resp, winner_idx) = match do_upstream_exchange(ctx, state, hot, &target).await {
+    let (resp, winner_idx) = match Box::pin(do_upstream_exchange(ctx, state, hot, &target)).await {
         Ok(r) => r,
         Err(e) => return (Err(e), target),
     };
@@ -961,7 +966,8 @@ async fn resolve_with_filters<'a>(
                     // but `target_idx` is threaded through so the caller can
                     // still honor a fixed (`RCODE://`) forward target's own TTL.
                     let forward_target = RouteTarget::Server(&hot.servers[target_idx], target_idx);
-                    let fresp = do_upstream_exchange(ctx, state, hot, &forward_target).await;
+                    let fresp =
+                        Box::pin(do_upstream_exchange(ctx, state, hot, &forward_target)).await;
                     return (
                         fresp.map(|(b, _)| {
                             StepOutcome::Response(b, "forwarded", None, Some(target_idx))
