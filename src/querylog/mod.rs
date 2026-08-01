@@ -103,11 +103,68 @@ pub fn unix_micros_now() -> u64 {
 
 // ── Counters ─────────────────────────────────────────────────────────────────
 
+/// One counter slot on its own cache line, so incrementing one shard never
+/// invalidates another shard's line (128-byte alignment also covers aarch64's
+/// larger prefetch stride).
+#[repr(align(128))]
+struct PaddedU64(AtomicU64);
+
+/// A per-thread-sharded `u64` counter for the hottest per-query stats.
+///
+/// The single-global-atomic counters below are fine for anything incremented
+/// off the hot path, but the three per-query ones (`queries_udp`,
+/// `queries_tcp`, `cache_hits`) are `fetch_add`-ed by every SO_REUSEPORT shard
+/// on every packet. As one shared, densely-packed cache line that turns into
+/// cross-core ping-pong (and false sharing between the adjacent counters) that
+/// caps throughput on many-core boxes.
+///
+/// Each writer instead bumps its own line, keyed by the same per-thread
+/// [`thread_shard`] id used for the event channels, so with
+/// `shards == worker-threads` the runtime's workers land on distinct slots and
+/// never contend. Reads (the 1 Hz sampler and on-demand dashboard) sum the
+/// slots — a cost paid far off the hot path.
+///
+/// The method signatures mirror [`AtomicU64`] (`fetch_add`/`load` taking an
+/// `Ordering`) so existing call sites are unchanged; the ordering argument is
+/// accepted and ignored — every access is `Relaxed`, matching the rest of these
+/// counters.
+pub struct ShardedCounter {
+    slots: Box<[PaddedU64]>,
+}
+
+impl ShardedCounter {
+    fn new(shards: usize) -> Self {
+        let n = shards.max(1);
+        let slots = (0..n).map(|_| PaddedU64(AtomicU64::new(0))).collect();
+        Self { slots }
+    }
+
+    /// Add to the calling thread's shard. Returns that shard's previous value
+    /// (like [`AtomicU64::fetch_add`]); no caller relies on the global total
+    /// here, and reads go through [`Self::load`].
+    #[inline]
+    pub fn fetch_add(&self, val: u64, _order: Ordering) -> u64 {
+        self.slots[thread_shard(self.slots.len())]
+            .0
+            .fetch_add(val, Ordering::Relaxed)
+    }
+
+    /// Sum across all shards. The `Ordering` argument mirrors [`AtomicU64::load`]
+    /// and is ignored (relaxed): the per-shard reads are not a single atomic
+    /// snapshot, which is irrelevant for these monotonically-growing stats.
+    #[inline]
+    pub fn load(&self, _order: Ordering) -> u64 {
+        self.slots.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
+    }
+}
+
 /// Hot-path counters — always incremented, never blocked.
 pub struct QueryLogCounters {
-    pub queries_udp: AtomicU64,
-    pub queries_tcp: AtomicU64,
-    pub cache_hits: AtomicU64,
+    /// Per-query counters, sharded per worker thread to avoid cross-core
+    /// contention — see [`ShardedCounter`].
+    pub queries_udp: ShardedCounter,
+    pub queries_tcp: ShardedCounter,
+    pub cache_hits: ShardedCounter,
     pub upstream_ok: AtomicU64,
     pub upstream_err: AtomicU64,
     pub inflight_queued: AtomicU64,
@@ -161,11 +218,13 @@ impl QueryLogCounters {
         self.queries_udp.load(Ordering::Relaxed) + self.queries_tcp.load(Ordering::Relaxed)
     }
 
-    pub fn new() -> Self {
+    /// `shards` is the per-thread fan-out for the hot [`ShardedCounter`] fields
+    /// (pass `worker-threads` so runtime workers land on distinct slots).
+    pub fn new(shards: usize) -> Self {
         Self {
-            queries_udp: AtomicU64::new(0),
-            queries_tcp: AtomicU64::new(0),
-            cache_hits: AtomicU64::new(0),
+            queries_udp: ShardedCounter::new(shards),
+            queries_tcp: ShardedCounter::new(shards),
+            cache_hits: ShardedCounter::new(shards),
             upstream_ok: AtomicU64::new(0),
             upstream_err: AtomicU64::new(0),
             inflight_queued: AtomicU64::new(0),
@@ -192,12 +251,6 @@ impl QueryLogCounters {
             ring_evictions: AtomicU64::new(0),
             file_write_errors: AtomicU64::new(0),
         }
-    }
-}
-
-impl Default for QueryLogCounters {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -322,7 +375,7 @@ pub fn build(
     Arc<StatsRing>,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let counters = Arc::new(QueryLogCounters::new());
+    let counters = Arc::new(QueryLogCounters::new(cfg.shards));
     let seq = Arc::new(AtomicU64::new(0));
     let qps_ring = Arc::new(QpsRing::new());
     let stats_ring = Arc::new(StatsRing::new());
