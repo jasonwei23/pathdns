@@ -991,7 +991,7 @@ mod tests {
 /// copy-out pattern (lookup → Bytes::copy_from_slice). Both loops share
 /// whatever incidental allocation the cache implementation itself does, so
 /// the comparison isolates exactly the pattern change.
-#[cfg(all(test, not(feature = "jemalloc")))]
+#[cfg(test)]
 #[allow(unsafe_code)] // the counting GlobalAlloc is inherently unsafe; test-only
 mod alloc_proof {
     use super::*;

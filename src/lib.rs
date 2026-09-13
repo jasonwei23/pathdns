@@ -9,10 +9,6 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("pathdns only builds on Linux (requires recvmmsg, netlink, SO_REUSEPORT, ...).");
 
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 // The whole application lives here as a library (with a thin `main.rs` binary
 // on top) so that `fuzz/` can link against it and call directly into the
 // wire-format parsers (`dns`, `mrs`, ...) without going through a process.

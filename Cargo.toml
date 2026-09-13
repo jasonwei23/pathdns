@@ -8,7 +8,6 @@ license = "MIT"
 # DoT + DoH are on by default; build with --no-default-features for a minimal
 # UDP/TCP-only resolver that drops the rustls/tokio-rustls/h2/webpki-roots stack.
 default = ["dot", "doh"]
-jemalloc = ["dep:tikv-jemallocator"]
 # DNS-over-TLS (RFC 7858); pulls the rustls + tokio-rustls + webpki-roots stack.
 dot = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 # DNS-over-HTTPS (HTTP/2); builds on `dot`'s TLS stack and adds the h2/http crates.
@@ -35,7 +34,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 webpki-roots = { version = "0.26", optional = true }
 h2 = { version = "0.4", optional = true }
 http = { version = "1", optional = true }
-tikv-jemallocator = { version = "0.6", optional = true }
 rmp-serde = "1"
 flate2 = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"], optional = true }

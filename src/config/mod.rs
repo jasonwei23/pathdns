@@ -542,10 +542,7 @@ impl Config {
         let udp_buf_size = t.udp_buf_size.unwrap_or(4 * 1024 * 1024);
         // recvmmsg batch capacity per shard, clamped to a sane range.
         let udp_recv_batch = t.udp_recv_batch.unwrap_or(64).clamp(8, 1024);
-        let upstream_udp_sockets = t
-            .upstream_udp_sockets
-            .unwrap_or(worker_threads.max(32))
-            .max(1);
+        let upstream_udp_sockets = t.upstream_udp_sockets.unwrap_or(worker_threads).max(1);
 
         // Parse dashboard section.
         let dashboard = parse::parse_dashboard_config(json.dashboard, &bind_addrs, &interface)?;

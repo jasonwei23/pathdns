@@ -55,7 +55,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-**Cargo features:** `dot` (DoT), `doh` (DoH, implies `dot`), `doq` (DoQ), `h3` (DoH3, implies `doq`), `jemalloc`. `default = ["dot", "doh"]`.
+**Cargo features:** `dot` (DoT), `doh` (DoH, implies `dot`), `doq` (DoQ), `h3` (DoH3, implies `doq`). `default = ["dot", "doh"]`.
 
 ### Testing
 
@@ -416,7 +416,7 @@ Tune these only for special network environments, debugging, or measured bottlen
 | `tcp-read-timeout-ms` | int (ms) | `5000` | Timeout for reading the DNS message body. `0` = disabled. |
 | `tcp-idle-timeout-ms` | int (ms) | `30000` | Idle TCP connection timeout. `0` = disabled. |
 | `udp-buf-size` | int | `4194304` | `SO_RCVBUF`/`SO_SNDBUF` size per UDP socket (bytes). |
-| `upstream-udp-sockets` | int | **auto** (`max(worker-threads, 32)`) | UDP socket pool size per upstream node. |
+| `upstream-udp-sockets` | int | **auto** (`worker-threads`) | UDP socket pool size per upstream node. |
 
 ### Cache
 
