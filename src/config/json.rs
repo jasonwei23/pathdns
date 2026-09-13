@@ -160,9 +160,10 @@ pub(crate) struct JsonRuntimeSection {
     pub(crate) tcp_idle_timeout_ms: Option<u64>,
     // UDP I/O
     pub(crate) udp_buf_size: Option<usize>,
-    /// io_uring provided-buffer-ring depth per shard (receive burst headroom vs
-    /// memory). Rounded up to a power of two. Default 256.
-    pub(crate) uring_recv_buffers: Option<usize>,
+    /// `recvmmsg` batch capacity per shard (receive burst headroom vs memory).
+    /// Default 64. Formerly `uring-recv-buffers` (kept as an alias).
+    #[serde(alias = "uring-recv-buffers")]
+    pub(crate) udp_recv_batch: Option<usize>,
     /// Per-datagram UDP socket diagnostics: "off", "basic" (SO_RXQ_OVFL drop
     /// accounting + SO_MEMINFO sampling) or "full" (adds SO_TIMESTAMPNS
     /// kernel→userspace latency; the default).

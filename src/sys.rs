@@ -257,15 +257,6 @@ pub(crate) fn recv_error_queue(
     }
 }
 
-pub(crate) fn page_size() -> usize {
-    // SAFETY: sysconf has no pointer arguments or caller-side invariants.
-    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(value)
-        .ok()
-        .filter(|v| *v > 0)
-        .unwrap_or(4096)
-}
-
 pub(crate) fn clock_realtime() -> io::Result<libc::timespec> {
     // SAFETY: all-zero is a valid timespec representation and the pointer is a
     // writable out-parameter for clock_gettime.
@@ -274,11 +265,6 @@ pub(crate) fn clock_realtime() -> io::Result<libc::timespec> {
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
     cvt_zero(rc)?;
     Ok(now)
-}
-
-pub(crate) fn zeroed_msghdr() -> libc::msghdr {
-    // SAFETY: Linux defines an all-zero msghdr as an empty message descriptor.
-    unsafe { mem::zeroed() }
 }
 
 pub(crate) fn read_timespec(bytes: &[u8]) -> Option<libc::timespec> {
@@ -300,20 +286,10 @@ pub(crate) fn read_timespec(bytes: &[u8]) -> Option<libc::timespec> {
     Some(value)
 }
 
-/// Parse the prefix of a kernel-produced sockaddr buffer.
-pub(crate) fn read_sockaddr_bytes(bytes: &[u8]) -> Option<SocketAddr> {
-    // SAFETY: all-zero is a valid sockaddr_storage representation.
-    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-    let len = bytes.len().min(mem::size_of_val(&storage));
-    // SAFETY: both pointers are valid for `len`, the regions cannot overlap, and
-    // `len` is capped to the destination size.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), &mut storage as *mut _ as *mut u8, len);
-    }
-    read_sockaddr(&storage, len as libc::socklen_t)
-}
-
-fn read_sockaddr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<SocketAddr> {
+pub(crate) fn read_sockaddr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET if len as usize >= mem::size_of::<libc::sockaddr_in>() => {
             // SAFETY: sockaddr_storage provides the required size/alignment and the
@@ -577,6 +553,145 @@ impl RecvMmsgBatch {
         // SAFETY: the kernel wrote exactly `len` (<= slot_size) bytes at base+offset,
         // and slots do not overlap, so this is a unique, initialised view.
         Some(unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(offset), len) })
+    }
+}
+
+/// Reusable storage for one `recvmmsg(2)` batch on an **unconnected** (listening)
+/// socket: each slot also captures the sender's address and, optionally, a
+/// control-message area (for `SO_RXQ_OVFL`/`SO_TIMESTAMPNS` diagnostics).
+///
+/// Like `RecvMmsgBatch`, the payload backing store is one uninitialised
+/// allocation so resident memory tracks only bytes the kernel actually wrote.
+pub(crate) struct UdpRecvBatch {
+    buf: Vec<u8>,
+    slot_size: usize,
+    names: Vec<libc::sockaddr_storage>,
+    control: Vec<u8>,
+    control_len: usize,
+    #[allow(dead_code)]
+    iovecs: Vec<libc::iovec>,
+    messages: Vec<libc::mmsghdr>,
+}
+
+// SAFETY: every raw pointer stored permanently points into one of this type's own
+// fixed Vec allocations (never reallocated). Moving the handles between threads does
+// not move those heap allocations, so the pointers remain valid.
+unsafe impl Send for UdpRecvBatch {}
+
+impl UdpRecvBatch {
+    /// `control_len` of 0 disables control-message capture entirely (no
+    /// `msg_control`/`msg_controllen` wired up), matching diagnostics being off.
+    pub(crate) fn new(capacity: usize, slot_size: usize, control_len: usize) -> Self {
+        let capacity = capacity.max(1);
+        let slot_size = slot_size.max(1);
+        let mut buf: Vec<u8> = Vec::with_capacity(capacity * slot_size);
+        let base = buf.as_mut_ptr();
+        // SAFETY: an all-zero sockaddr_storage is a valid starting state before wiring.
+        let mut names = (0..capacity)
+            .map(|_| unsafe { mem::zeroed::<libc::sockaddr_storage>() })
+            .collect::<Vec<_>>();
+        let mut control = vec![0u8; capacity * control_len];
+        let control_base = control.as_mut_ptr();
+        // SAFETY: an all-zero iovec is a valid starting state before wiring.
+        let mut iovecs = vec![unsafe { mem::zeroed::<libc::iovec>() }; capacity];
+        // SAFETY: an all-zero mmsghdr is valid before its fields are wired below.
+        let mut messages = vec![unsafe { mem::zeroed::<libc::mmsghdr>() }; capacity];
+        for i in 0..capacity {
+            // SAFETY: `base + i*slot_size` stays within the single `capacity*slot_size`
+            // allocation reserved above.
+            iovecs[i].iov_base = unsafe { base.add(i * slot_size) } as *mut libc::c_void;
+            iovecs[i].iov_len = slot_size;
+            messages[i].msg_hdr.msg_iov = &mut iovecs[i];
+            messages[i].msg_hdr.msg_iovlen = 1 as _;
+            messages[i].msg_hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
+            messages[i].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+            if control_len > 0 {
+                // SAFETY: `control_base + i*control_len` stays within the single
+                // `capacity*control_len` allocation reserved above.
+                messages[i].msg_hdr.msg_control =
+                    unsafe { control_base.add(i * control_len) } as *mut libc::c_void;
+                messages[i].msg_hdr.msg_controllen = control_len as _;
+            }
+        }
+        Self {
+            buf,
+            slot_size,
+            names,
+            control,
+            control_len,
+            iovecs,
+            messages,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Receive up to `capacity` datagrams in one non-blocking syscall. Returns the
+    /// number received; per-message data is obtained via [`Self::payload`],
+    /// [`Self::peer`] and [`Self::control`]. Surfaces `WouldBlock` (EAGAIN) so a
+    /// `tokio::io::try_io` caller can wait for readability.
+    pub(crate) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+        for m in &mut self.messages {
+            m.msg_len = 0;
+            m.msg_hdr.msg_flags = 0;
+            m.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+            if self.control_len > 0 {
+                m.msg_hdr.msg_controllen = self.control_len as _;
+            }
+        }
+        loop {
+            // SAFETY: `messages`/`iovecs`/`names`/`control` are initialised and point
+            // into their owning, fixed Vec allocations; recvmmsg writes only into
+            // those regions and sets msg_len/msg_namelen/msg_controllen.
+            let n = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    self.messages.as_mut_ptr(),
+                    self.capacity() as libc::c_uint,
+                    libc::MSG_DONTWAIT as _,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The received bytes of message `index` (`index < count` from the last `recv`).
+    /// Returns `None` if the datagram was truncated to the slot size (oversized).
+    pub(crate) fn payload(&self, index: usize) -> Option<&[u8]> {
+        let flags = self.messages[index].msg_hdr.msg_flags;
+        if flags & libc::MSG_TRUNC != 0 {
+            return None;
+        }
+        let len = self.messages[index].msg_len as usize;
+        let offset = index * self.slot_size;
+        // SAFETY: the kernel wrote exactly `len` (<= slot_size) bytes at base+offset,
+        // and slots do not overlap.
+        Some(unsafe { std::slice::from_raw_parts(self.buf.as_ptr().add(offset), len) })
+    }
+
+    /// The sender address of message `index`.
+    pub(crate) fn peer(&self, index: usize) -> Option<SocketAddr> {
+        read_sockaddr(&self.names[index], self.messages[index].msg_hdr.msg_namelen)
+    }
+
+    /// The control-message bytes the kernel actually wrote for message `index`
+    /// (empty if control capture is disabled or the kernel wrote none).
+    pub(crate) fn control(&self, index: usize) -> &[u8] {
+        if self.control_len == 0 {
+            return &[];
+        }
+        let len = self.messages[index].msg_hdr.msg_controllen.min(self.control_len);
+        let offset = index * self.control_len;
+        &self.control[offset..offset + len]
     }
 }
 

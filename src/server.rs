@@ -878,8 +878,8 @@ async fn reload_config(state: &AppState) -> Result<()> {
         if old.cfg.udp_buf_size != cfg.udp_buf_size {
             changed.push("runtime.udp-buf-size");
         }
-        if old.cfg.uring_recv_buffers != cfg.uring_recv_buffers {
-            changed.push("runtime.uring-recv-buffers");
+        if old.cfg.udp_recv_batch != cfg.udp_recv_batch {
+            changed.push("runtime.udp-recv-batch");
         }
         if old.cfg.udp_diagnostics != cfg.udp_diagnostics {
             changed.push("runtime.udp-diagnostics");

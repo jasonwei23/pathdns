@@ -1,6 +1,6 @@
 //! Batch UDP send using Linux sendmmsg(2), plus shared sockaddr helpers.
 //!
-//! The receive side lives in `udp_uring` (io_uring multishot recvmsg). This module
+//! The receive side lives in `udp_recv` (batched recvmmsg). This module
 //! owns the send half: a pre-allocated `SendBatch` whose iovec/mmsghdr/sockaddr
 //! arrays are wired up once and reused for every `sendmmsg`, so dispatching a batch
 //! of responses costs zero heap allocations.

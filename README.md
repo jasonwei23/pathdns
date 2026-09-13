@@ -2,9 +2,9 @@
 
 A policy-based DNS forwarder for split-horizon deployments. Routes queries to different upstream resolvers based on ruleset domain classification and custom routing rules, with optional ipset/nftset integration for IP-based routing decisions.
 
-**Linux only.** The project uses Linux-specific APIs throughout (io_uring, `sendmmsg`, `SO_REUSEPORT`, netlink for ipset/nftset, `SO_BINDTODEVICE`) and is not designed to run on other platforms.
+**Linux only.** The project uses Linux-specific APIs throughout (`recvmmsg`/`sendmmsg`, `SO_REUSEPORT`, netlink for ipset/nftset, `SO_BINDTODEVICE`) and is not designed to run on other platforms.
 
-> **Requires Linux kernel 6.0 or newer.** The UDP receive path is built exclusively on **io_uring multishot `recvmsg`** with provided buffer rings — there is **no `recvmmsg` fallback**. pathdns probes for support at startup and **refuses to start** with a clear error if the kernel is too old. See [Requirements](#requirements).
+The UDP receive path is built on batched **`recvmmsg(2)`** on plain Tokio UDP sockets — each wakeup drains the socket in `recvmmsg` batches (looping while a batch comes back full) rather than one `recv` per packet. No kernel-registered/pinned buffer memory is involved, so the per-shard footprint is a small, ordinary, reclaimable heap allocation. `recvmmsg` has been available since Linux 2.6.33, so there is no meaningful kernel-version floor.
 
 ---
 
@@ -12,25 +12,11 @@ A policy-based DNS forwarder for split-horizon deployments. Routes queries to di
 
 | Requirement | Why |
 |---|---|
-| **Linux ≥ 6.0** | UDP datagrams are received with a single io_uring **multishot `recvmsg`** fed by a kernel-managed **provided buffer ring** (the ring registration needs 5.19, multishot recvmsg needs 6.0). One submission then delivers packets continuously — one completion per packet, no per-packet recv syscall. |
-| io_uring not seccomp-blocked | Some container runtimes disable the `io_uring_setup`/`io_uring_enter` syscalls. pathdns needs them for the receive path. |
+| **Linux** | UDP datagrams are received in batches via `recvmmsg(2)`; sends are batched via `sendmmsg(2)`. Both have been available since Linux 2.6.33/3.0, so any current distribution or router kernel works. |
 
-There is **no compatibility/fallback layer**: this branch deliberately drops the
-older `recvmmsg` receive loop. The startup probe arms a multishot `recvmsg` on a
-throwaway loopback socket and confirms a round trip; if that fails, pathdns exits
-with:
-
-```
-io_uring multishot recvmsg is unavailable — pathdns requires Linux 6.0+ ...
-```
-
-Check your kernel with `uname -r`. Most current distributions (and OpenWrt ≥ 23.05
-on supported targets) ship ≥ 6.0; older long-term router kernels (5.4 / 5.10 / 5.15)
-do **not** work with this build.
-
-Sends still use `sendmmsg`, and the dashboard's drop diagnostics — `SO_RXQ_OVFL`
-(kernel receive-overflow drops) and `SO_MEMINFO` (receive-buffer occupancy) — are
-carried on the io_uring receive path.
+The dashboard's drop diagnostics — `SO_RXQ_OVFL` (kernel receive-overflow drops)
+and `SO_MEMINFO` (receive-buffer occupancy) — are carried as control messages on
+the same `recvmmsg` calls.
 
 ---
 
@@ -39,7 +25,7 @@ carried on the io_uring receive path.
 - **Ruleset routing** — rules matched by domain pattern and/or ruleset tag, each pointing at a named `route.servers` entry; top-to-bottom match order. Multiple rules sharing a server share one connection pool.
 - **Encrypted upstreams** — DoT (`tls://`, `dot` feature, on by default), DoH (`https://`, `doh` feature, on by default), DoQ (`quic://`, `--features doq`), DoH3 (`h3://`, `--features h3`). Build `--no-default-features` for a UDP/TCP-only resolver that drops the entire TLS/HTTP stack (~22 fewer crates).
 - **EDNS-aware cache isolation** — DO bit and ECS subnet are part of the cache key. When an upstream uses `ecs=strip`, all clients share one entry regardless of subnet.
-- **io_uring UDP receive** (Linux 6.0+) — a single multishot `recvmsg` over a provided buffer ring delivers datagrams with no per-packet recv syscall; responses are batched with `sendmmsg`.
+- **Batched UDP receive** — datagrams are drained in `recvmmsg` batches instead of one `recv` per packet; responses are batched with `sendmmsg`.
 - **Hot-reload** — ruleset files and routing config are watched and reloaded without restart.
 - **Built-in dashboard** — authenticated HTTP API and single-page web UI with live QPS chart, counter cards, query log, and upstream stats.
 

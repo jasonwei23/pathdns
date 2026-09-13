@@ -1,13 +1,13 @@
-// pathdns is Linux-only by construction: io_uring multishot recvmsg, netlink
-// (ipset/nftset), SO_REUSEPORT and other Linux APIs are used unconditionally.
-// Fail with one clear message instead of a cascade of unresolved-symbol errors.
+// pathdns is Linux-only by construction: recvmmsg/sendmmsg, netlink (ipset/nftset),
+// SO_REUSEPORT and other Linux APIs are used unconditionally. Fail with one clear
+// message instead of a cascade of unresolved-symbol errors.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(not(test), warn(clippy::expect_used, clippy::unwrap_used))]
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("pathdns only builds on Linux (requires io_uring, netlink, SO_REUSEPORT, ...).");
+compile_error!("pathdns only builds on Linux (requires recvmmsg, netlink, SO_REUSEPORT, ...).");
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -38,9 +38,8 @@ pub mod singleflight;
 pub mod stats;
 #[allow(unsafe_code)]
 pub mod sys;
+pub mod udp_recv;
 pub mod udp_send;
-#[allow(unsafe_code)]
-pub mod udp_uring;
 pub mod upstream;
 pub mod verdict_cache;
 

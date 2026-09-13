@@ -4,7 +4,7 @@
 //! and run them in a `JoinSet`. The kernel distributes incoming packets/connections across
 //! the socket group with no central bottleneck.
 //!
-//! UDP receive uses io_uring multishot recvmsg (`udp_uring`); sends are batched with
+//! UDP receive uses batched recvmmsg (`udp_recv`); sends are batched with
 //! sendmmsg (`udp_send`). Cache hits and filter hits are batched into one sendmmsg call.
 //! Only cache misses spawn a task for full async upstream resolution.
 //! TCP connections are handled per-connection in a spawned task that calls `handle_packet`.
@@ -50,14 +50,6 @@ pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
         ));
     }
     let addr = sockets[0].local_addr()?;
-    // io_uring multishot recvmsg is a hard requirement — there is no recvmmsg
-    // fallback. Fail fast with a clear message if the kernel is too old.
-    if !crate::udp_uring::supported() {
-        return Err(anyhow!(
-            "io_uring multishot recvmsg is unavailable — pathdns requires Linux 6.0+ \
-             (see README). No recvmmsg fallback is built."
-        ));
-    }
     if n == 1 {
         if let Some(iface) = iface {
             crate::startup!("listen udp://{} (iface={})", addr, iface);
@@ -83,14 +75,13 @@ pub async fn serve_udp(bind: SocketAddr, iface: Option<&str>, state: Arc<AppStat
     }
 }
 
-/// Run one UDP shard on the io_uring multishot-recvmsg receive path. Kernel support
-/// is verified up front by the caller, so this never falls back.
+/// Run one UDP shard on the batched-recvmmsg receive path.
 async fn run_udp_worker(
     socket: Arc<UdpSocket>,
     state: Arc<AppState>,
     batch_size: usize,
 ) -> Result<()> {
-    crate::udp_uring::serve_udp_uring(socket, state, batch_size).await
+    crate::udp_recv::serve_udp_recvmmsg(socket, state, batch_size).await
 }
 
 /// Bind `worker_threads` SO_REUSEPORT TCP listeners and race them in a `JoinSet`.

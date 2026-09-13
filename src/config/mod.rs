@@ -337,7 +337,7 @@ pub struct BindEndpoint {
 /// upstream timeouts/hedging, and TCP read/idle timeouts.
 ///
 /// **Startup-only** (a reload logs `restart_required`): listeners and worker sizing,
-/// io_uring/listener buffers, global inflight/TCP connection limits, cache and
+/// UDP recv-batch/listener buffers, global inflight/TCP connection limits, cache and
 /// persistence construction, ipset/verdict-cache managers, dashboard/querylog, and
 /// the ruleset watcher file list.
 #[derive(Debug, Clone)]
@@ -358,9 +358,9 @@ pub struct Config {
     pub cache_persist_interval: u64,
     /// Listener-start-only: changing this requires a restart.
     pub udp_buf_size: usize,
-    /// io_uring provided-buffer-ring depth per shard (power of two).
+    /// `recvmmsg` batch capacity per shard.
     /// Listener-start-only: changing this requires a restart.
-    pub uring_recv_buffers: usize,
+    pub udp_recv_batch: usize,
     /// Socket-level UDP diagnostics level (cmsg options are set at bind time).
     /// Listener-start-only: changing this requires a restart.
     pub udp_diagnostics: UdpDiagnostics,
@@ -540,13 +540,8 @@ impl Config {
             }
         };
         let udp_buf_size = t.udp_buf_size.unwrap_or(4 * 1024 * 1024);
-        // Provided buffer-ring depth: power of two, clamped to a sane range. The ring
-        // index is a u16, so the kernel caps it at 32768; we cap lower for memory.
-        let uring_recv_buffers = t
-            .uring_recv_buffers
-            .unwrap_or(256)
-            .clamp(16, 8192)
-            .next_power_of_two();
+        // recvmmsg batch capacity per shard, clamped to a sane range.
+        let udp_recv_batch = t.udp_recv_batch.unwrap_or(64).clamp(8, 1024);
         let upstream_udp_sockets = t
             .upstream_udp_sockets
             .unwrap_or(worker_threads.max(32))
@@ -586,7 +581,7 @@ impl Config {
                 .and_then(|p| p.interval)
                 .unwrap_or(0),
             udp_buf_size,
-            uring_recv_buffers,
+            udp_recv_batch,
             udp_diagnostics,
             upstream_udp_sockets,
             servers,
@@ -695,7 +690,7 @@ mod anchor_tests {
             cache_persist_path: cfg_paths.1.take(),
             cache_persist_interval: 0,
             udp_buf_size: 0,
-            uring_recv_buffers: 16,
+            udp_recv_batch: 16,
             udp_diagnostics: UdpDiagnostics::Full,
             upstream_udp_sockets: 1,
             tcp_max_connections: 0,
