@@ -689,7 +689,14 @@ impl UdpRecvBatch {
         if self.control_len == 0 {
             return &[];
         }
-        let len = self.messages[index].msg_hdr.msg_controllen.min(self.control_len);
+        // `msg_controllen`'s width varies by libc/arch (`size_t` on glibc x86_64/
+        // aarch64, `socklen_t` elsewhere), so this conversion is a no-op on some
+        // targets and load-bearing on others — allow whichever lint that target's
+        // clippy would otherwise raise.
+        #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+        let controllen = usize::try_from(self.messages[index].msg_hdr.msg_controllen)
+            .unwrap_or(self.control_len);
+        let len = controllen.min(self.control_len);
         let offset = index * self.control_len;
         &self.control[offset..offset + len]
     }
