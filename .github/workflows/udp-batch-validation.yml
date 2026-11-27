@@ -1,0 +1,38 @@
+name: UDP receive batch comparison
+on:
+  pull_request:
+    branches: [claude/busy-dirac-h0au33]
+    paths: [.github/workflows/udp-batch-validation.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    if: github.event.pull_request.head.ref == 'codex/pathdns-lazy-udp-batch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build baseline, lazy, and adaptive versions independently
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base-src" ad730c85a79cfe81b7bba6060e7c0e14e12dff67
+          git worktree add --detach "$RUNNER_TEMP/adaptive-src" ad730c85a79cfe81b7bba6060e7c0e14e12dff67
+          cp testing/benchmark/udp-batch-prototype.rs "$RUNNER_TEMP/adaptive-src/src/upstream/udp.rs"
+          for variant in base lazy adaptive; do
+            case "$variant" in
+              lazy) source_dir="$GITHUB_WORKSPACE" ;;
+              *) source_dir="$RUNNER_TEMP/$variant-src" ;;
+            esac
+            export CARGO_TARGET_DIR="$RUNNER_TEMP/target-$variant"
+            (cd "$source_dir" && cargo build --locked --release --no-default-features)
+            cp "$CARGO_TARGET_DIR/release/pathdns" "$RUNNER_TEMP/pathdns-$variant"
+          done
+          rustc -O testing/benchmark/loadbench.rs -o "$RUNNER_TEMP/reuse-load"
+          rustc -O testing/benchmark/rustmock.rs -o "$RUNNER_TEMP/reuse-mock"
+          uname -m
+          wc -c "$RUNNER_TEMP/pathdns-base" "$RUNNER_TEMP/pathdns-lazy" "$RUNNER_TEMP/pathdns-adaptive"
+          sha256sum "$RUNNER_TEMP/pathdns-base" "$RUNNER_TEMP/pathdns-lazy" "$RUNNER_TEMP/pathdns-adaptive" | tee "$RUNNER_TEMP/udp-batch-hashes"
+          test "$(cut -d' ' -f1 "$RUNNER_TEMP/udp-batch-hashes" | sort -u | wc -l)" -eq 3
+      - name: Compare idle, primed, and loaded memory with forwarding rate
+        run: python3 testing/benchmark/udp-batch-validation.py
