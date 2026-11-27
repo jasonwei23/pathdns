@@ -6,8 +6,10 @@ use crate::sys;
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use std::cell::RefCell;
+use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,10 +17,15 @@ use tokio::net::UdpSocket;
 
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
-/// Datagrams drained per `recvmmsg` syscall on each upstream socket. Larger batches
-/// amortise the syscall over more responses under load; 16 keeps per-socket buffer
-/// reservation modest (slots are lazily committed, so unused capacity costs nothing).
+/// Datagrams drained per `recvmmsg` syscall on each upstream socket.
 const RECV_BATCH: usize = 16;
+
+thread_local! {
+    // One batch per thread that receives an upstream reply. The borrow ends
+    // before the task can yield, so even tasks that migrate can share storage.
+    static RECV_BUFFER: RefCell<sys::RecvMmsgBatch> =
+        RefCell::new(sys::RecvMmsgBatch::new(RECV_BATCH, MAX_DNS_MESSAGE));
+}
 
 /// Outbound queries coalesced per `sendmmsg` syscall on each upstream socket.
 const SEND_BATCH: usize = 16;
@@ -250,7 +257,6 @@ impl UdpUpstream {
     }
 
     async fn recv_loop(self: Arc<Self>, socket_idx: usize, my_gen: u64) -> Result<()> {
-        let mut batch = sys::RecvMmsgBatch::new(RECV_BATCH, MAX_DNS_MESSAGE);
         let mut recv_count = 0u32;
         loop {
             // Register interest in `refreshed` *before* the generation check:
@@ -275,10 +281,10 @@ impl UdpUpstream {
             // blocked on a socket that a sibling task already replaced — see
             // `trigger_refresh`'s docs for why a UDP failure can be otherwise silent.
             let received = tokio::select! {
-                r = socket.async_io(tokio::io::Interest::READABLE, || batch.recv(fd)) => r,
+                r = socket.async_io(tokio::io::Interest::READABLE, || self.recv_ready(fd)) => r,
                 _ = &mut refreshed => continue,
             };
-            let received = match received {
+            let delivered = match received {
                 Ok(n) => n,
                 // ICMP unreachable for this connected upstream surfaces as a socket
                 // error. Drain the IP_RECVERR queue and keep going — a dead/unreachable
@@ -290,27 +296,35 @@ impl UdpUpstream {
                 }
                 Err(e) => return Err(e.into()),
             };
+            recv_count += delivered;
+            // Yield between batches, once roughly 100 responses have been dispatched.
+            if recv_count >= 100 {
+                recv_count -= 100;
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn recv_ready(&self, fd: RawFd) -> io::Result<u32> {
+        RECV_BUFFER.with(|buffer| {
+            let mut batch = buffer.borrow_mut();
+            let received = batch.recv(fd)?;
+            let mut delivered = 0;
             for i in 0..received {
                 // `None` = the datagram was truncated to the slot size (oversized);
                 // skip it, the waiter falls back to its timeout.
                 let Some(packet) = batch.message(i) else {
                     continue;
                 };
+                // complete copies the response into owned Bytes before waking its waiter.
                 match self.inflight.complete(packet) {
-                    Completion::Delivered => {
-                        recv_count += 1;
-                        // Yield every 100 dispatched responses to prevent monopolizing
-                        // the Tokio worker during sustained bursts.
-                        if recv_count >= 100 {
-                            recv_count = 0;
-                            tokio::task::yield_now().await;
-                        }
-                    }
+                    Completion::Delivered => delivered += 1,
                     Completion::Mismatch(_id) => {}
                     Completion::NoWaiter => {}
                 }
             }
-        }
+            Ok(delivered)
+        })
     }
 }
 
@@ -396,4 +410,97 @@ fn drain_error_queue(fd: libc::c_int) -> u32 {
         drained += 1;
     }
     drained
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    async fn upstream(
+        answer: Ipv4Addr,
+        padding: u16,
+    ) -> (Arc<UdpUpstream>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpUpstream::create(
+            crate::upstream::UpstreamCommonConfig {
+                name: answer.to_string(),
+                remote: server.local_addr().unwrap(),
+                timeout: Duration::from_secs(5),
+                ecs_mode: EcsMode::Strip,
+                max_inflight: 32,
+                mark: None,
+            },
+            2,
+            0,
+        )
+        .await
+        .unwrap();
+        let mock = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            loop {
+                let (len, addr) = server.recv_from(&mut buffer).await.unwrap();
+                let query = &buffer[..len];
+                let end = dns::question_end(query).unwrap();
+                let mut reply = dns::a_reply(query, end, answer, 60).unwrap();
+                if padding > 0 {
+                    // Add a valid EDNS padding option to exercise large UDP datagrams.
+                    reply[11] = 1;
+                    reply.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0]);
+                    reply.extend_from_slice(&(padding + 4).to_be_bytes());
+                    reply.extend_from_slice(&[0, 12]);
+                    reply.extend_from_slice(&padding.to_be_bytes());
+                    reply.resize(reply.len() + usize::from(padding), 0);
+                }
+                server.send_to(&reply, addr).await.unwrap();
+            }
+        });
+        (client, mock)
+    }
+
+    async fn query(upstream: &UdpUpstream, id: u16) -> Bytes {
+        let (packet, end) = dns::synthetic_query("reuse.test", 1).unwrap();
+        let packet = Bytes::from(packet);
+        upstream
+            .exchange(UpstreamRequest {
+                question: packet.slice(12..end),
+                packet,
+                client_id: id,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_batch_preserves_responses_across_sockets_and_refresh() {
+        let a_ip = Ipv4Addr::new(192, 0, 2, 1);
+        let b_ip = Ipv4Addr::new(192, 0, 2, 2);
+        let (a, a_mock) = upstream(a_ip, 48 * 1024).await;
+        let (b, b_mock) = upstream(b_ip, 0).await;
+
+        // Four receive tasks all execute on this thread and reuse its batch.
+        let (a1, b1, a2, b2) = tokio::join!(query(&a, 1), query(&b, 2), query(&a, 3), query(&b, 4));
+        a.do_refresh().await;
+        assert!(a.generations.iter().all(|g| g.load(Ordering::Relaxed) == 1));
+        let (a3, b3) = tokio::join!(query(&a, 5), query(&b, 6));
+
+        // Check the old results after the batch has already been reused.
+        for (id, reply, ip, extra) in [
+            (1, a1, a_ip, 15 + 48 * 1024),
+            (2, b1, b_ip, 0),
+            (3, a2, a_ip, 15 + 48 * 1024),
+            (4, b2, b_ip, 0),
+            (5, a3, a_ip, 15 + 48 * 1024),
+            (6, b3, b_ip, 0),
+        ] {
+            let end = dns::question_end(&reply).unwrap();
+            assert_eq!(dns::get_id(&reply).unwrap(), id);
+            assert_eq!(dns::answer_ips(&reply, end).as_slice(), &[std::net::IpAddr::V4(ip)]);
+            assert_eq!(reply.len(), end + 16 + extra);
+        }
+        a.shutdown();
+        b.shutdown();
+        a_mock.abort();
+        b_mock.abort();
+    }
 }
