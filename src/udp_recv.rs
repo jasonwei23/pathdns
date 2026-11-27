@@ -1,8 +1,8 @@
 //! Batched-recvmmsg UDP receive path.
 //!
 //! Each shard drains its socket with `recvmmsg(2)` batches on a plain
-//! `tokio::net::UdpSocket`, looping while a batch comes back full (more datagrams
-//! are likely still queued) and stopping on a short read or `WouldBlock`. This
+//! `tokio::net::UdpSocket`, stopping on a short read, `WouldBlock`, or the
+//! per-turn receive budget. This
 //! needs no kernel-registered/pinned memory — the batch's backing storage is a
 //! plain heap allocation sized `batch_capacity * MAX_PKT`, reused across calls.
 //!
@@ -43,6 +43,9 @@ use tokio::sync::mpsc;
 /// large EDNS buffer a client advertises governs *response* size, not the query.)
 /// Larger datagrams are flagged truncated and dropped.
 const MAX_PKT: usize = 2048;
+/// Target number of datagrams to process before flushing replies and yielding.
+/// A configured receive batch larger than this still gets one syscall per turn.
+const RECV_PACKETS_PER_TURN: usize = 256;
 /// Per-slot control-message space. Holds the `SO_RXQ_OVFL` cmsg (u32) plus the
 /// `SCM_TIMESTAMPNS` cmsg (timespec); `CMSG_SPACE(4)+CMSG_SPACE(16)` ≈ 72 bytes.
 const CONTROL_LEN: usize = 128;
@@ -517,6 +520,7 @@ pub(crate) async fn serve_udp_recvmmsg(
         0
     };
     let mut recv = UdpRecvBatch::new(recv_batch, MAX_PKT, control_len);
+    let batches_per_turn = (RECV_PACKETS_PER_TURN / recv.capacity()).max(1);
 
     let mut bs = SendBatch::new(batch_size);
     let mut send_items: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(batch_size);
@@ -564,14 +568,16 @@ pub(crate) async fn serve_udp_recvmmsg(
         }
 
         send_items.clear();
-        // Drain every currently-queued datagram: loop calling recvmmsg (each attempt
-        // wrapped in try_io so tokio's readiness bit is cleared correctly) while a
-        // call returns a full batch — more is likely still queued — stopping on a
-        // short read or WouldBlock.
-        loop {
+        // Bound the drain so a continuously readable socket cannot delay
+        // sendmmsg or monopolize the worker that runs upstream tasks.
+        let mut may_have_more = false;
+        for _ in 0..batches_per_turn {
             let n = match socket.try_io(Interest::READABLE, || recv.recv(fd)) {
                 Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    may_have_more = false;
+                    break;
+                }
                 Err(e) => return Err(e).context("recvmmsg"),
             };
             let stats = process_batch(
@@ -611,7 +617,8 @@ pub(crate) async fn serve_udp_recvmmsg(
                     .udp_recv_lat_us_acc
                     .fetch_max(stats.recv_lat_us, Ordering::Relaxed);
             }
-            if n < recv.capacity() {
+            may_have_more = n == recv.capacity();
+            if !may_have_more {
                 break;
             }
         }
@@ -638,6 +645,9 @@ pub(crate) async fn serve_udp_recvmmsg(
         );
         if !pending_sends.is_empty() {
             drain_pending_sends(&socket, fd, &mut bs, batch_size, &mut pending_sends, &state);
+        }
+        if may_have_more {
+            tokio::task::yield_now().await;
         }
     }
 }
