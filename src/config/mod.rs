@@ -23,6 +23,7 @@ use self::json::JsonConfig;
 use self::upstream_url::{parse_rcode_name, parse_upstreams};
 use crate::ruleset::RuleSetSpec;
 pub use fingerprint::cache_fingerprint;
+pub(crate) use fingerprint::cache_fingerprint_for_ruleset;
 
 // ── Public types ────────────────────────────────────────────────────────────
 
