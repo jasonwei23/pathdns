@@ -34,6 +34,7 @@ use crate::domain::DomainMatcher;
 use crate::iprange::{IpRangeSet, IpRangeSetBuilder};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,13 +72,28 @@ enum TagEntry {
     IpCidr(IpRangeSet),
 }
 
+struct LoadedTag {
+    entry: TagEntry,
+    stamp: (u64, u64),
+}
+
+/// Nanosecond mtime and size, used to fingerprint the exact file generation loaded.
+pub(crate) fn file_stamp(metadata: &std::fs::Metadata) -> (u64, u64) {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    (mtime, metadata.len())
+}
+
 /// Compiled ruleset database. Holds matchers for a selected subset of tags only.
 ///
 /// Entries are `Arc`-wrapped so a partial reload (`load`'s `reuse` parameter)
 /// can share an unchanged tag's already-parsed matcher with the previous
 /// `RuleSetDb` instance instead of re-parsing its file.
 pub struct RuleSetDb {
-    tags: HashMap<String, Arc<TagEntry>>,
+    tags: HashMap<String, Arc<LoadedTag>>,
 }
 
 impl RuleSetDb {
@@ -126,9 +142,12 @@ impl RuleSetDb {
                     }
                 }
             }
+            let (raw, stamp) = read_ruleset(spec).with_context(|| {
+                format!("failed to read ruleset '{}' ({})", spec.tag, spec.path.display())
+            })?;
             let entry = match spec.behavior {
                 RuleSetBehavior::Domain => {
-                    let patterns = read_domain_patterns(spec).with_context(|| {
+                    let patterns = decode_domain_patterns(spec.format, &raw).with_context(|| {
                         format!(
                             "failed to load ruleset '{}' ({})",
                             spec.tag,
@@ -151,7 +170,7 @@ impl RuleSetDb {
                     TagEntry::Domain(matchers)
                 }
                 RuleSetBehavior::IpCidr => {
-                    let set = build_ipcidr_set(spec).with_context(|| {
+                    let set = build_ipcidr_set(spec.format, &raw).with_context(|| {
                         format!(
                             "failed to load ruleset '{}' ({})",
                             spec.tag,
@@ -161,11 +180,12 @@ impl RuleSetDb {
                     TagEntry::IpCidr(set)
                 }
             };
-            db.tags.insert(spec.tag.clone(), Arc::new(entry));
+            db.tags
+                .insert(spec.tag.clone(), Arc::new(LoadedTag { entry, stamp }));
         }
 
         for tag in domain_tags {
-            match db.tags.get(tag.as_str()).map(Arc::as_ref) {
+            match db.tags.get(tag.as_str()).map(|tag| &tag.entry) {
                 None => {
                     return Err(anyhow!(
                         "ruleset tag '{tag}' not found in any configured route.ruleset entry"
@@ -181,7 +201,7 @@ impl RuleSetDb {
             }
         }
         for tag in ipcidr_tags {
-            match db.tags.get(tag.as_str()).map(Arc::as_ref) {
+            match db.tags.get(tag.as_str()).map(|tag| &tag.entry) {
                 None => {
                     return Err(anyhow!(
                         "ruleset tag '{tag}' not found in any configured route.ruleset entry"
@@ -199,6 +219,10 @@ impl RuleSetDb {
         Ok(db)
     }
 
+    pub(crate) fn loaded_file_stamp(&self, tag: &str) -> Option<(u64, u64)> {
+        self.tags.get(tag).map(|loaded| loaded.stamp)
+    }
+
     /// Returns `true` when `domain` matches any rule stored under `tag`.
     ///
     /// `domain` must already be normalized (lowercase, no trailing dot).
@@ -206,7 +230,7 @@ impl RuleSetDb {
     /// config validation in `load` prevents such a tag from ever being
     /// reachable from a `rule.matcher` tag expression in the first place.
     pub fn matches(&self, tag: &str, domain: &str) -> bool {
-        match self.tags.get(tag).map(Arc::as_ref) {
+        match self.tags.get(tag).map(|tag| &tag.entry) {
             Some(TagEntry::Domain(m)) => {
                 m.lookup_specific(domain).is_some() || m.lookup_fuzzy(domain).is_some()
             }
@@ -220,7 +244,7 @@ impl RuleSetDb {
     /// config validation in `load` prevents such a tag from ever being
     /// reachable from an `answer-ip` field in the first place.
     pub fn matches_ip(&self, tag: &str, ip: IpAddr) -> bool {
-        match self.tags.get(tag).map(Arc::as_ref) {
+        match self.tags.get(tag).map(|tag| &tag.entry) {
             Some(TagEntry::IpCidr(set)) => set.contains(ip),
             _ => false,
         }
@@ -249,7 +273,7 @@ impl RuleSetDb {
     /// Iterator over loaded (tag, entry_count) pairs, for startup logging.
     pub fn tag_counts(&self) -> impl Iterator<Item = (&str, usize)> {
         self.tags.iter().map(|(k, v)| {
-            let n = match v.as_ref() {
+            let n = match &v.entry {
                 TagEntry::Domain(m) => m.len(),
                 TagEntry::IpCidr(set) => set.len(),
             };
@@ -258,16 +282,24 @@ impl RuleSetDb {
     }
 }
 
-// Domain-behavior loading.
+/// Read from one open file so an atomic path replacement cannot attach the
+/// replacement's metadata to the old bytes. In-place edits are retried by the watcher.
+fn read_ruleset(spec: &RuleSetSpec) -> Result<(Vec<u8>, (u64, u64))> {
+    let mut file = std::fs::File::open(&spec.path)?;
+    let stamp = file_stamp(&file.metadata()?);
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+    anyhow::ensure!(file_stamp(&file.metadata()?) == stamp, "file changed during read");
+    Ok((raw, stamp))
+}
 
-/// Read a domain-behavior ruleset file's patterns, in mihomo's inline text form.
-fn read_domain_patterns(spec: &RuleSetSpec) -> Result<Vec<String>> {
-    let raw = std::fs::read(&spec.path)?;
-    match spec.format {
-        RuleSetFormat::Mrs => crate::mrs::decode_domain_patterns(&raw),
+/// Decode a domain-behavior ruleset's patterns, in mihomo's inline text form.
+fn decode_domain_patterns(format: RuleSetFormat, raw: &[u8]) -> Result<Vec<String>> {
+    match format {
+        RuleSetFormat::Mrs => crate::mrs::decode_domain_patterns(raw),
         RuleSetFormat::Text => {
-            let text = String::from_utf8(raw).context("ruleset text file is not valid UTF-8")?;
-            Ok(parse_text_lines(&text))
+            let text = std::str::from_utf8(raw).context("ruleset text file is not valid UTF-8")?;
+            Ok(parse_text_lines(text))
         }
     }
 }
@@ -310,18 +342,16 @@ fn apply_domain_pattern(matchers: &mut TagMatchers, pattern: &str) -> bool {
 // IP-CIDR loading.
 
 /// Build a queryable IP-range set from an ipcidr-behavior ruleset file.
-fn build_ipcidr_set(spec: &RuleSetSpec) -> Result<IpRangeSet> {
+fn build_ipcidr_set(format: RuleSetFormat, raw: &[u8]) -> Result<IpRangeSet> {
     let mut builder = IpRangeSetBuilder::default();
-    match spec.format {
+    match format {
         RuleSetFormat::Mrs => {
-            let raw = std::fs::read(&spec.path)?;
-            for (from, to) in crate::mrs::decode_ipcidr_ranges(&raw)? {
+            for (from, to) in crate::mrs::decode_ipcidr_ranges(raw)? {
                 builder.push_range(from, to);
             }
         }
         RuleSetFormat::Text => {
-            let raw = std::fs::read(&spec.path)?;
-            let text = String::from_utf8(raw).context("ruleset text file is not valid UTF-8")?;
+            let text = std::str::from_utf8(raw).context("ruleset text file is not valid UTF-8")?;
             for (lineno, line) in text.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') || line.starts_with("//") {

@@ -10,6 +10,24 @@ use super::*;
 /// Covers: rules (matcher, upstream identity, filters, cache policy), fallback
 /// routing, global cache TTL settings, and ruleset file paths.
 pub fn cache_fingerprint(cfg: &Config) -> u64 {
+    cache_fingerprint_with_stamps(cfg, |spec| {
+        std::fs::metadata(&spec.path)
+            .ok()
+            .map(|metadata| crate::ruleset::file_stamp(&metadata))
+    })
+}
+
+pub(crate) fn cache_fingerprint_for_ruleset(
+    cfg: &Config,
+    ruleset: Option<&crate::ruleset::RuleSetDb>,
+) -> u64 {
+    cache_fingerprint_with_stamps(cfg, |spec| ruleset?.loaded_file_stamp(&spec.tag))
+}
+
+fn cache_fingerprint_with_stamps(
+    cfg: &Config,
+    stamp_for: impl Fn(&crate::ruleset::RuleSetSpec) -> Option<(u64, u64)>,
+) -> u64 {
     let mut h = crate::hasher::Fnv1a::new();
     macro_rules! feed {
         ($bytes:expr) => {
@@ -148,21 +166,9 @@ pub fn cache_fingerprint(cfg: &Config) -> u64 {
         feed!(spec.tag.as_bytes());
         feed!(&[spec.format as u8, spec.behavior as u8]);
         feed!(spec.path.to_string_lossy().as_bytes());
-        // Include mtime+size so a same-path file replacement invalidates the
-        // cache. Nanosecond mtime (not seconds): an equal-length replacement
-        // landing within the same second — easy for a scripted ruleset update
-        // — must still be distinguishable. (Linux filesystems in common use
-        // store nanosecond timestamps; a filesystem that truncates them just
-        // degrades back toward the old behavior.)
-        if let Ok(meta) = std::fs::metadata(&spec.path) {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+        if let Some((mtime, len)) = stamp_for(spec) {
             feed!(&mtime.to_le_bytes());
-            feed!(&meta.len().to_le_bytes());
+            feed!(&len.to_le_bytes());
         }
         sep!();
     }

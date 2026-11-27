@@ -605,6 +605,7 @@ fn render_stats(
     ring: &EventRing,
     state: &AppState,
 ) -> Vec<u8> {
+    let hot = state.hot.load();
     let c = &handle.counters;
     let total = c.queries_total();
     let cache = c.cache_hits.load(Ordering::Relaxed);
@@ -672,12 +673,12 @@ fn render_stats(
         "queue_high_watermark": queue_high_watermark,
         "ring_evictions": ring_evictions,
         "file_write_errors": file_write_errors,
-        "cache_entries": state.cache.entry_count(),
-        "cache_capacity": state.cache.capacity(),
+        "cache_entries": hot.cache.entry_count(),
+        "cache_capacity": hot.cache.capacity(),
         "add_ip_dropped": add_ip_dropped,
         // Hot-reload visibility: the reload paths' own logging is compiled
         // out, so this is where a failing or restart-requiring reload shows up.
-        "reload_generation": state.hot_generation(),
+        "reload_generation": hot.generation,
         "reload_applied": reload.applied.load(Ordering::Relaxed),
         "reload_failed_attempts": reload.failed_attempts.load(Ordering::Relaxed),
         "reload_restart_required": reload.restart_required.load(Ordering::Relaxed),

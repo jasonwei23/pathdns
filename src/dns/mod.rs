@@ -102,7 +102,7 @@ pub use ttl::{
 /// NSID=3, DAU/DHU/N3U=5/6/7, CHAIN=13) whose presence or absence may cause
 /// the upstream to return a different response.  Two queries with different
 /// non-ECS/non-PADDING option sets are placed in different cache buckets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct QueryVariant {
     /// Client presented an EDNS OPT record.
     pub has_opt: bool,
@@ -128,8 +128,10 @@ pub struct QueryVariant {
 ///
 /// Bits beyond `prefix_len` are zeroed so that structurally different but
 /// semantically identical ECS options (e.g. trailing zero bytes) compare equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EcsSrc {
+    /// EDNS address family (1 = IPv4, 2 = IPv6).
+    pub family: u16,
     /// Network address as big-endian bytes (IPv4 uses the low 4 bytes: bytes 12–15).
     pub addr: [u8; 16],
     /// Source prefix length.
@@ -308,7 +310,11 @@ fn parse_ecs_src(opt_data: &[u8]) -> Option<EcsSrc> {
         }
         _ => return None,
     };
-    Some(EcsSrc { addr, prefix_len })
+    Some(EcsSrc {
+        family,
+        addr,
+        prefix_len,
+    })
 }
 
 /// Return the byte offset immediately after the question section (QNAME + QTYPE + QCLASS).

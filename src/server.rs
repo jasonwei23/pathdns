@@ -58,21 +58,45 @@ pub struct RoutingConfig {
     pub fallback: ResolvedFallback,
 }
 
-/// Hot-reloadable state: routing config, the ruleset database, and the routing
-/// index derived from both, swapped in as a single atomic unit on every reload
-/// (config or ruleset). This is what closes the reload race: a query snapshots
-/// one `Arc<HotState>` via `state.hot.load_full()` and every field it reads
-/// back out of that snapshot is guaranteed to be from the same reload
-/// generation, never a mix of an old and a new one.
+/// Routing rules and caches published atomically on each reload. A request
+/// can finish against its old snapshot, but its writes stay in that snapshot.
 pub struct HotState {
     routing: Arc<RoutingConfig>,
     pub ruleset: Option<Arc<RuleSetDb>>,
     pub routing_index: RouteIndex,
-    /// Monotonically increasing per-reload identity, baked into this same
-    /// struct rather than tracked via a separate `AtomicU64` — reading it back
-    /// out of an already-loaded `HotState` snapshot is a plain field access,
-    /// never a second independently-timed atomic load that could race the swap.
+    pub cache: DnsCache,
+    pub verdict_cache: VerdictCache,
+    pub(crate) remote_inflight: singleflight::InflightTable,
+    /// Fingerprint of this snapshot's config and loaded rulesets, when persistence is enabled.
+    pub(crate) cache_fingerprint: Option<u64>,
     pub generation: u64,
+}
+
+impl HotState {
+    fn new(
+        routing: Arc<RoutingConfig>,
+        ruleset: Option<Arc<RuleSetDb>>,
+        cache: DnsCache,
+        generation: u64,
+    ) -> Self {
+        let cfg = &routing.cfg;
+        let routing_index = RouteIndex::build(&routing.rules, cfg.cache_size);
+        let verdict_cache = VerdictCache::new(cfg.verdict_cache.as_ref());
+        let cache_fingerprint = cfg
+            .cache_persist_path
+            .as_ref()
+            .map(|_| crate::config::cache_fingerprint_for_ruleset(cfg, ruleset.as_deref()));
+        Self {
+            routing,
+            ruleset,
+            routing_index,
+            cache,
+            verdict_cache,
+            remote_inflight: singleflight::InflightTable::new(),
+            cache_fingerprint,
+            generation,
+        }
+    }
 }
 
 impl std::ops::Deref for HotState {
@@ -166,10 +190,7 @@ pub struct AppState {
     pub limit: Arc<Semaphore>,
     /// Connection-level semaphore for TCP. `None` = unlimited.
     pub tcp_conn_limit: Option<Arc<Semaphore>>,
-    pub cache: DnsCache,
-    pub(crate) remote_inflight: singleflight::InflightTable,
     pub ipset: Option<Arc<IpSetManager>>,
-    pub verdict_cache: VerdictCache,
     pub querylog: crate::querylog::QueryLogHandle,
     /// Hot-reload outcome counters + last error, for `/api/stats`.
     pub reload: ReloadStats,
@@ -179,9 +200,8 @@ pub struct AppState {
     /// watched on its own OS thread) could otherwise interleave — the slower
     /// one's `store` would silently discard the faster one's already-published
     /// result, and both would mint the same `generation` for structurally
-    /// different `HotState`s, breaking every `routing_gen` staleness check
-    /// downstream. Held for the full read/compute/store/invalidate sequence in
-    /// both reload paths, not just around the `store` call.
+    /// different `HotState`s. Held for the full read/compute/store sequence in
+    /// both reload paths.
     reload_lock: tokio::sync::Mutex<()>,
 }
 
@@ -216,6 +236,8 @@ pub struct Server {
     /// or this is a fixed answer (always ECS-independent).
     /// Used to share a single cache entry across all clients rather than one per subnet.
     pub strip_ecs: bool,
+    /// Whether any node forwards an incoming client subnet unchanged.
+    pub forwards_client_ecs: bool,
 }
 
 pub struct Rule {
@@ -250,19 +272,6 @@ impl AppState {
         config_path: Option<PathBuf>,
         querylog: crate::querylog::QueryLogHandle,
     ) -> Result<Self> {
-        // Cache is created first so each rule's cache policy can be resolved
-        // against the global defaults inside build_hot_state.
-        let cache = DnsCache::new(&cfg.cache_config());
-
-        if let Some(path) = &cfg.cache_persist_path {
-            let fp = crate::config::cache_fingerprint(&cfg);
-            match cache.load_from_file(path, fp) {
-                Ok(n) if n > 0 => crate::startup!("cache persist=loaded entries={n}"),
-                Ok(_) => {}
-                Err(e) => crate::startup!("cache persist=load_failed error={e:#}"),
-            }
-        }
-
         let ipset = cfg
             .ipset
             .as_ref()
@@ -270,13 +279,17 @@ impl AppState {
             .transpose()?
             .map(Arc::new);
 
-        let verdict_cache = VerdictCache::new(cfg.verdict_cache.as_ref());
-        if verdict_cache.enabled() {
-            if let Some(path) = &cfg.cache_persist_path {
+        let hot = build_hot_state(cfg, &querylog, 0).await?;
+        if let (Some(path), Some(fp)) = (&hot.cfg.cache_persist_path, hot.cache_fingerprint) {
+            match hot.cache.load_from_file(path, fp) {
+                Ok(n) if n > 0 => crate::startup!("cache persist=loaded entries={n}"),
+                Ok(_) => {}
+                Err(e) => crate::startup!("cache persist=load_failed error={e:#}"),
+            }
+            if hot.verdict_cache.enabled() {
                 let vpath = crate::verdict_cache::persist_path_for(path);
                 if vpath.exists() {
-                    let fp = crate::config::cache_fingerprint(&cfg);
-                    match verdict_cache.load_from_file(&vpath, fp) {
+                    match hot.verdict_cache.load_from_file(&vpath, fp) {
                         Ok(n) if n > 0 => {
                             crate::startup!("verdict_cache persist=loaded entries={n}")
                         }
@@ -286,8 +299,6 @@ impl AppState {
                 }
             }
         }
-
-        let hot = build_hot_state(cfg, &querylog, &cache, 0).await?;
 
         // Restore ipset/nftset entries from the persisted DNS cache so that policy
         // routing rules are active immediately after a restart without waiting for
@@ -300,7 +311,7 @@ impl AppState {
             // in one netlink message per set rather than one per cache entry.
             let mut filter_ips: HashMap<(usize, usize), Vec<std::net::IpAddr>> = HashMap::new();
             let ruleset = hot.ruleset.as_deref();
-            cache.for_each_rule_entry(|rule_id, packet, question_end| {
+            hot.cache.for_each_rule_entry(|rule_id, packet, question_end| {
                 let Some(rule) = hot.rules.get(rule_id as usize) else {
                     return;
                 };
@@ -341,20 +352,11 @@ impl AppState {
             config_path,
             limit: Arc::new(Semaphore::new(max)),
             tcp_conn_limit,
-            cache,
-            remote_inflight: singleflight::InflightTable::new(),
             ipset,
-            verdict_cache,
             querylog,
             reload: ReloadStats::new(),
             reload_lock: tokio::sync::Mutex::new(()),
         })
-    }
-
-    /// Opaque per-reload identity: differs from a previously captured value iff
-    /// `state.hot` has been swapped since (i.e. a reload happened).
-    pub fn hot_generation(&self) -> u64 {
-        self.hot.load().generation
     }
 }
 
@@ -365,18 +367,17 @@ impl AppState {
 async fn build_hot_state(
     cfg: Config,
     querylog: &crate::querylog::QueryLogHandle,
-    cache: &DnsCache,
     generation: u64,
 ) -> Result<Arc<HotState>> {
+    let cache = DnsCache::new(&cfg.cache_config());
     let upstream_cfg = cfg.upstream_config();
     let servers = build_servers(&cfg, &upstream_cfg, querylog).await?;
-    let rules = build_rules(&cfg, &servers, cache).await?;
+    let rules = build_rules(&cfg, &servers, &cache).await?;
     let fallback = resolve_fallback(&cfg, &rules, &servers)?;
     let domain_tags = needed_ruleset_domain_tags(&cfg);
     let ipcidr_tags = needed_ruleset_ipcidr_tags(&cfg);
     let needs_ruleset = !domain_tags.is_empty() || !ipcidr_tags.is_empty();
     let ruleset = load_ruleset(cfg.ruleset_specs.clone(), domain_tags, ipcidr_tags, None).await?;
-    let routing_index = RouteIndex::build(&rules, cfg.cache_size);
     let routing = Arc::new(RoutingConfig {
         cfg,
         servers,
@@ -384,12 +385,7 @@ async fn build_hot_state(
         needs_ruleset,
         fallback,
     });
-    Ok(Arc::new(HotState {
-        routing,
-        ruleset,
-        routing_index,
-        generation,
-    }))
+    Ok(Arc::new(HotState::new(routing, ruleset, cache, generation)))
 }
 
 /// Build one shared `Server` per `route.servers` entry: a real `Arc<UpstreamPool>`
@@ -406,7 +402,7 @@ async fn build_servers(
 
     let mut servers = Vec::with_capacity(cfg.servers.len());
     for (idx, (name, spec)) in cfg.servers.iter().enumerate() {
-        let (kind, strip_ecs) = match spec {
+        let (kind, strip_ecs, forwards_client_ecs) = match spec {
             ServerSpec::Upstream(endpoints) => {
                 let pool = UpstreamPool::new(
                     name,
@@ -418,11 +414,18 @@ async fn build_servers(
                 let strip_ecs = endpoints
                     .iter()
                     .all(|ep| matches!(ep.ecs_mode, Some(EcsMode::Strip) | None));
-                (ServerKind::Upstream(Arc::new(pool)), strip_ecs)
+                let forwards_client_ecs = endpoints
+                    .iter()
+                    .any(|ep| matches!(ep.ecs_mode, Some(EcsMode::Forward)));
+                (
+                    ServerKind::Upstream(Arc::new(pool)),
+                    strip_ecs,
+                    forwards_client_ecs,
+                )
             }
             // Fixed answers are the same for every client, so they're always
             // ECS-independent — one shared cache entry regardless of subnet.
-            ServerSpec::Fixed(set) => (ServerKind::Fixed(set.clone()), true),
+            ServerSpec::Fixed(set) => (ServerKind::Fixed(set.clone()), true, false),
         };
         servers.push(Server {
             name: name.clone(),
@@ -431,6 +434,7 @@ async fn build_servers(
             index: idx,
             kind,
             strip_ecs,
+            forwards_client_ecs,
         });
     }
     Ok(servers)
@@ -811,31 +815,13 @@ async fn reload_ruleset(state: &AppState, changed_paths: &HashSet<PathBuf>) -> R
     // `RuleSetDb::load`'s doc comment.
     let reuse = previous_db.map(|db| (db, changed_paths.clone()));
     let db = load_ruleset(ruleset_specs, domain_tags, ipcidr_tags, reuse).await?;
-    // RouteIndex::build is a pure function of `rules`/`cache_size` alone
-    // (unchanged here), so rebuilding it fresh is just cheap tag
-    // re-interning; the side effect of a guaranteed-empty route cache comes
-    // from construction, not a separate invalidate() mutation.
-    let routing_index = RouteIndex::build(&routing.rules, routing.cfg.cache_size);
-    // Single atomic swap: the new ruleset, its fresh (empty) routing index, and the
-    // config/rules they were derived from all become visible to concurrent queries
-    // together — no window where a query can see one but not the others.
-    state.hot.store(Arc::new(HotState {
+    let cache = DnsCache::new(&routing.cfg.cache_config());
+    state.hot.store(Arc::new(HotState::new(
         routing,
-        ruleset: db,
-        routing_index,
+        db,
+        cache,
         generation,
-    }));
-    // Two-part invalidation, not redundant with each other: this clears
-    // whatever was already cached under the *old* generation; the per-query
-    // `routing_gen` check in `resolver.rs::exchange_with_dedupe` (and
-    // `resolve_none_rule_with_cidr`) is the other half, stopping a query that
-    // was already in flight under the old generation from writing a fresh
-    // entry into the cache *after* this clear using now-stale routing
-    // decisions. Store-then-clear ordering matters: a query reading `hot`
-    // after the store but before this clear still sees its own write cleared
-    // rather than left stale.
-    state.cache.invalidate_all();
-    state.verdict_cache.invalidate_all();
+    )));
     state.reload.record_applied();
     crate::log_info!(
         "reload event=ruleset status=ok files={ruleset_specs_len} generation={generation}"
@@ -931,13 +917,8 @@ async fn reload_config(state: &AppState) -> Result<()> {
 
     let old_hot = state.hot.load_full();
     let generation = old_hot.generation.wrapping_add(1);
-    let hot = build_hot_state(cfg, &state.querylog, &state.cache, generation).await?;
+    let hot = build_hot_state(cfg, &state.querylog, generation).await?;
     state.hot.store(hot);
-    // Same two-part invalidation as `reload_ruleset` above: this clears the
-    // old generation's entries, `resolver.rs`'s `routing_gen` check stops a
-    // still-in-flight old-generation query from writing a fresh stale one.
-    state.cache.invalidate_all();
-    state.verdict_cache.invalidate_all();
     // `build_hot_state` just built entirely new `UpstreamPool`s (fresh UDP
     // sockets and recv/send tasks included) for every rule, so `old_hot`'s
     // pools are now orphaned once the last reference drops. No explicit
@@ -1208,6 +1189,130 @@ mod tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    async fn resolve_test_query(state: Arc<AppState>, qtype: u16) -> std::net::IpAddr {
+        use crate::resolver::{self, FastPathOutcome, ResponseArena};
+        use crate::upstream::ClientProto;
+        use crate::{dns, dns::synthetic_query};
+        use bytes::Bytes;
+
+        let (query, question_end) = synthetic_query("cache.test", qtype).unwrap();
+        let peer = "127.0.0.1:53000".parse().unwrap();
+        let mut arena = ResponseArena::new(4096);
+        let response =
+            match resolver::try_fast_path_into(&query, peer, ClientProto::Udp, &state, &mut arena) {
+                FastPathOutcome::Response { resp } => resp,
+                FastPathOutcome::Miss { info, probe } => {
+                    Box::pin(resolver::handle_packet_slow_preparsed(
+                        Bytes::from(query),
+                        peer,
+                        ClientProto::Udp,
+                        state,
+                        info,
+                        probe,
+                        None,
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                }
+                FastPathOutcome::Drop => panic!("test query was dropped"),
+            };
+        dns::answer_ips(&response, question_end)[0]
+    }
+
+    #[tokio::test]
+    async fn inflight_response_finishes_in_its_original_cache_after_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "pathdns-cache-reload-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_ip = "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap();
+        let new_ip = "192.0.2.2".parse::<std::net::IpAddr>().unwrap();
+        let write_config = |server: &str| {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "cache": { "size": 64 },
+                    "runtime": { "timeout-ms": 10000, "upstream-udp-sockets": 1 },
+                    "route": { "servers": { "answer": server }, "final": "answer" }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_config(&format!("udp://{}", upstream.local_addr().unwrap()));
+        let state = state_from_config_file(&path).await;
+        let old_hot = state.hot.load_full();
+        let pending = tokio::spawn(resolve_test_query(state.clone(), 1));
+        let mut packet = [0; 512];
+        let (len, peer) = tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        let question_end = crate::dns::question_end(&packet[..len]).unwrap();
+
+        write_config("A://192.0.2.2");
+        reload_config(&state).await.unwrap();
+        let new_answer = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolve_test_query(state.clone(), 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_answer, new_ip);
+
+        let reply = crate::dns::a_reply(&packet[..len], question_end, old_ip, 60).unwrap();
+        upstream.send_to(&reply, peer).await.unwrap();
+        assert_eq!(pending.await.unwrap(), std::net::IpAddr::V4(old_ip));
+        assert_eq!(old_hot.cache.entry_count(), 1);
+        assert_eq!(state.hot.load().cache.entry_count(), 1);
+        assert_eq!(resolve_test_query(state, 1).await, new_ip);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verdicts_for_a_and_aaaa_route_independently() {
+        let dir = std::env::temp_dir().join(format!(
+            "pathdns-verdict-families-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ruleset = dir.join("ip.list");
+        std::fs::write(&ruleset, "192.0.2.0/24\n").unwrap();
+        let config_path = dir.join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "cache": { "size": 0 },
+                "route": {
+                    "servers": {
+                        "primary": ["A://192.0.2.1", "AAAA://2001:db8::1"],
+                        "secondary": ["A://198.51.100.1", "AAAA://2001:db8::2"]
+                    },
+                    "ruleset": [
+                        { "tag": "in-range", "format": "text", "behavior": "ipcidr", "path": ruleset }
+                    ],
+                    "final": {
+                        "primary": "primary", "secondary": "secondary", "answer-ip": "in-range",
+                        "verdict-cache": { "size": 64 }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = state_from_config_file(&config_path).await;
+        let a = "192.0.2.1".parse::<std::net::IpAddr>().unwrap();
+        let aaaa = "2001:db8::2".parse::<std::net::IpAddr>().unwrap();
+        for (qtype, want) in [(1, a), (28, aaaa), (1, a), (28, aaaa)] {
+            assert_eq!(resolve_test_query(state.clone(), qtype).await, want);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A config hot-reload can change which ruleset tags the rules reference.

@@ -192,17 +192,12 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
                     let save_path = path.clone();
                     let save_vpath = vpath.clone();
                     let save_lock = persist_lock.clone();
-                    // Recomputed on every tick (not captured once at startup): a
-                    // hot-reload since the last save changes what the live cache
-                    // content actually corresponds to, and tagging saves with a
-                    // stale fingerprint would make the next startup reject a
-                    // perfectly fresh, post-reload cache as stale.
-                    let fp = config::cache_fingerprint(&save_state.hot.load().cfg);
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         let _guard = save_lock
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        save_caches(&save_state, &save_path, &save_vpath, fp);
+                        let hot = save_state.hot.load_full();
+                        save_caches(&hot, &save_path, &save_vpath);
                     })
                     .await
                     {
@@ -253,9 +248,8 @@ async fn async_main(cfg: Config, config_path: std::path::PathBuf) -> Result<()> 
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let hot = state.hot.load();
         if let Some(path) = &hot.cfg.cache_persist_path {
-            let fp = config::cache_fingerprint(&hot.cfg);
             let vpath = verdict_cache::persist_path_for(path);
-            save_caches(&state, path, &vpath, fp);
+            save_caches(&hot, path, &vpath);
         }
     }
 
@@ -317,13 +311,16 @@ fn spawn_dashboard_listeners(
 /// Save the main DNS cache and (if enabled) the verdict cache to disk, logging
 /// the outcome of each. Shared by the periodic persist task and the final
 /// shutdown save.
-fn save_caches(state: &server::AppState, path: &std::path::Path, vpath: &std::path::Path, fp: u64) {
-    match state.cache.save_to_file(path, fp) {
+fn save_caches(hot: &server::HotState, path: &std::path::Path, vpath: &std::path::Path) {
+    let Some(fp) = hot.cache_fingerprint else {
+        return;
+    };
+    match hot.cache.save_to_file(path, fp) {
         Ok(n) => startup!("cache persist=saved entries={n}"),
         Err(e) => startup!("cache persist=save_failed error={e:#}"),
     }
-    if state.verdict_cache.enabled() {
-        match state.verdict_cache.save_to_file(vpath, fp) {
+    if hot.verdict_cache.enabled() {
+        match hot.verdict_cache.save_to_file(vpath, fp) {
             Ok(n) => startup!("verdict_cache persist=saved entries={n}"),
             Err(e) => startup!("verdict_cache persist=save_failed error={e:#}"),
         }

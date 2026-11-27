@@ -147,6 +147,7 @@ fn finish_cache_key(
             None => h.write_byte(0),
             Some(ecs) => {
                 h.write_byte(1);
+                h.write(&ecs.family.to_le_bytes());
                 h.write(&ecs.addr);
                 h.write_byte(ecs.prefix_len);
             }
@@ -443,14 +444,6 @@ impl DnsCache {
         cache.insert(ins.key, entry);
     }
 
-    /// Discard all cached entries. Called when the routing policy changes (ruleset reload)
-    /// so that stale responses produced under the old rule decisions are not returned.
-    pub fn invalidate_all(&self) {
-        if let Some(cache) = &self.cache {
-            cache.clear();
-        }
-    }
-
     /// Core lookup implementation for the `_into` path: accepts a pre-computed cache key and
     /// the live query's pre-computed `QueryVariant` so neither needs to be re-derived here.
     fn lookup_into_keyed(
@@ -547,7 +540,7 @@ impl DnsCache {
         atomic_write(path, |w| {
             // Magic encodes format implicitly; change it when the on-disk layout changes.
             // Fingerprint encodes the config; a mismatch on load causes the file to be discarded.
-            crate::persist::write_header(w, b"PDNSC009", fingerprint, count as u32)?;
+            crate::persist::write_header(w, b"PDNSC010", fingerprint, count as u32)?;
 
             for (key, entry, remaining) in &entries {
                 let expire_unix = now_unix + remaining;
@@ -596,7 +589,7 @@ impl DnsCache {
         let mut r = BufReader::new(file);
 
         let count =
-            crate::persist::read_and_check_header(&mut r, b"PDNSC009", fingerprint, "cache")?
+            crate::persist::read_and_check_header(&mut r, b"PDNSC010", fingerprint, "cache")?
                 as usize;
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)

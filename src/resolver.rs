@@ -10,6 +10,7 @@ use crate::dns;
 use crate::router::RouteTarget;
 use crate::server::{AppState, HotState, Server};
 use crate::upstream::ClientProto;
+use crate::verdict_cache::VerdictKey;
 use crate::{router, singleflight};
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
@@ -119,7 +120,7 @@ impl QueryContext {
 }
 
 struct SingleflightLeader<'a> {
-    state: &'a AppState,
+    table: &'a singleflight::InflightTable,
     key: CacheKey,
     /// Set to true after publish_bytes removes the key so Drop does not
     /// accidentally evict a newly registered leader for the same key.
@@ -129,7 +130,7 @@ struct SingleflightLeader<'a> {
 impl Drop for SingleflightLeader<'_> {
     fn drop(&mut self) {
         if !self.published {
-            singleflight::remove(&self.state.remote_inflight, &self.key);
+            singleflight::remove(self.table, &self.key);
         }
     }
 }
@@ -277,9 +278,9 @@ pub(crate) fn try_fast_path_into(
 
     // Cache hit: write directly into the caller-provided arena. The entry's
     // qname Arc is only cloned when detailed events are collected.
+    let hot = state.hot.load();
     let (hit, probe) =
-        state
-            .cache
+        hot.cache
             .get_into_with_ecs_fallback(packet, &fast_info, arena.buf_mut(), collecting);
     if let Some(meta) = hit {
         let ql = &state.querylog;
@@ -287,10 +288,6 @@ pub(crate) fn try_fast_path_into(
         // `meta.qname` is Some exactly when `collecting` was passed into the
         // lookup above; destructuring keeps the two in lockstep.
         if let Some(qname) = meta.qname {
-            // A plain `load()` guard suffices: `h` never crosses an .await and
-            // this whole path is synchronous, so the cheaper thread-local guard
-            // beats `load_full()`'s refcount round-trip on every logged hit.
-            let h = state.hot.load();
             ql.try_emit_with(|seq| crate::querylog::QueryLogEvent {
                 seq,
                 unix_micros: crate::querylog::unix_micros_now(),
@@ -302,7 +299,7 @@ pub(crate) fn try_fast_path_into(
                 elapsed_us: t0.map_or(0, |t| t.elapsed().as_micros() as u64),
                 response_bytes: arena.buf().len() as u32,
                 source: "cache",
-                upstream: upstream_name_for_rule_id(meta.rule_id, &h),
+                upstream: upstream_name_for_rule_id(meta.rule_id, &hot),
             });
         }
         return FastPathOutcome::Response { resp: arena.take() };
@@ -415,7 +412,7 @@ async fn resolve_query(mut ctx: QueryContext, state: &Arc<AppState>) -> Result<O
     // itself needs it only when the decision is name-dependent (below). When
     // none of these hold — a constant-route, cache-off, querylog-off forward —
     // the string is never built, saving an allocation per query.
-    let need_qname_downstream = state.cache.is_enabled() || state.querylog.collecting();
+    let need_qname_downstream = hot.cache.is_enabled() || state.querylog.collecting();
 
     let target = match hot.routing_index.constant_target() {
         // Routing is constant: no qname needed to pick the target.
@@ -457,7 +454,6 @@ async fn resolve_query(mut ctx: QueryContext, state: &Arc<AppState>) -> Result<O
 /// `None` for a plain `RouteTarget::Rule`/`Server`, since the caller already knows its identity.
 async fn do_upstream_exchange(
     ctx: &QueryContext,
-    state: &Arc<AppState>,
     hot: &HotState,
     target: &RouteTarget<'_>,
 ) -> Result<(Bytes, Option<usize>)> {
@@ -473,17 +469,11 @@ async fn do_upstream_exchange(
         )
         .await
         .map(|(b, idx)| (b, Some(idx))),
-        RouteTarget::CidrTest { primary, secondary } => resolve_none_rule_with_cidr(
-            ctx.packet.clone(),
-            &ctx.info,
-            ctx.proto,
-            primary,
-            secondary,
-            state,
-            hot,
-        )
-        .await
-        .map(|(b, idx)| (b, Some(idx))),
+        RouteTarget::CidrTest { primary, secondary } => {
+            resolve_none_rule_with_cidr(ctx, primary, secondary, hot)
+                .await
+                .map(|(b, idx)| (b, Some(idx)))
+        }
         RouteTarget::Rule(rule, _) => exchange_kind(
             ctx.packet.clone(),
             ctx.info.question_end,
@@ -573,12 +563,6 @@ async fn exchange_with_dedupe(
     target: RouteTarget<'_>,
 ) -> Result<Option<Bytes>> {
     let started = Instant::now();
-    // Record routing generation before any upstream I/O. A hot-reload always swaps
-    // `state.hot` (and its embedded `generation`) before clearing the cache, so this
-    // snapshot can never be stale relative to the cache clear. We check it before
-    // writing to the cache below to prevent stale responses from re-populating the
-    // fresh cache.
-    let routing_gen = hot.generation;
     // Reuse the EDNS variant the fast path already parsed while checking the
     // cache (see `dns::QueryInfo::variant`) for cache-key selection and the
     // strip-mode cache-write decision, instead of re-parsing it here.
@@ -606,10 +590,7 @@ async fn exchange_with_dedupe(
             ecs_in_query,
         ),
     };
-    // Mix routing generation into the singleflight key so followers from a previous
-    // routing generation do not join an in-flight request for a different route target.
-    let sf_ck = ck ^ routing_gen.wrapping_mul(0x9e3779b97f4a7c15);
-    let waiter = singleflight::register(&state.remote_inflight, sf_ck)?;
+    let waiter = singleflight::register(&hot.remote_inflight, ck)?;
 
     if let Some(rx) = waiter {
         // Bound the follower wait so a panicking leader never leaves clients hung
@@ -622,10 +603,6 @@ async fn exchange_with_dedupe(
         // only pads the panic-safety fallback, so erring generous costs nothing
         // in the (overwhelmingly common) case where the leader finishes well
         // before it.
-        // Reuse the same `hot` snapshot the caller took `routing_gen`/`sf_ck` from,
-        // rather than an independent `state.hot.load()` here: a concurrent
-        // hot-reload between the two reads could otherwise pair this generation's
-        // routing_gen with a *different* generation's `cfg.timeout`/`hedge_delay`.
         let cfg = &hot.cfg;
         let deadline = cfg.timeout * MAX_EXCHANGES_PER_QUERY
             + cfg.hedge_delay.unwrap_or_default()
@@ -707,8 +684,8 @@ async fn exchange_with_dedupe(
     // If the leader task is cancelled while awaiting upstream I/O, Drop removes
     // the table entry so later callers can become the new leader instead of waiting forever.
     let mut _leader = SingleflightLeader {
-        state,
-        key: sf_ck,
+        table: &hot.remote_inflight,
+        key: ck,
         published: false,
     };
 
@@ -731,27 +708,24 @@ async fn exchange_with_dedupe(
             let winner_server = winner_idx.and_then(|idx| hot.servers.get(idx));
             let upstream_arc =
                 winner_server.map_or_else(|| upstream_arc.clone(), |s| s.final_name_arc.clone());
-            // Skip cache write if the routing generation advanced (ruleset hot-reload cleared
-            // the cache between when we started the query and when the response arrived).
-            // Also gated on the cache being configured at all, so a cache-off forward
-            // neither builds a `CacheInsert` nor materializes the qname it carries.
-            if !skip_cache && state.cache.is_enabled() && state.hot_generation() == routing_gen {
+            // Write to the cache owned by the routing snapshot that resolved this query.
+            if !skip_cache && hot.cache.is_enabled() {
                 let (mut cache_policy, attribution) = match (&target, winner_server) {
                     (RouteTarget::Rule(rule, idx), _) => {
                         (rule.cache_policy, RuleAttribution::Rule(*idx))
                     }
                     (RouteTarget::Server(_, idx), _) => (
-                        state.cache.resolve_policy(None),
+                        hot.cache.resolve_policy(None),
                         RuleAttribution::Final(*idx),
                     ),
                     (_, Some(w)) => (
-                        state.cache.resolve_policy(None),
+                        hot.cache.resolve_policy(None),
                         RuleAttribution::Final(w.index),
                     ),
                     // Winner not known (e.g. race tie-break fallback): sentinel so cache
                     // hits show the generic "final".
                     (_, None) => (
-                        state.cache.resolve_policy(None),
+                        hot.cache.resolve_policy(None),
                         RuleAttribution::FinalUnknown,
                     ),
                 };
@@ -803,7 +777,7 @@ async fn exchange_with_dedupe(
                 let sanitized_resp = dns::strip_opt_rdata(resp.as_ref()).map(bytes::Bytes::from);
                 let cache_packet: &[u8] =
                     sanitized_resp.as_deref().unwrap_or_else(|| resp.as_ref());
-                state.cache.add(
+                hot.cache.add(
                     crate::cache::CacheInsert {
                         key: ck,
                         qname: ctx.qname_owned(),
@@ -823,7 +797,7 @@ async fn exchange_with_dedupe(
             let mut resp_mut = BytesMut::from(resp);
             resp_mut[12..ctx.info.question_end].copy_from_slice(ctx.question());
             let resp = resp_mut.freeze();
-            singleflight::publish_bytes(&state.remote_inflight, &sf_ck, resp.clone());
+            singleflight::publish_bytes(&hot.remote_inflight, &ck, resp.clone());
             _leader.published = true;
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(state, elapsed);
@@ -836,7 +810,7 @@ async fn exchange_with_dedupe(
             Ok(Some(resp))
         }
         Ok(StepOutcome::Drop) => {
-            singleflight::publish_drop(&state.remote_inflight, &sf_ck);
+            singleflight::publish_drop(&hot.remote_inflight, &ck);
             _leader.published = true;
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(state, elapsed);
@@ -867,7 +841,7 @@ async fn exchange_with_dedupe(
                 Err(_) => return Err(err),
             };
             let servfail = Bytes::from(servfail);
-            singleflight::publish_bytes(&state.remote_inflight, &sf_ck, servfail.clone());
+            singleflight::publish_bytes(&hot.remote_inflight, &ck, servfail.clone());
             _leader.published = true;
             let elapsed = started.elapsed().as_micros() as u64;
             record_client_latency(state, elapsed);
@@ -945,7 +919,7 @@ async fn resolve_with_filters<'a>(
 ) -> (Result<StepOutcome>, RouteTarget<'a>) {
     use crate::response_filter::FilterAction;
 
-    let (resp, winner_idx) = match Box::pin(do_upstream_exchange(ctx, state, hot, &target)).await {
+    let (resp, winner_idx) = match Box::pin(do_upstream_exchange(ctx, hot, &target)).await {
         Ok(r) => r,
         Err(e) => return (Err(e), target),
     };
@@ -967,7 +941,7 @@ async fn resolve_with_filters<'a>(
                     // still honor a fixed (`RCODE://`) forward target's own TTL.
                     let forward_target = RouteTarget::Server(&hot.servers[target_idx], target_idx);
                     let fresp =
-                        Box::pin(do_upstream_exchange(ctx, state, hot, &forward_target)).await;
+                        Box::pin(do_upstream_exchange(ctx, hot, &forward_target)).await;
                     return (
                         fresp.map(|(b, _)| {
                             StepOutcome::Response(b, "forwarded", None, Some(target_idx))
@@ -1116,21 +1090,15 @@ fn pick_race_winner(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn resolve_none_rule_with_cidr(
-    packet: Bytes,
-    info: &dns::QueryInfo,
-    client_proto: ClientProto,
+    ctx: &QueryContext,
     primary: &Server,
     secondary: &Server,
-    state: &Arc<AppState>,
-    // The caller's own `HotState` snapshot (kept alive across this whole call),
-    // so `answer_ip`/`ruleset`/`generation` all come from the same generation
-    // as every other decision made for this query — and this function does not
-    // pay a second `load_full` (atomic load + Arc refcount round-trip) plus a
-    // ruleset Arc clone per CIDR-fallback query.
     hot: &HotState,
 ) -> Result<(Bytes, usize)> {
+    let info = &ctx.info;
+    let packet = ctx.packet.clone();
+    let client_proto = ctx.proto;
     let answer_ip: Option<&crate::config::AnswerIpMatcher> = match &hot.cfg.fallback.target {
         FallbackTarget::Dual { answer_ip, .. } if !answer_ip.is_empty() => Some(answer_ip),
         _ => None,
@@ -1147,20 +1115,22 @@ async fn resolve_none_rule_with_cidr(
         )
         .await;
     };
-    // Captured before any upstream I/O so a verdict write below can be skipped if a
-    // hot-reload invalidates the verdict cache while this query is still in flight
-    // (mirrors the same guard the DNS response cache uses in `exchange_with_dedupe`).
-    let routing_gen = hot.generation;
-
-    // This path is only reached for a `CidrTest` rule target, i.e. name-dependent
-    // routing, so `resolve_query` already materialized the qname. Fall back to
-    // materializing from the packet defensively (keeps the verdict cache keyed
-    // correctly without an unwrap if that invariant ever changes).
-    let qname = info.qname.clone().unwrap_or_else(|| {
-        dns::qname_from_question(&packet, info.question_end).unwrap_or_else(|_| Arc::from(""))
+    let verdict_key = hot.verdict_cache.enabled().then(|| {
+        let mut variant = info.variant;
+        if !primary.forwards_client_ecs {
+            variant.ecs_src = None;
+        }
+        VerdictKey {
+            qname: ctx.qname_owned(),
+            qtype: info.qtype,
+            qclass: dns::question_qclass(&packet, info.question_end).unwrap_or_default(),
+            variant,
+        }
     });
-
-    if let Some(is_primary_domain) = state.verdict_cache.get(&qname) {
+    if let Some(is_primary_domain) = verdict_key
+        .as_ref()
+        .and_then(|key| hot.verdict_cache.get(key))
+    {
         return if is_primary_domain {
             exchange_kind(
                 packet,
@@ -1231,23 +1201,17 @@ async fn resolve_none_rule_with_cidr(
             // Pure in-memory range-set lookup, no syscalls, so it runs inline.
             let is_primary_ip = ruleset.matches_answer_ip(answer_ip, &ips);
             let noip_as_primary = hot.cfg.fallback.noip_as_primary_ip;
-            // Skip the write entirely if a hot-reload advanced the generation while
-            // this query was in flight — the verdict cache was just invalidated and
-            // this decision may be based on now-stale ruleset/ipcidr data.
-            let routing_unchanged = state.hot_generation() == routing_gen;
             if ips.is_empty() {
                 if noip_as_primary {
                     return Ok((resp, primary.index));
                 }
-            } else if is_primary_ip {
-                if routing_unchanged {
-                    state.verdict_cache.add(&qname, true);
+            } else {
+                if let Some(key) = verdict_key {
+                    hot.verdict_cache.add(key, is_primary_ip);
                 }
-                // Decision is "use primary"; the secondary's answer is not
-                // needed, so return now and let its in-flight query be dropped.
-                return Ok((resp, primary.index));
-            } else if routing_unchanged {
-                state.verdict_cache.add(&qname, false);
+                if is_primary_ip {
+                    return Ok((resp, primary.index));
+                }
             }
             // Decision needs the secondary's answer: use the stashed result
             // or finish awaiting the already-in-flight query.

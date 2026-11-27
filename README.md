@@ -372,7 +372,7 @@ Route unmatched queries straight to the named `route.servers` entry — this byp
 1. Both servers are queried concurrently.
 2. The primary's answer IPs are tested against the `route.ruleset` tag(s) named by `answer-ip` (each must have `behavior: "ipcidr"`) — the same criterion [`rule.filter`'s `answer-ip`](#rule-filters) uses.
 3. IPs in range → return primary's answer. IPs not in range → return secondary's answer.
-4. The verdict is cached per domain (`verdict-cache`); subsequent queries skip the race.
+4. When `verdict-cache` is enabled, subsequent queries with the same question and DNS variant skip the race. A and AAAA have separate verdicts. Client ECS subnets are separated when the primary forwards client ECS.
 
 Non-A/AAAA queries fall back to the first non-SERVFAIL answer.
 
@@ -382,7 +382,7 @@ Non-A/AAAA queries fall back to the first non-SERVFAIL answer.
 | `secondary` | string | `route.servers` name used when the primary's IPs are not in `answer-ip`'s range (required). |
 | `answer-ip` | string or string array | `route.ruleset` tag(s) (`behavior: "ipcidr"`) the primary's answer IPs are tested against (required), each optionally prefixed with `!` to exclude — same convention as [`rule.filter`'s `answer-ip`](#rule-filters), including the "primary wins" polarity: primary wins when it *matches* (which for an exclude-only `!tag` means none of its answer IPs are in `tag`'s range), secondary wins otherwise. |
 | `noip-as-primary-ip` | bool | Treat NODATA primary replies as if their IPs were in range (default: `false`). |
-| `verdict-cache` | object | Cache per-domain routing decisions to skip repeated answer-ip lookups (see below). |
+| `verdict-cache` | object | Cache routing decisions by DNS question and variant to skip repeated answer-IP lookups (see below). |
 
 **`verdict-cache`** inside `route.final`:
 
@@ -447,7 +447,7 @@ Tune these only for special network environments, debugging, or measured bottlen
 
 Negative responses (NODATA/NXDOMAIN) are cached for their SOA TTL (capped at 10800 s per RFC 2308), clamped by `min-ttl`/`max-ttl`; with no SOA they fall to `min-ttl`. A fixed-answer `RCODE://` server's responses use their own `?ttl=` instead.
 
-With `persist` configured, the cache survives restarts. On load, a config fingerprint is compared; if routing-relevant config has changed (rules, tags, cache policies, ruleset files), the persisted cache is discarded.
+With `persist` configured, the cache survives restarts. On load, the file format and the fingerprint of the loaded routing configuration and rulesets must match. Upgrading from an older cache format starts with an empty cache.
 
 ### Per-server cache overrides
 
