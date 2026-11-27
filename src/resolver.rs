@@ -714,10 +714,9 @@ async fn exchange_with_dedupe(
                     (RouteTarget::Rule(rule, idx), _) => {
                         (rule.cache_policy, RuleAttribution::Rule(*idx))
                     }
-                    (RouteTarget::Server(_, idx), _) => (
-                        hot.cache.resolve_policy(None),
-                        RuleAttribution::Final(*idx),
-                    ),
+                    (RouteTarget::Server(_, idx), _) => {
+                        (hot.cache.resolve_policy(None), RuleAttribution::Final(*idx))
+                    }
                     (_, Some(w)) => (
                         hot.cache.resolve_policy(None),
                         RuleAttribution::Final(w.index),
@@ -940,8 +939,7 @@ async fn resolve_with_filters<'a>(
                     // but `target_idx` is threaded through so the caller can
                     // still honor a fixed (`RCODE://`) forward target's own TTL.
                     let forward_target = RouteTarget::Server(&hot.servers[target_idx], target_idx);
-                    let fresp =
-                        Box::pin(do_upstream_exchange(ctx, hot, &forward_target)).await;
+                    let fresp = Box::pin(do_upstream_exchange(ctx, hot, &forward_target)).await;
                     return (
                         fresp.map(|(b, _)| {
                             StepOutcome::Response(b, "forwarded", None, Some(target_idx))

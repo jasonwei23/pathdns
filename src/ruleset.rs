@@ -143,17 +143,22 @@ impl RuleSetDb {
                 }
             }
             let (raw, stamp) = read_ruleset(spec).with_context(|| {
-                format!("failed to read ruleset '{}' ({})", spec.tag, spec.path.display())
+                format!(
+                    "failed to read ruleset '{}' ({})",
+                    spec.tag,
+                    spec.path.display()
+                )
             })?;
             let entry = match spec.behavior {
                 RuleSetBehavior::Domain => {
-                    let patterns = decode_domain_patterns(spec.format, &raw).with_context(|| {
-                        format!(
-                            "failed to load ruleset '{}' ({})",
-                            spec.tag,
-                            spec.path.display()
-                        )
-                    })?;
+                    let patterns =
+                        decode_domain_patterns(spec.format, &raw).with_context(|| {
+                            format!(
+                                "failed to load ruleset '{}' ({})",
+                                spec.tag,
+                                spec.path.display()
+                            )
+                        })?;
                     let mut matchers = TagMatchers::default();
                     for p in &patterns {
                         if !apply_domain_pattern(&mut matchers, p) {
@@ -289,7 +294,10 @@ fn read_ruleset(spec: &RuleSetSpec) -> Result<(Vec<u8>, (u64, u64))> {
     let stamp = file_stamp(&file.metadata()?);
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)?;
-    anyhow::ensure!(file_stamp(&file.metadata()?) == stamp, "file changed during read");
+    anyhow::ensure!(
+        file_stamp(&file.metadata()?) == stamp,
+        "file changed during read"
+    );
     Ok((raw, stamp))
 }
 

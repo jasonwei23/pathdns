@@ -311,29 +311,30 @@ impl AppState {
             // in one netlink message per set rather than one per cache entry.
             let mut filter_ips: HashMap<(usize, usize), Vec<std::net::IpAddr>> = HashMap::new();
             let ruleset = hot.ruleset.as_deref();
-            hot.cache.for_each_rule_entry(|rule_id, packet, question_end| {
-                let Some(rule) = hot.rules.get(rule_id as usize) else {
-                    return;
-                };
-                let Some((filter_idx, filter)) = crate::response_filter::first_match(
-                    &rule.filters,
-                    ruleset,
-                    packet,
-                    question_end,
-                ) else {
-                    return;
-                };
-                if !matches!(filter.action, crate::response_filter::FilterAction::Accept) {
-                    return;
-                }
-                let ips = crate::dns::answer_ips(packet, question_end);
-                if !ips.is_empty() {
-                    filter_ips
-                        .entry((rule_id as usize, filter_idx))
-                        .or_default()
-                        .extend_from_slice(&ips);
-                }
-            });
+            hot.cache
+                .for_each_rule_entry(|rule_id, packet, question_end| {
+                    let Some(rule) = hot.rules.get(rule_id as usize) else {
+                        return;
+                    };
+                    let Some((filter_idx, filter)) = crate::response_filter::first_match(
+                        &rule.filters,
+                        ruleset,
+                        packet,
+                        question_end,
+                    ) else {
+                        return;
+                    };
+                    if !matches!(filter.action, crate::response_filter::FilterAction::Accept) {
+                        return;
+                    }
+                    let ips = crate::dns::answer_ips(packet, question_end);
+                    if !ips.is_empty() {
+                        filter_ips
+                            .entry((rule_id as usize, filter_idx))
+                            .or_default()
+                            .extend_from_slice(&ips);
+                    }
+                });
             if !filter_ips.is_empty() {
                 let count = filter_ips.len();
                 for ((rule_idx, filter_idx), ips) in &filter_ips {
@@ -816,12 +817,9 @@ async fn reload_ruleset(state: &AppState, changed_paths: &HashSet<PathBuf>) -> R
     let reuse = previous_db.map(|db| (db, changed_paths.clone()));
     let db = load_ruleset(ruleset_specs, domain_tags, ipcidr_tags, reuse).await?;
     let cache = DnsCache::new(&routing.cfg.cache_config());
-    state.hot.store(Arc::new(HotState::new(
-        routing,
-        db,
-        cache,
-        generation,
-    )));
+    state
+        .hot
+        .store(Arc::new(HotState::new(routing, db, cache, generation)));
     state.reload.record_applied();
     crate::log_info!(
         "reload event=ruleset status=ok files={ruleset_specs_len} generation={generation}"
@@ -1200,25 +1198,30 @@ mod tests {
         let (query, question_end) = synthetic_query("cache.test", qtype).unwrap();
         let peer = "127.0.0.1:53000".parse().unwrap();
         let mut arena = ResponseArena::new(4096);
-        let response =
-            match resolver::try_fast_path_into(&query, peer, ClientProto::Udp, &state, &mut arena) {
-                FastPathOutcome::Response { resp } => resp,
-                FastPathOutcome::Miss { info, probe } => {
-                    Box::pin(resolver::handle_packet_slow_preparsed(
-                        Bytes::from(query),
-                        peer,
-                        ClientProto::Udp,
-                        state,
-                        info,
-                        probe,
-                        None,
-                    ))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                }
-                FastPathOutcome::Drop => panic!("test query was dropped"),
-            };
+        let response = match resolver::try_fast_path_into(
+            &query,
+            peer,
+            ClientProto::Udp,
+            &state,
+            &mut arena,
+        ) {
+            FastPathOutcome::Response { resp } => resp,
+            FastPathOutcome::Miss { info, probe } => {
+                Box::pin(resolver::handle_packet_slow_preparsed(
+                    Bytes::from(query),
+                    peer,
+                    ClientProto::Udp,
+                    state,
+                    info,
+                    probe,
+                    None,
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+            }
+            FastPathOutcome::Drop => panic!("test query was dropped"),
+        };
         dns::answer_ips(&response, question_end)[0]
     }
 
@@ -1249,20 +1252,19 @@ mod tests {
         let old_hot = state.hot.load_full();
         let pending = tokio::spawn(resolve_test_query(state.clone(), 1));
         let mut packet = [0; 512];
-        let (len, peer) = tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
-            .await
-            .unwrap()
-            .unwrap();
+        let (len, peer) =
+            tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
         let question_end = crate::dns::question_end(&packet[..len]).unwrap();
 
         write_config("A://192.0.2.2");
         reload_config(&state).await.unwrap();
-        let new_answer = tokio::time::timeout(
-            Duration::from_secs(2),
-            resolve_test_query(state.clone(), 1),
-        )
-        .await
-        .unwrap();
+        let new_answer =
+            tokio::time::timeout(Duration::from_secs(2), resolve_test_query(state.clone(), 1))
+                .await
+                .unwrap();
         assert_eq!(new_answer, new_ip);
 
         let reply = crate::dns::a_reply(&packet[..len], question_end, old_ip, 60).unwrap();
