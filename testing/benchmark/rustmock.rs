@@ -4,7 +4,7 @@
 // far more than a Python mock so it never becomes the benchmark bottleneck.
 //
 // Build: rustc -O rustmock.rs -o rustmock
-// Run:   ./rustmock 5300 [threads]
+// Run:   ./rustmock 5300 [threads] [ttl]
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::thread;
@@ -13,12 +13,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5300);
     let threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let ttl: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
 
     let sock = Arc::new(UdpSocket::bind(("127.0.0.1", port)).expect("bind"));
-    // A RR: name pointer 0xC00C, type A, class IN, ttl 60, rdlen 4, 9.9.9.9
-    const A_RR: [u8; 16] = [
-        0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 9, 9, 9, 9,
-    ];
+    // A RR: name pointer 0xC00C, type A, class IN, TTL, rdlen 4, 9.9.9.9
+    let mut answer = [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 9, 9, 9, 9];
+    answer[6..10].copy_from_slice(&ttl.to_be_bytes());
 
     let mut handles = Vec::new();
     for _ in 0..threads {
@@ -57,7 +57,7 @@ fn main() {
                 out[9] = 0; // NSCOUNT=0
                 out[10] = 0;
                 out[11] = 0; // ARCOUNT=0
-                out[qend..qend + 16].copy_from_slice(&A_RR);
+                out[qend..qend + answer.len()].copy_from_slice(&answer);
                 let _ = s.send_to(&out[..qend + 16], peer);
             }
         }));

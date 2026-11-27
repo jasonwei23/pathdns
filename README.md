@@ -4,7 +4,7 @@ A policy-based DNS forwarder for split-horizon deployments. Routes queries to di
 
 **Linux only.** The project uses Linux-specific APIs throughout (`recvmmsg`/`sendmmsg`, `SO_REUSEPORT`, netlink for ipset/nftset, `SO_BINDTODEVICE`) and is not designed to run on other platforms.
 
-The UDP receive path is built on batched **`recvmmsg(2)`** on plain Tokio UDP sockets — each wakeup drains the socket in `recvmmsg` batches (looping while a batch comes back full) rather than one `recv` per packet. No kernel-registered/pinned buffer memory is involved, so the per-shard footprint is a small, ordinary, reclaimable heap allocation. `recvmmsg` has been available since Linux 2.6.33, so there is no meaningful kernel-version floor.
+The UDP receive path uses batched **`recvmmsg(2)`** on plain Tokio UDP sockets. Each shard drains a bounded number of batches, flushes ready replies, and yields when the last batch is still full. The receive buffers are ordinary pageable heap allocations. `recvmmsg` has been available since Linux 2.6.33.
 
 ---
 

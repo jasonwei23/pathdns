@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Pure-forwarding benchmark: pathdns vs unbound vs smartdns vs mosdns.
+"""Benchmark PathDNS, Unbound, SmartDNS, MosDNS and KixDNS.
 
-All resolvers forward every query to a shared mock upstream (127.0.0.1:5300),
-caching disabled, so each query is a real forward. dnsperf drives load with a
-file of unique qnames (no cache / single-flight hits). Everything runs inside
-this one process tree so backgrounded servers are not reaped between steps.
+The shared mock upstream serves zero TTLs for forwarding runs and positive
+TTLs for cache-hit runs. Everything runs inside one process tree so
+backgrounded servers are not reaped between steps.
 """
 import subprocess, socket, struct, time, os, signal, sys, re
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BENCH)
-# Paths (override via env). PATHDNS_BIN / MOSDNS_BIN let you point at any build.
+# Paths can be overridden to compare local builds.
 PR = os.environ.get("PATHDNS_BIN",
                     os.path.join(BENCH, "..", "..", "target", "release", "pathdns"))
 MOSDNS = os.environ.get("MOSDNS_BIN", "mosdns")  # on PATH, or absolute path
+KIXDNS = os.environ.get("KIXDNS_BIN", "kixdns")
 MOCK_PORT = 5300
 MOCK_INSTANCES = int(os.environ.get("MOCKS", "2"))
 DURATION = int(os.environ.get("DURATION", "15"))
@@ -30,6 +30,7 @@ MODE = os.environ.get("MODE", "forward")
 NCACHE = int(os.environ.get("NCACHE", "2000"))
 SUFFIX = "_cache" if MODE == "cache" else ""
 QFILE = "queries_cache.txt" if MODE == "cache" else "queries.txt"
+MOCK_TTL = "60" if MODE == "cache" else "0"
 
 def have(cmd):
     from shutil import which
@@ -46,12 +47,16 @@ def bootstrap():
         print(f"generating {QFILE} ({NQUERIES} unique names)...")
         with open(QFILE, "w") as f:
             f.write("\n".join(f"h{i}.bench.test A" for i in range(NQUERIES)))
-    if not os.path.exists("./rustmock"):
-        if have("rustc"):
-            print("compiling rustmock...")
-            subprocess.run(["rustc", "-O", "rustmock.rs", "-o", "rustmock"], cwd=BENCH, check=True)
-        else:
-            print("rustc not found; falling back to benchmock.py (set MOCK=py)")
+    if os.environ.get("MOCK", "rust") != "rust":
+        return False
+    if os.path.exists("./rustmock") and os.path.getmtime("./rustmock") >= os.path.getmtime("rustmock.rs"):
+        return True
+    if not have("rustc"):
+        print("rustc not found; falling back to benchmock.py")
+        return False
+    print("compiling rustmock...")
+    subprocess.run(["rustc", "-O", "rustmock.rs", "-o", "rustmock"], cwd=BENCH, check=True)
+    return True
 
 PIN = os.environ.get("PIN", "0") == "1"
 MOCK_CPU = os.environ.get("MOCK_CPU", "0")      # core(s) for mock pool
@@ -112,19 +117,14 @@ def median(xs):
     xs = sorted(x for x in xs if x is not None)
     return xs[len(xs) // 2] if xs else None
 
-bootstrap()
-
 # ── start the shared mock upstream pool ──────────────────────────────────────
-MOCK_KIND = os.environ.get("MOCK", "rust")  # "rust" (fast) or "py"
-if not os.path.exists("./rustmock"):
-    MOCK_KIND = "py"
 MOCK_THREADS = os.environ.get("MOCK_THREADS", "4")
-if MOCK_KIND == "rust":
-    spawn(pin(["./rustmock", str(MOCK_PORT), MOCK_THREADS], MOCK_CPU))
+if bootstrap():
+    spawn(pin(["./rustmock", str(MOCK_PORT), MOCK_THREADS, MOCK_TTL], MOCK_CPU))
     label = f"1x rustmock ({MOCK_THREADS} threads)"
 else:
     for _ in range(MOCK_INSTANCES):
-        spawn(pin([sys.executable, "benchmock.py", str(MOCK_PORT)], MOCK_CPU))
+        spawn(pin([sys.executable, "benchmock.py", str(MOCK_PORT), MOCK_TTL], MOCK_CPU))
     label = f"{MOCK_INSTANCES}x benchmock.py"
 time.sleep(0.5)
 if not wait_ready(MOCK_PORT):
@@ -138,6 +138,7 @@ ALL_RESOLVERS = [
     ("smartdns", ["smartdns", "-f", "-c", f"smartdns{SUFFIX}.conf"], 5303),
     ("mosdns",   [MOSDNS, "start", "-c", f"mosdns{SUFFIX}.yaml", "-d", BENCH,
                   "--cpu", str(RESOLVER_CORES)],                     5304),
+    ("kixdns",   [KIXDNS, "run", "-c", "kixdns.json", "--udp-workers", "2"], 5305),
 ]
 # Skip any resolver whose binary is not installed.
 RESOLVERS = []

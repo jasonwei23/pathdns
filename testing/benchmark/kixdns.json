@@ -1,0 +1,12 @@
+{
+  "settings": {
+    "bind_udp": "127.0.0.1:5305",
+    "bind_tcp": "127.0.0.1:5305",
+    "default_upstream": "127.0.0.1:5300",
+    "upstream_timeout_ms": 3000,
+    "udp_pool_size": 2,
+    "enable_tcp_fallback": false,
+    "min_ttl": 0,
+    "cache_capacity": 1000000
+  }
+}

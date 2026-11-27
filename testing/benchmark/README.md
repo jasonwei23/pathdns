@@ -1,16 +1,15 @@
-# Pure-forwarding benchmark
+# Forwarding and cache benchmarks
 
-Compares **pathdns** against **unbound**, **smartdns**, and **mosdns** in the one
-job a forwarder does on the hot path: receive a query, forward it to one upstream,
-return the answer. Caching is disabled in every resolver and the load is a stream
-of **unique** qnames, so every query is a real forward (no cache hits, no
-single-flight collapsing).
+Compares **pathdns**, **unbound**, **smartdns**, **mosdns**, and **kixdns**.
+Forwarding mode uses a stream of distinct names and a mock that responds with
+TTL 0. This keeps responses out of KixDNS's cache even when the query file
+loops. Cache mode uses TTL 60 and a repeating set of names.
 
 ## How it works
 
 ```
 dnsperf  ──queries──▶  resolver  ──forward──▶  mock upstream (rustmock, :5300)
-   ▲                   (:5301..5304)                │
+   ▲                   (:5301..5305)                │
    └──────────────────── answers ◀──────────────────┘
 ```
 
@@ -89,6 +88,7 @@ cargo build --release
 sudo apt-get install -y dnsperf unbound smartdns
 # mosdns: download a release binary and point MOSDNS_BIN at it, or put it on PATH
 #   https://github.com/IrineSistiana/mosdns/releases
+# kixdns: put the binary on PATH or set KIXDNS_BIN to its absolute path
 ```
 
 Any resolver whose binary is missing is skipped automatically. `rustmock` is
@@ -100,7 +100,7 @@ run.
 ```sh
 cd testing/benchmark
 
-# simple: all four on all cores
+# simple: all available resolvers on all cores
 python3 orchestrator.py
 
 # pinned (recommended on a small box): mock->core0, resolver->cores1-2,
@@ -117,11 +117,11 @@ MODE=cache NCACHE=2000 PIN=1 MOCK_CPU=0 RESOLVER_CPU=1,2 DNSPERF_CPU=3 \
 
 Key env knobs: `MODE` (`forward`/`cache`), `DURATION`, `REPEATS`, `CLIENTS`
 (`-c`), `OUTSTANDING` (`-q`), `PIN`, `*_CPU`, `MOCK` (`rust`/`py`),
-`PATHDNS_BIN`, `MOSDNS_BIN`, `NQUERIES`, `NCACHE`.
+`PATHDNS_BIN`, `MOSDNS_BIN`, `KIXDNS_BIN`, `NQUERIES`, `NCACHE`.
 
 ## Configs
 
-Forward mode (`*.json`/`.conf`/`.yaml`) — pure-forward, cache disabled.
+Forward mode uses the base configurations and TTL 0 upstream answers.
 Cache mode (`*_cache.*`) — caching enabled, same single upstream.
 
 | File | Resolver | Notes |
