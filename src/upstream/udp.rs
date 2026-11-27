@@ -495,7 +495,10 @@ mod tests {
         ] {
             let end = dns::question_end(&reply).unwrap();
             assert_eq!(dns::get_id(&reply).unwrap(), id);
-            assert_eq!(dns::answer_ips(&reply, end).as_slice(), &[std::net::IpAddr::V4(ip)]);
+            assert_eq!(
+                dns::answer_ips(&reply, end).as_slice(),
+                &[std::net::IpAddr::V4(ip)]
+            );
             assert_eq!(reply.len(), end + 16 + extra);
         }
         a.shutdown();
